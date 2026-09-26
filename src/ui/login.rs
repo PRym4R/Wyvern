@@ -358,3 +358,108 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::StoredAccount;
+
+    /// Позиции всех нарисованных строк текста: (текст, x, y).
+    fn texts(app: &mut App) -> Vec<(String, f32, f32)> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| app.draw_login(ctx));
+        let mut found = Vec::new();
+        for cs in out.shapes {
+            if let egui::Shape::Text(t) = cs.shape {
+                found.push((t.galley.text().to_string(), t.pos.x, t.pos.y));
+            }
+        }
+        found
+    }
+
+    fn at(list: &[(String, f32, f32)], needle: &str) -> Vec<(f32, f32)> {
+        list.iter()
+            .filter(|(t, _, _)| t.contains(needle))
+            .map(|(_, x, y)| (*x, *y))
+            .collect()
+    }
+
+    fn make_app() -> App {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.status = "статус".into();
+        app
+    }
+
+    /// Токен и пароль хранилища — в одну строку, галка «запомнить» под ними.
+    #[test]
+    fn token_and_password_are_in_one_row() {
+        let mut app = make_app();
+        let list = texts(&mut app);
+
+        let token = at(&list, "Вставь токен...");
+        let pass = at(&list, "Локальный пароль...");
+        assert_eq!(token.len(), 1, "поле токена не найдено: {:?}", list);
+        assert_eq!(pass.len(), 1, "поле пароля не найдено: {:?}", list);
+        let (tx, ty) = token[0];
+        let (px, py) = pass[0];
+        eprintln!("[TEST] токен x={tx:.0} y={ty:.0} | пароль x={px:.0} y={py:.0} | галка y={:.0}", at(&list, "Запомнить этот аккаунт")[0].1);
+        assert!((ty - py).abs() < 0.5, "поля должны быть в одной строке: y {} vs {}", ty, py);
+        assert!(px > tx + 100.0, "пароль должен быть справа от токена: x {} vs {}", px, tx);
+
+        // Подписи полей — тоже в одной строке.
+        let lbl_t = at(&list, "Токен");
+        let lbl_p = at(&list, "Пароль хранилища");
+        assert!((lbl_t[0].1 - lbl_p[0].1).abs() < 0.5, "подписи полей не в одной строке");
+
+        // Галка «запомнить» — ниже обоих полей.
+        let remember = at(&list, "Запомнить этот аккаунт");
+        assert_eq!(remember.len(), 1, "галка не найдена");
+        assert!(
+            remember[0].1 > ty + 20.0,
+            "галка должна быть под полями: y {} vs поля y {}",
+            remember[0].1,
+            ty
+        );
+    }
+
+    /// Надпись «Показать сохранённые аккаунты» должна быть ровно одна.
+    #[test]
+    fn saved_accounts_caption_is_not_duplicated() {
+        let mut app = make_app();
+        let list = texts(&mut app);
+        assert_eq!(
+            at(&list, "Показать сохранённые аккаунты").len(),
+            1,
+            "надпись должна быть ровно один раз"
+        );
+
+        // Если токен введён — кнопка становится «Войти», лишней надписи нет.
+        app.token_input = "MTIz.token.value".into();
+        let list = texts(&mut app);
+        assert!(at(&list, "Показать сохранённые аккаунты").is_empty());
+        assert_eq!(at(&list, "Войти").len(), 1);
+    }
+
+    /// Сохранённые аккаунты рисуются полосой снизу, и по клику выбирается аккаунт.
+    #[test]
+    fn account_strip_lists_accounts() {
+        let mut app = make_app();
+        app.saved_accounts = vec![
+            StoredAccount { token: "tok-one".into(), username: "alice".into() },
+            StoredAccount { token: "tok-two".into(), username: String::new() },
+        ];
+        let list = texts(&mut app);
+        assert_eq!(at(&list, "АККАУНТЫ").len(), 1, "полоса аккаунтов не нарисована");
+        assert_eq!(at(&list, "alice").len(), 1);
+        // Без имени показывается маска токена.
+        assert_eq!(at(&list, "••••").len(), 1, "аккаунт без имени не показан: {:?}", list);
+    }
+}
