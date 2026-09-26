@@ -663,6 +663,56 @@ mod layout_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Весь путь пользователя: вошёл по токену с паролем → закрыл клиент →
+    /// снова открыл → ввёл пароль → кликнул аккаунт → вошёл.
+    /// Ровно тот сценарий, на котором клиент раньше говорил «неверный пароль».
+    #[test]
+    fn full_cycle_save_restart_unlock_and_login() {
+        let (mut app, tmp) = vaulted_app("cycle");
+        let token = "MTIz.тест.токен".to_string();
+        let pw = "мой-пароль";
+
+        // 1. Открыли хранилище паролем и сохранили аккаунт.
+        app.unlock_vault(pw).expect("первый вход создаёт хранилище");
+        app.add_saved_account(&token, "мой_юзер");
+        assert!(tmp.exists(), "файл хранилища не создан");
+        assert_eq!(app.saved_accounts.len(), 1);
+        assert_eq!(app.account_label(&app.saved_accounts[0]), "мой_юзер");
+
+        // 2. «Перезапуск клиента»: новый экземпляр, ничего не помнит.
+        let mut app2 = App::new(mpsc::unbounded_channel().1);
+        app2.vault_path_override = Some(tmp.clone());
+        assert!(app2.saved_accounts.is_empty(), "после перезапуска список пуст");
+        assert!(!app2.accounts_unlocked, "хранилище закрыто");
+        assert!(app2.login_password.is_empty());
+
+        // 3. Ввели пароль хранилища.
+        let hint = app2.unlock_vault(pw).expect("пароль должен подойти после перезапуска");
+        assert!(hint.is_none(), "точный пароль не должен давать подсказку");
+        assert_eq!(app2.saved_accounts.len(), 1, "аккаунт не подгрузился");
+        assert_eq!(app2.saved_accounts[0].token, token);
+        assert!(app2.accounts_unlocked);
+
+        // 4. Кликнули по аккаунту в нижней ленте.
+        app2.select_account(token.clone());
+        assert_eq!(app2.login_selected.as_deref(), Some(token.as_str()));
+        assert_eq!(app2.login_password, pw, "раз уже открыто — пароль подставляется");
+
+        // 5. Нажали «Войти»: токен пошёл в гейтвей, выбор сброшен.
+        app2.login_with_password(&token);
+        assert_eq!(app2.token_input, token, "вход должен выбрать аккаунт");
+        assert!(app2.gw_started, "гейтвей должен стартовать");
+        assert!(app2.login_selected.is_none(), "после входа выбор сброшен");
+        assert!(app2.login_password.is_empty(), "пароль из поля должен очищаться");
+
+        // 6. Хранилище на диске не пострадало от входа.
+        let mut app3 = App::new(mpsc::unbounded_channel().1);
+        app3.vault_path_override = Some(tmp.clone());
+        assert!(app3.unlock_vault(pw).is_ok(), "файл должен остаться читаемым");
+        assert_eq!(app3.saved_accounts.len(), 1);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     /// Неверный пароль — честная ошибка, а не тихий пустой список.
     #[test]
     fn wrong_password_still_errors() {

@@ -239,6 +239,9 @@ impl App {
             self.status = "Аккаунт не найден в хранилище".to_string();
             return;
         }
+        // Как и при входе по токену: убираем выбор, чтобы при возврате на
+        // экран входа показывалась обычная форма, а не форма аккаунта.
+        self.login_selected = None;
         self.login_password.clear();
         self.switch_account(token.to_string());
     }
