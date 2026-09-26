@@ -110,7 +110,7 @@ impl App {
                             });
                         }
 
-                        let msgs_for_render = msgs.clone();
+                        let msgs_for_render = &msgs;
                         let scroll_out = egui::ScrollArea::vertical()
                             .id_salt(("chat", &sel_id))
                             .auto_shrink([false, false])
@@ -128,7 +128,7 @@ impl App {
                                             .size(12.0).color(self.theme.text_secondary));
                                     });
                                 } else {
-                                    for msg in &msgs_for_render {
+                                    for msg in msgs_for_render {
                                         let display = self.display_name(msg);
                                         let is_own = msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id);
                                         if is_own {

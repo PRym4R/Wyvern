@@ -80,7 +80,7 @@ impl App {
 
         if let Some(idx) = self.selected_channel {
             let cid = self.channels[idx].id.clone();
-            self.messages.entry(cid.clone()).or_default().push(ChatMessage {
+            self.messages.entry(cid.clone()).or_default().push(std::sync::Arc::new(ChatMessage {
                 id: String::new(),
                 channel_id: cid.clone(),
                 author_id: self.user_id.clone(),
@@ -92,7 +92,7 @@ impl App {
                 attachments: Vec::new(),
                 embeds: Vec::new(),
                 is_own: true,
-            });
+            }));
             self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string() });
         }
     }

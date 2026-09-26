@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui::{self, TextureHandle};
@@ -7,9 +8,27 @@ use tokio::sync::mpsc;
 use crate::gateway::run_gateway;
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{
-    ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, StoredAccount,
+    BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, StoredAccount,
     Theme, UserProfile,
 };
+
+/// Больше этого сообщений на канал не держим в памяти.
+const MAX_MESSAGES_PER_CHANNEL: usize = 300;
+/// Сколько текстур аватаров/иконок guild'ов держим.
+const MAX_AVATAR_CACHE: usize = 192;
+/// Сколько картинок-вложений держим (каждая — это мегабайты VRAM/RAM).
+const MAX_IMAGE_CACHE: usize = 32;
+/// Сколько неудачных URL'ов запоминаем, чтобы не качать их снова.
+pub(crate) const MAX_FAILED_IMAGES: usize = 512;
+
+/// Оставляем только последние N сообщений: иначе активный канал в шумном
+/// чате раздувает память бесконечно.
+fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>) {
+    if entry.len() > MAX_MESSAGES_PER_CHANNEL {
+        let extra = entry.len() - MAX_MESSAGES_PER_CHANNEL;
+        entry.drain(..extra);
+    }
+}
 
 pub(crate) struct App {
     pub(crate) connected: bool,
@@ -20,21 +39,23 @@ pub(crate) struct App {
     pub(crate) channels: Vec<ChatChannel>,
     pub(crate) selected_guild: Option<usize>,
     pub(crate) selected_channel: Option<usize>,
-    pub(crate) messages: HashMap<String, Vec<ChatMessage>>,
+    pub(crate) messages: HashMap<String, Vec<Arc<ChatMessage>>>,
     pub(crate) input: String,
     pub(crate) token_input: String,
     pub(crate) master_password: String,
+    pub(crate) login_password: String,
+    pub(crate) login_selected: Option<String>,
+    pub(crate) remember_account: bool,
     pub(crate) saved_accounts: Vec<StoredAccount>,
-    pub(crate) login_new_token: String,
     pub(crate) active_index: Option<usize>,
     pub(crate) status: String,
     pub(crate) debug_log: Vec<String>,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
-    pub(crate) avatar_cache: HashMap<String, TextureHandle>,
+    pub(crate) avatar_cache: BoundedCache<TextureHandle>,
     pub(crate) pending_avatars: HashMap<String, std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
-    pub(crate) image_cache: HashMap<String, LoadedImage>,
+    pub(crate) image_cache: BoundedCache<LoadedImage>,
     pub(crate) pending_images: HashMap<String, std::sync::mpsc::Receiver<Option<ImagePayload>>>,
     pub(crate) failed_images: HashSet<String>,
     pub(crate) theme: Theme,
@@ -65,8 +86,10 @@ impl App {
             input: String::new(),
             token_input: String::new(),
             master_password: String::new(),
+            login_password: String::new(),
+            login_selected: None,
+            remember_account: true,
             saved_accounts: Vec::new(),
-            login_new_token: String::new(),
             active_index: None,
             status: String::new(),
             debug_log: Vec::new(),
@@ -74,9 +97,9 @@ impl App {
             from_gw,
             gw_started: false,
             accounts_unlocked: false,
-            avatar_cache: HashMap::new(),
+            avatar_cache: BoundedCache::new(MAX_AVATAR_CACHE),
             pending_avatars: HashMap::new(),
-            image_cache: HashMap::new(),
+            image_cache: BoundedCache::new(MAX_IMAGE_CACHE),
             pending_images: HashMap::new(),
             failed_images: HashSet::new(),
             theme: Theme::dark(),
@@ -113,16 +136,32 @@ impl App {
                     self.connected = true;
                     self.status = format!("Online: {}", self.username);
                     let tkn = self.token_input.clone();
-                    self.add_saved_account(&tkn, &username);
+                    if self.remember_account {
+                        self.add_saved_account(&tkn, &username);
+                    } else {
+                        // Аккаунт уже в списке — просто дописываем имя, если его не было.
+                        let blank = self
+                            .saved_accounts
+                            .iter()
+                            .position(|a| a.token == tkn && a.username.is_empty());
+                        if let Some(i) = blank {
+                            self.saved_accounts[i].username = username.clone();
+                            self.save_accounts(&self.master_password);
+                        }
+                    }
                     self.push_debug("READY received!".into());
                 }
                 ToApp::Message(msg) => {
-                    self.messages.entry(msg.channel_id.clone()).or_default().push(msg);
+                    let cid = msg.channel_id.clone();
+                    let entry = self.messages.entry(cid).or_default();
+                    entry.push(Arc::new(msg));
+                    trim_messages(entry);
                 }
                 ToApp::History { channel_id, messages } => {
                     let entry = self.messages.entry(channel_id.clone()).or_default();
                     entry.clear();
-                    entry.extend(messages);
+                    entry.extend(messages.into_iter().map(Arc::new));
+                    trim_messages(entry);
                     let stored = entry.len();
                     let dump = entry.iter()
                         .map(|m| format!("[{}] {} (id {}): {}{}", m.timestamp, m.author_name, m.author_id, m.content,
@@ -171,8 +210,7 @@ impl App {
                             if let Some(chan_idx) = chan_idx {
                                 self.selected_channel = Some(chan_idx);
                                 let cid = self.channels[chan_idx].id.clone();
-                                self.history_loading = Some(cid.clone());
-                                self.send_cmd(ToGateway::FetchHistory { channel_id: cid });
+                                self.open_channel(&cid);
                                 self.push_debug(format!("Auto-selected channel {}", self.channels[chan_idx].name));
                             }
                         }
@@ -191,16 +229,18 @@ impl App {
                     self.show_friends = false;
                     self.scroll_to_bottom = true;
                     let cid = self.channels[idx].id.clone();
-                    self.history_loading = Some(cid.clone());
-                    self.send_cmd(ToGateway::FetchHistory { channel_id: cid });
+                    self.open_channel(&cid);
                 }
                 ToApp::UserUpdate { id, username, avatar, nickname } => {
                     for msg in self.messages.values_mut().flat_map(|v| v.iter_mut()) {
                         if msg.author_id == id {
-                            msg.author_name = username.clone();
-                            msg.author_avatar = avatar.clone();
+                            // Сообщение могло уже раздаваться в рендер, поэтому
+                            // правим копию, а не на месте.
+                            let m = Arc::make_mut(msg);
+                            m.author_name = username.clone();
+                            m.author_avatar = avatar.clone();
                             if nickname.is_some() {
-                                msg.nickname = nickname.clone();
+                                m.nickname = nickname.clone();
                             }
                         }
                     }
@@ -265,10 +305,42 @@ impl App {
         self.user_id.clear();
         self.user_avatar = None;
         self.token_input = token.clone();
-        self.login_new_token.clear();
         self.start_gateway(token.clone());
         self.add_saved_account(&token, "");
         self.push_debug(format!("Switched account to {}", self.mask_token(&token)));
+    }
+    /// Вход по свежему токену из формы логина.
+    /// Если включён "запомнить" — сначала открываем/создаём хранилище паролем.
+    pub(crate) fn login_with_token(&mut self) {
+        let token = self.token_input.trim().to_string();
+        if token.is_empty() {
+            return;
+        }
+        self.status.clear();
+        if self.remember_account {
+            let pw = if self.login_password.is_empty() {
+                self.master_password.clone()
+            } else {
+                self.login_password.clone()
+            };
+            if let Err(e) = self.unlock_vault(&pw) {
+                // Вход всё равно продолжаем — просто аккаунт не сохранится.
+                self.status = format!("{} (аккаунт не сохранён)", e);
+            }
+        }
+        self.login_selected = None;
+        self.token_input = token.clone();
+        self.start_gateway(token.clone());
+        if self.accounts_unlocked {
+            self.add_saved_account(&token, "");
+        }
+    }
+    /// Открыть канал. История всё равно грузится заново, поэтому сообщения
+    /// других каналов можно выбросить — память не растёт при переключении.
+    pub(crate) fn open_channel(&mut self, channel_id: &str) {
+        self.history_loading = Some(channel_id.to_string());
+        self.messages.retain(|k, _| k == channel_id);
+        self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string() });
     }
     pub(crate) fn display_name(&self, msg: &ChatMessage) -> String {
         msg.nickname.clone().unwrap_or_else(|| msg.author_name.clone())
@@ -306,7 +378,9 @@ impl App {
             .filter(|ch| ch.guild_id.as_deref() == Some(guild_id) && ch.channel_type == 0)
             .collect()
     }
-    pub(crate) fn current_channel_messages(&self) -> Vec<ChatMessage> {
+    /// Сообщения текущего канала. Отдаём `Arc`, поэтому вызывающий код
+    /// копирует только указатели, а не все сообщения целиком.
+    pub(crate) fn current_channel_messages(&self) -> Vec<Arc<ChatMessage>> {
         self.selected_channel
             .and_then(|i| self.channels.get(i))
             .map(|ch| ch.id.clone())
@@ -366,7 +440,7 @@ mod layout_tests {
         a.selected_channel = Some(0);
         a.messages.insert(
             "c0".into(),
-            vec![ChatMessage {
+            vec![Arc::new(ChatMessage {
                 id: "m1".into(),
                 channel_id: "c0".into(),
                 author_id: "u1".into(),
@@ -378,7 +452,7 @@ mod layout_tests {
                 attachments: vec![],
                 embeds: vec![],
                 is_own: false,
-            }],
+            })],
         );
         a
     }
@@ -454,7 +528,7 @@ mod layout_tests {
             attachments: vec![],
             embeds: vec![],
             is_own: false,
-        }).collect::<Vec<_>>();
+        }).map(Arc::new).collect::<Vec<_>>();
 
         let ctx = egui::Context::default();
         let size = egui::vec2(1052.0, 1054.0);
@@ -498,5 +572,51 @@ mod layout_tests {
         let empty = vec![];
         assert!(App::encrypt_accounts(&empty, "").is_none(), "empty password must refuse encryption");
         assert!(App::load_accounts("").is_empty(), "no password, no accounts");
+    }
+
+    #[test]
+    fn history_is_capped_and_old_channels_dropped() {
+        let mut entry: Vec<Arc<ChatMessage>> = Vec::new();
+        let mut msg = ChatMessage {
+            id: "m0".into(),
+            channel_id: "c0".into(),
+            author_id: "u1".into(),
+            author_name: "Alice".into(),
+            author_avatar: None,
+            nickname: None,
+            content: "x".into(),
+            timestamp: "2026-01-01T00:00:00.000Z".into(),
+            attachments: vec![],
+            embeds: vec![],
+            is_own: false,
+        };
+        for i in 0..MAX_MESSAGES_PER_CHANNEL + 50 {
+            msg.id = format!("m{}", i);
+            entry.push(Arc::new(msg.clone()));
+        }
+        trim_messages(&mut entry);
+        assert_eq!(entry.len(), MAX_MESSAGES_PER_CHANNEL);
+        // Остались самые новые, порядок сохранён.
+        assert_eq!(entry[0].id, "m50");
+        assert_eq!(entry[MAX_MESSAGES_PER_CHANNEL - 1].id, format!("m{}", MAX_MESSAGES_PER_CHANNEL + 49));
+
+        // При открытии канала история других каналов выбрасывается.
+        let mut app = make_app();
+        app.messages.insert("c1".into(), vec![entry[0].clone()]);
+        app.open_channel("c0");
+        assert!(app.messages.contains_key("c0"), "активный канал должен остаться");
+        assert!(!app.messages.contains_key("c1"), "история других каналов должна быть выброшена");
+    }
+
+    #[test]
+    fn bounded_cache_evicts_oldest() {
+        let mut cache = BoundedCache::new(3);
+        for i in 0..10 {
+            cache.insert(format!("k{}", i), i);
+        }
+        assert_eq!(cache.len(), 3, "кеш не должен расти дальше лимита");
+        assert!(!cache.contains_key("k0"), "самый старый должен вытесниться");
+        assert!(cache.contains_key("k9"), "свежее должно остаться");
+        assert_eq!(cache.get("k9"), Some(&9));
     }
 }

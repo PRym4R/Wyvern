@@ -108,4 +108,59 @@ impl App {
     pub(crate) fn refresh_active_index(&mut self) {
         self.active_index = self.saved_accounts.iter().position(|a| a.token == self.token_input);
     }
+    /// Имя для показа: username, если известен, иначе замаскированный токен.
+    pub(crate) fn account_label(&self, acc: &StoredAccount) -> String {
+        if acc.username.is_empty() {
+            self.mask_token(&acc.token)
+        } else {
+            acc.username.clone()
+        }
+    }
+    /// Открыть хранилище паролем. Пустой файл — считаем, что пароль верный
+    /// (создаём новое хранилище), непустой файл, который не расшифровался, — ошибка.
+    pub(crate) fn unlock_vault(&mut self, password: &str) -> Result<(), &'static str> {
+        if password.is_empty() {
+            return Err("Введите пароль хранилища");
+        }
+        let exists = Self::accounts_path().exists();
+        let accounts = Self::load_accounts(password);
+        if exists && accounts.is_empty() {
+            return Err("Неверный пароль хранилища");
+        }
+        self.saved_accounts = accounts;
+        self.master_password = password.to_string();
+        self.accounts_unlocked = true;
+        self.refresh_active_index();
+        Ok(())
+    }
+    /// ЛКМ по аккаунту в нижней ленте: выбрать его и спросить пароль.
+    pub(crate) fn select_account(&mut self, token: String) {
+        self.login_selected = Some(token);
+        self.status.clear();
+        self.login_password = if self.accounts_unlocked {
+            self.master_password.clone()
+        } else {
+            String::new()
+        };
+    }
+    pub(crate) fn clear_login_selection(&mut self) {
+        self.login_selected = None;
+        self.login_password.clear();
+        self.status.clear();
+    }
+    /// Войти в сохранённый аккаунт: пароль должен открыть хранилище,
+    /// а токен — лежать в нём.
+    pub(crate) fn login_with_password(&mut self, token: &str) {
+        let pw = self.login_password.clone();
+        if let Err(e) = self.unlock_vault(&pw) {
+            self.status = e.to_string();
+            return;
+        }
+        if !self.saved_accounts.iter().any(|a| a.token == token) {
+            self.status = "Аккаунт не найден в хранилище".to_string();
+            return;
+        }
+        self.login_password.clear();
+        self.switch_account(token.to_string());
+    }
 }

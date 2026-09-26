@@ -1,5 +1,44 @@
+use std::collections::{HashMap, VecDeque};
+
 use eframe::egui::{self, Color32, TextureHandle};
 use serde_json::Value;
+
+/// Кеш с ограничением размера: при переполнении вытесняется самый старый элемент.
+/// Нужен, чтобы текстуры (они живут в памяти egui до конца сессии) не копились
+/// бесконечно.
+pub(crate) struct BoundedCache<V> {
+    map: HashMap<String, V>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl<V> BoundedCache<V> {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+        self.map.get(key)
+    }
+    // Хелперы для тестов и отладки — в самом клиенте не вызываются.
+    #[allow(dead_code)]
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub(crate) fn insert(&mut self, key: String, value: V) {
+        if self.map.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ChatMessage {
@@ -112,6 +151,7 @@ impl LoadedImage {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Theme {
     pub(crate) bg: Color32,
     pub(crate) panel_bg: Color32,
