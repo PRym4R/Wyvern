@@ -44,6 +44,8 @@ pub(crate) struct App {
     pub(crate) token_input: String,
     pub(crate) master_password: String,
     pub(crate) login_password: String,
+    /// Не-ошибка на экране входа («пароль принят после обрезки пробелов»).
+    pub(crate) login_notice: String,
     pub(crate) login_selected: Option<String>,
     pub(crate) remember_account: bool,
     pub(crate) saved_accounts: Vec<StoredAccount>,
@@ -87,6 +89,7 @@ impl App {
             token_input: String::new(),
             master_password: String::new(),
             login_password: String::new(),
+            login_notice: String::new(),
             login_selected: None,
             remember_account: true,
             saved_accounts: Vec::new(),
@@ -317,15 +320,23 @@ impl App {
             return;
         }
         self.status.clear();
+        self.login_notice.clear();
         if self.remember_account {
             let pw = if self.login_password.is_empty() {
                 self.master_password.clone()
             } else {
                 self.login_password.clone()
             };
-            if let Err(e) = self.unlock_vault(&pw) {
-                // Вход всё равно продолжаем — просто аккаунт не сохранится.
-                self.status = format!("{} (аккаунт не сохранён)", e);
+            if pw.is_empty() {
+                // Запомнить без пароля нельзя: файл надо чем-то шифровать.
+                self.status = "Чтобы запомнить аккаунт, введи пароль хранилища".to_string();
+            } else {
+                match self.unlock_vault(&pw) {
+                    Ok(Some(hint)) => self.login_notice = hint,
+                    Ok(None) => {}
+                    // Вход всё равно продолжаем — просто аккаунт не сохранится.
+                    Err(e) => self.status = format!("{} — аккаунт не сохранён", e),
+                }
             }
         }
         self.login_selected = None;
@@ -571,7 +582,84 @@ mod layout_tests {
         assert!(App::decrypt_accounts(&encrypted, "").is_none());
         let empty = vec![];
         assert!(App::encrypt_accounts(&empty, "").is_none(), "empty password must refuse encryption");
-        assert!(App::load_accounts("").is_empty(), "no password, no accounts");
+        assert!(App::load_accounts_with(&encrypted, "").is_none(), "empty password opens nothing");
+    }
+
+    /// Изолированный файл хранилища на время теста: никто не трогает
+    /// настоящий ~/.wyvern_accounts.json.
+    struct TempVault {
+        path: std::path::PathBuf,
+    }
+    impl TempVault {
+        fn new(tag: &str) -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!("wyvern-test-{}-{}.json", tag, std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            std::env::set_var("WYVERN_ACCOUNTS_PATH", &p);
+            Self { path: p }
+        }
+    }
+    impl Drop for TempVault {
+        fn drop(&mut self) {
+            std::env::remove_var("WYVERN_ACCOUNTS_PATH");
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Пробелы в пароле — самая частая причина «неверного пароля».
+    #[test]
+    fn vault_tolerates_password_spaces() {
+        for saved in ["hunter2", "hunter2 ", " hunter2", "hunter2\n"] {
+            let _vault = TempVault::new("space");
+            let accs = vec![StoredAccount { token: "tok-space".into(), username: "bob".into() }];
+            let mut app = App::new(mpsc::unbounded_channel().1);
+            app.saved_accounts = accs;
+            app.save_accounts(saved);
+            assert!(App::accounts_path().exists(), "файл не записался");
+
+            // Вводим без пробелов — должно открыться.
+            let mut app2 = App::new(mpsc::unbounded_channel().1);
+            let hint = app2.unlock_vault("hunter2").expect("пароль без пробелов должен подойти");
+            assert_eq!(app2.saved_accounts.len(), 1, "аккаунт не загрузился (saved={:?})", saved);
+            assert_eq!(app2.saved_accounts[0].username, "bob");
+            if saved == "hunter2" {
+                assert!(hint.is_none(), "для точного пароля подсказки быть не должно");
+            } else {
+                assert!(hint.is_some(), "для пароля с пробелами ждём подсказку, saved={:?}", saved);
+            }
+        }
+    }
+
+    /// Хранилище без аккаунтов — это не «неверный пароль».
+    #[test]
+    fn empty_vault_is_not_a_wrong_password() {
+        let _vault = TempVault::new("empty");
+        let encrypted = App::encrypt_accounts(&[], "pw123").expect("encrypt");
+        std::fs::write(App::accounts_path(), encrypted).unwrap();
+
+        let mut app = App::new(mpsc::unbounded_channel().1);
+        let res = app.unlock_vault("pw123");
+        assert!(res.is_ok(), "пустое хранилище с верным паролем должно открываться: {:?}", res);
+        assert!(app.saved_accounts.is_empty());
+        assert!(app.accounts_unlocked);
+    }
+
+    /// Неверный пароль — честная ошибка, а не тихий пустой список.
+    #[test]
+    fn wrong_password_still_errors() {
+        let _vault = TempVault::new("wrong");
+        let encrypted = App::encrypt_accounts(
+            &[StoredAccount { token: "t".into(), username: "u".into() }],
+            "right",
+        )
+        .expect("encrypt");
+        std::fs::write(App::accounts_path(), encrypted).unwrap();
+
+        let mut app = App::new(mpsc::unbounded_channel().1);
+        let res = app.unlock_vault("wrong");
+        let err = res.err().expect("неверный пароль должен давать ошибку");
+        assert!(err.contains("Неверный пароль"), "непонятное сообщение: {}", err);
+        assert!(!app.accounts_unlocked);
     }
 
     #[test]

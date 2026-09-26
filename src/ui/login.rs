@@ -330,12 +330,28 @@ impl App {
     fn login_footer(&self, ui: &mut egui::Ui) {
         if !self.status.is_empty() {
             ui.label(RichText::new(&self.status).size(13.0).color(ERROR_RED));
+        } else if !self.login_notice.is_empty() {
+            ui.label(RichText::new(&self.login_notice).size(13.0).color(self.theme.accent));
         } else if let Some(last) = self.debug_log.last() {
             ui.label(RichText::new(format!("Last: {}", last))
                 .size(11.0)
                 .color(self.theme.text_secondary));
         }
-        if self.saved_accounts.is_empty() {
+        // Подсказка про существующий файл: сразу видно, что аккаунты на
+        // диске есть и нужен именно тот пароль, которым их сохраняли.
+        if !self.accounts_unlocked {
+            if let Some(age) = App::vault_age_text() {
+                ui.label(
+                    RichText::new(format!(
+                        "Файл хранилища найден ({}), открой его паролем оттуда",
+                        age
+                    ))
+                    .size(11.0)
+                    .color(self.theme.text_secondary),
+                );
+            }
+        }
+        if self.saved_accounts.is_empty() && self.status.is_empty() {
             ui.label(
                 RichText::new("Пароль хранилища открывает список аккаунтов внизу слева")
                     .size(11.0)
@@ -346,15 +362,18 @@ impl App {
 
     fn unlock_from_form(&mut self) {
         let pw = self.login_password.clone();
+        self.login_notice.clear();
+        self.status.clear();
         match self.unlock_vault(&pw) {
-            Ok(()) => {
-                self.status = if self.saved_accounts.is_empty() {
-                    "Хранилище открыто, но аккаунтов в нём пока нет".to_string()
-                } else {
-                    String::new()
+            Ok(hint) => {
+                if let Some(h) = hint {
+                    self.login_notice = h;
+                }
+                if self.saved_accounts.is_empty() {
+                    self.status = "Пароль верный, но аккаунтов в хранилище пока нет".to_string();
                 }
             }
-            Err(e) => self.status = e.to_string(),
+            Err(e) => self.status = e,
         }
     }
 }

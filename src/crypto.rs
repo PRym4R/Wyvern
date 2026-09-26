@@ -10,6 +10,12 @@ use crate::util::{base64_decode, base64_string};
 
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
+        // Переопределение нужно тестам, чтобы не трогать настоящий файл.
+        if let Ok(custom) = std::env::var("WYVERN_ACCOUNTS_PATH") {
+            if !custom.is_empty() {
+                return std::path::PathBuf::from(custom);
+            }
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
             std::path::PathBuf::from(".wyvern_accounts.json")
@@ -59,20 +65,17 @@ impl App {
         let pt = cipher.decrypt(nonce, ct.as_slice()).ok()?;
         serde_json::from_slice::<Vec<StoredAccount>>(&pt).ok()
     }
-    pub(crate) fn load_accounts(password: &str) -> Vec<StoredAccount> {
-        let path = Self::accounts_path();
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Vec<StoredAccount>>(&s) {
-                if password.is_empty() {
-                    return Vec::new();
-                }
-                return v;
-            }
-            if let Some(accs) = Self::decrypt_accounts(&s, password) {
-                return accs;
-            }
+    /// Разобрать содержимое файла: `None` — пароль не подошёл (в отличие от
+    /// пустого списка, который означает «аккаунтов пока нет»).
+    pub(crate) fn load_accounts_with(content: &str, password: &str) -> Option<Vec<StoredAccount>> {
+        if password.is_empty() {
+            return None;
         }
-        Vec::new()
+        // Старый формат: незашифрованный список.
+        if let Ok(v) = serde_json::from_str::<Vec<StoredAccount>>(content) {
+            return Some(v);
+        }
+        Self::decrypt_accounts(content, password)
     }
     pub(crate) fn save_accounts(&self, password: &str) {
         if let Some(s) = Self::encrypt_accounts(&self.saved_accounts, password) {
@@ -116,22 +119,78 @@ impl App {
             acc.username.clone()
         }
     }
-    /// Открыть хранилище паролем. Пустой файл — считаем, что пароль верный
-    /// (создаём новое хранилище), непустой файл, который не расшифровался, — ошибка.
-    pub(crate) fn unlock_vault(&mut self, password: &str) -> Result<(), &'static str> {
+    /// «изменён N мин назад» для файла хранилища, если он есть.
+    pub(crate) fn vault_age_text() -> Option<String> {
+        let meta = std::fs::metadata(Self::accounts_path()).ok()?;
+        let secs = meta.modified().ok()?.elapsed().ok()?.as_secs();
+        Some(if secs < 90 {
+            format!("изменён {} сек назад", secs)
+        } else if secs < 5400 {
+            format!("изменён {} мин назад", secs / 60)
+        } else {
+            format!("изменён {} ч назад", secs / 3600)
+        })
+    }
+    /// Открыть хранилище паролем. Возвращает `Ok(None)` если всё чисто,
+    /// `Ok(Some(подсказка))` если пароль подошёл после угадывания пробелов,
+    /// `Err` если файл есть, а пароль не подошёл.
+    ///
+    /// Раньше здесь была ошибка: если аккаунтов в хранилище 0, но файл
+    /// существует, `load_accounts` возвращал пустой вектор и мы показывали
+    /// «Неверный пароль» даже с верным паролем.
+    pub(crate) fn unlock_vault(&mut self, password: &str) -> Result<Option<String>, String> {
         if password.is_empty() {
-            return Err("Введите пароль хранилища");
+            return Err("Введите пароль хранилища".to_string());
         }
-        let exists = Self::accounts_path().exists();
-        let accounts = Self::load_accounts(password);
-        if exists && accounts.is_empty() {
-            return Err("Неверный пароль хранилища");
+        let content = match std::fs::read_to_string(Self::accounts_path()) {
+            Ok(s) => s,
+            Err(_) => {
+                // Файла нет — это первый вход, создаём новое хранилище.
+                self.saved_accounts = Vec::new();
+                self.master_password = password.to_string();
+                self.accounts_unlocked = true;
+                self.refresh_active_index();
+                return Ok(None);
+            }
+        };
+
+        // Под пробелы/невидимые символы: их легко принести из буфера обмена
+        // или случайно нажать пробел, а потом не вспомнить.
+        for candidate in Self::password_variants(password) {
+            let accounts = Self::load_accounts_with(&content, &candidate);
+            if let Some(accounts) = accounts {
+                let hint = if candidate == password {
+                    None
+                } else {
+                    Some("Пароль принят: убрал лишние пробелы".to_string())
+                };
+                self.saved_accounts = accounts;
+                self.master_password = candidate;
+                self.accounts_unlocked = true;
+                self.refresh_active_index();
+                return Ok(hint);
+            }
         }
-        self.saved_accounts = accounts;
-        self.master_password = password.to_string();
-        self.accounts_unlocked = true;
-        self.refresh_active_index();
-        Ok(())
+
+        Err(format!(
+            "Неверный пароль хранилища (файл {})",
+            Self::accounts_path().display()
+        ))
+    }
+    /// Набор вариантов пароля, которые пробуем подряд: как ввёл, без
+    /// окружающих пробелов, и с лишним пробелом/переводом строки с любой
+    /// стороны. Ошибка в один символ — самая частая причина «неверного пароля».
+    fn password_variants(password: &str) -> Vec<String> {
+        let mut out = vec![password.to_string()];
+        let trimmed = password.trim();
+        if trimmed.len() != password.len() {
+            out.push(trimmed.to_string());
+        }
+        for extra in [" ", "\n", "\r\n"] {
+            out.push(format!("{}{}", password, extra));
+            out.push(format!("{}{}", extra, password));
+        }
+        out
     }
     /// ЛКМ по аккаунту в нижней ленте: выбрать его и спросить пароль.
     pub(crate) fn select_account(&mut self, token: String) {
@@ -152,9 +211,17 @@ impl App {
     /// а токен — лежать в нём.
     pub(crate) fn login_with_password(&mut self, token: &str) {
         let pw = self.login_password.clone();
-        if let Err(e) = self.unlock_vault(&pw) {
-            self.status = e.to_string();
-            return;
+        self.login_notice.clear();
+        match self.unlock_vault(&pw) {
+            Ok(hint) => {
+                if let Some(h) = hint {
+                    self.login_notice = h;
+                }
+            }
+            Err(e) => {
+                self.status = e;
+                return;
+            }
         }
         if !self.saved_accounts.iter().any(|a| a.token == token) {
             self.status = "Аккаунт не найден в хранилище".to_string();
