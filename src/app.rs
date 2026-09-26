@@ -178,9 +178,17 @@ impl App {
                         .join("\n");
                     let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
                     let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.clone() };
-                    self.history_loading = None;
-                    self.scroll_to_bottom = true;
-                    self.push_debug(format!("Stored {} msgs for channel {}", stored, cid_short));
+                    // Спиннер и прокрутка — только если ответ пришёл для канала,
+                    // который грузится сейчас. Поздний ответ по уже закрытому
+                    // каналу не должен снимать «Loading messages…» у того,
+                    // который ещё грузится: так выглядело как «истории нет».
+                    let for_current = self.history_loading.as_deref() == Some(channel_id.as_str());
+                    if for_current || self.history_loading.is_none() {
+                        self.history_loading = None;
+                        self.scroll_to_bottom = true;
+                    }
+                    self.push_debug(format!("Stored {} msgs for channel {}{}", stored, cid_short,
+                        if for_current { "" } else { " (не текущий канал)" }));
                 }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
@@ -763,6 +771,115 @@ mod layout_tests {
         app.open_channel("c0");
         assert!(app.messages.contains_key("c0"), "активный канал должен остаться");
         assert!(!app.messages.contains_key("c1"), "история других каналов должна быть выброшена");
+        assert_eq!(app.history_loading.as_deref(), Some("c0"), "пока грузим — должен быть спиннер");
+    }
+
+    /// Сообщение для тестов истории.
+    fn test_msg(id: &str, channel_id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            channel_id: channel_id.into(),
+            author_id: "u1".into(),
+            author_name: "Alice".into(),
+            author_avatar: None,
+            nickname: None,
+            content: content.into(),
+            timestamp: "2026-01-01T00:00:00.000Z".into(),
+            attachments: vec![],
+            embeds: vec![],
+            is_own: false,
+        }
+    }
+
+    /// Поздний ответ по каналу, который пользователь уже закрыл, не должен
+    /// снимать «Loading messages…» у канала, который грузится сейчас: из-за
+    /// этого открытый канал выглядел как пустой, пока грузился. Раньше
+    /// ответы приходили вперемешку (команда гейтвея брала историю по очереди).
+    #[test]
+    fn late_history_keeps_current_channel_loading() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "first".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.channels.push(ChatChannel {
+            id: "c2".into(),
+            name: "second".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 1,
+        });
+        app.selected_channel = Some(1);
+        app.open_channel("c2");
+        assert_eq!(app.history_loading.as_deref(), Some("c2"));
+
+        // Приходит поздний ответ по первому каналу.
+        tx.send(ToApp::History {
+            channel_id: "c1".into(),
+            messages: vec![test_msg("m1", "c1", "старое")],
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(
+            app.history_loading.as_deref(),
+            Some("c2"),
+            "спиннер текущего канала снимать нельзя"
+        );
+        assert_eq!(app.messages.get("c1").map(|v| v.len()), Some(1), "ответ должен сохраниться");
+
+        // Ответ по текущему каналу принимается и снимает спиннер.
+        tx.send(ToApp::History {
+            channel_id: "c2".into(),
+            messages: vec![test_msg("m2", "c2", "свежее")],
+        })
+        .unwrap();
+        app.poll(&ctx);
+        let msgs = app.messages.get("c2").expect("история текущего канала должна сохраниться");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "свежее");
+        assert!(app.history_loading.is_none(), "спиннер должен сняться");
+    }
+
+    /// Пагинация истории: `before` берём от самого старого сообщения
+    /// страницы, иначе Discord отдаёт ту же страницу заново (в канале на 91
+    /// сообщение приезжало 300 строк с тройными дублями).
+    #[test]
+    fn history_pagination_uses_oldest_id() {
+        // Discord отдаёт от новых к старым: [100, 99, ..., 1].
+        let page: Vec<ChatMessage> = (1..=3)
+            .rev()
+            .map(|i| test_msg(&format!("{}", 100 + i), "c1", "x"))
+            .collect();
+        assert_eq!(page[0].id, "103", "первым идёт самое новое");
+        assert_eq!(crate::gateway::next_before_id(&page, None).as_deref(), Some("101"));
+
+        // Повторяющийся id — значит страницы идут по кругу, грузить дальше
+        // бессмысленно (иначе запросы не кончатся).
+        assert_eq!(
+            crate::gateway::next_before_id(&page, Some("101")),
+            None,
+            "одинаковый id должен останавливать пагинацию"
+        );
+        // Пустая страница — история кончилась.
+        assert_eq!(crate::gateway::next_before_id(&[], None), None);
+        // Короткая страница = дошли до начала канала.
+        assert!(!crate::gateway::more_history_pages(3, 3));
+        assert!(crate::gateway::more_history_pages(100, 100));
+        assert!(!crate::gateway::more_history_pages(100, crate::gateway::MAX_HISTORY));
+
+        // Адрес страницы: первая без `before`, вторая — от старого id.
+        let first = crate::gateway::history_url("42", None);
+        assert!(!first.contains("before="), "первая страница без before: {}", first);
+        assert!(first.ends_with("/channels/42/messages?limit=100"), "{}", first);
+        let second = crate::gateway::history_url("42", Some("101"));
+        assert!(second.ends_with("/channels/42/messages?limit=100&before=101"), "{}", second);
     }
 
     #[test]

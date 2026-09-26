@@ -44,6 +44,179 @@ struct SessionState {
     seq: Option<i64>,
 }
 
+/// Сколько сообщений максимум тянуть из одного канала.
+pub(crate) const MAX_HISTORY: usize = 300;
+/// Размер страницы истории (максимум, который отдаёт Discord).
+pub(crate) const HISTORY_PAGE: usize = 100;
+
+/// Загрузить историю канала и отдать её в UI.
+///
+/// Страницы идут от новых к старым. `before` — самый старый id уже
+/// полученной страницы: Discord отдаёт сообщения от новых к старым, и если
+/// просить `before` от самого нового, он вернёт ту же страницу ещё раз
+/// (раньше так и было — в канале на 91 сообщение приезжало 300 строк с
+/// тройными дублями и лишними запросами).
+async fn fetch_history(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: mpsc::UnboundedSender<ToApp>,
+    channel_id: String,
+) {
+    let mut all: Vec<ChatMessage> = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let url = history_url(&channel_id, before.as_deref());
+
+        let mut page: Vec<ChatMessage> = Vec::new();
+        let mut got_page = false;
+        let mut failed = false;
+        let mut attempt = 0u32;
+        while !got_page && attempt < 3 && !failed {
+            attempt += 1;
+            let req = httpc
+                .get(&url)
+                .header("Authorization", &*tkn)
+                .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+                .header("X-Super-Properties", &super_props())
+                .header("X-Discord-Locale", "en-US")
+                .header("X-Discord-Timezone", "Europe/Moscow");
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
+                    if status == 429 {
+                        let retry = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(2);
+                        let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
+                        time::sleep(Duration::from_secs(retry)).await;
+                        continue;
+                    }
+                    if !status.is_success() {
+                        let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
+                        failed = true;
+                        break;
+                    }
+                    match resp.text().await {
+                        Ok(body) => match serde_json::from_str::<Vec<Value>>(&body) {
+                            Ok(arr) => {
+                                page = parse_history_page(&arr, &channel_id);
+                                got_page = true;
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(ToApp::Debug(format!("History parse error: {}", e)));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
+                    time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+        if failed || !got_page {
+            break;
+        }
+        // Пустая страница — истории больше нет.
+        if page.is_empty() {
+            break;
+        }
+        let got = page.len();
+        match next_before_id(&page, before.as_deref()) {
+            Some(id) => before = Some(id),
+            None => {
+                all.extend(page);
+                break;
+            }
+        }
+        all.extend(page);
+        // Короткая страница = дошли до начала канала, ещё страниц не будет.
+        if !more_history_pages(got, all.len()) {
+            break;
+        }
+        time::sleep(Duration::from_millis(300)).await;
+    }
+
+    all.reverse();
+    let _ = event_tx.send(ToApp::Debug(format!("History: {} messages total", all.len())));
+    let _ = event_tx.send(ToApp::History { channel_id, messages: all });
+}
+
+/// Адрес страницы истории. Первая страница — без `before`, дальше — от
+/// самого старого id, который уже получили.
+pub(crate) fn history_url(channel_id: &str, before: Option<&str>) -> String {
+    match before {
+        Some(b) => format!(
+            "{}/channels/{}/messages?limit={}&before={}",
+            API_BASE, channel_id, HISTORY_PAGE, b
+        ),
+        None => format!("{}/channels/{}/messages?limit={}", API_BASE, channel_id, HISTORY_PAGE),
+    }
+}
+
+/// Id самого старого сообщения страницы — его просим как `before` у
+/// Discord. Если страницы пошли по кругу (id повторился) или id пустой,
+/// грузить дальше бессмысленно: возвращаем `None`.
+pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Option<String> {
+    let id = page.last()?.id.clone();
+    if id.is_empty() || Some(id.as_str()) == current {
+        return None;
+    }
+    Some(id)
+}
+
+/// Нужно ли догружать страницы: страница должна быть полной, а лимит
+/// ещё не выбран.
+pub(crate) fn more_history_pages(got: usize, total: usize) -> bool {
+    got >= HISTORY_PAGE && total < MAX_HISTORY
+}
+
+/// Разобрать страницу истории из JSON Discord в сообщения.
+fn parse_history_page(arr: &[Value], channel_id: &str) -> Vec<ChatMessage> {
+    arr.iter()
+        .filter_map(|m| {
+            let author = m.get("author")?;
+            Some(ChatMessage {
+                id: m["id"].as_str().unwrap_or("").to_string(),
+                channel_id: channel_id.to_string(),
+                author_id: author["id"].as_str().unwrap_or("").to_string(),
+                author_name: author["username"].as_str().unwrap_or("?").to_string(),
+                author_avatar: author["avatar"].as_str().map(|s| s.to_string()),
+                nickname: None,
+                content: m["content"].as_str().unwrap_or("").to_string(),
+                timestamp: m["timestamp"].as_str().unwrap_or("").to_string(),
+                attachments: m["attachments"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|a| {
+                                Some(Attachment {
+                                    filename: a["filename"].as_str()?.to_string(),
+                                    url: a["url"].as_str()?.to_string(),
+                                    content_type: a["content_type"].as_str().map(|s| s.to_string()),
+                                    width: a["width"].as_u64().map(|v| v as u32),
+                                    height: a["height"].as_u64().map(|v| v as u32),
+                                    size: a["size"].as_u64().unwrap_or(0),
+                                    description: a["description"].as_str().map(|s| s.to_string()),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                embeds: m["embeds"].as_array().cloned().unwrap_or_default(),
+                is_own: false,
+            })
+        })
+        .collect()
+}
+
 async fn gw_inner(
     cmd_rx: &mut mpsc::UnboundedReceiver<ToGateway>,
     event_tx: mpsc::UnboundedSender<ToApp>,
@@ -137,6 +310,8 @@ async fn gw_inner(
 
     let http = reqwest::Client::new();
     let tkn = token.to_string();
+    // Каналы, история которых уже грузится: защита от дублей при кликах.
+    let history_inflight = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let mut heartbeat = time::interval(Duration::from_millis(interval));
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
@@ -541,125 +716,31 @@ async fn gw_inner(
                         }
                     }
                     ToGateway::FetchHistory { channel_id } => {
-                        let cid_for_msg = channel_id.clone();
-                        let mut all: Vec<ChatMessage> = Vec::new();
-                        let mut before: Option<String> = None;
-                        let mut done = false;
-                        let mut failed = false;
-
-                        while !done {
-                            let url = match &before {
-                                Some(b) => format!("{}/channels/{}/messages?limit=100&before={}", API_BASE, channel_id, b),
-                                None => format!("{}/channels/{}/messages?limit=100", API_BASE, channel_id),
-                            };
-                            let mut attempt = 0u32;
-                            let mut page_ok = false;
-                            while !page_ok && attempt < 3 {
-                                attempt += 1;
-                                let req = http.get(&url)
-                                    .header("Authorization", &*tkn)
-                                    .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                                    .header("X-Super-Properties", &super_props())
-                                    .header("X-Discord-Locale", "en-US")
-                                    .header("X-Discord-Timezone", "Europe/Moscow");
-                                match req.send().await {
-                                    Ok(resp) => {
-                                        let status = resp.status();
-                                        let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
-                                        if status == 429 {
-                                            let retry = resp.headers()
-                                                .get("retry-after")
-                                                .and_then(|v| v.to_str().ok())
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                                .unwrap_or(2);
-                                            let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
-                                            tokio::time::sleep(Duration::from_secs(retry)).await;
-                                            continue;
-                                        }
-                                        if status.is_success() {
-                                            match resp.text().await {
-                                                Ok(body) => {
-                                                    match serde_json::from_str::<Vec<Value>>(&body) {
-                                                        Ok(arr) => {
-                                                            if arr.is_empty() {
-                                                                page_ok = true;
-                                                                done = true;
-                                                                break;
-                                                            }
-                                                            let mut page: Vec<ChatMessage> = arr.iter().filter_map(|m| {
-                                                                let author = m.get("author")?;
-                                                                Some(ChatMessage {
-                                                                    id: m["id"].as_str().unwrap_or("").to_string(),
-                                                                    channel_id: cid_for_msg.clone(),
-                                                                    author_id: author["id"].as_str().unwrap_or("").to_string(),
-                                                                    author_name: author["username"].as_str().unwrap_or("?").to_string(),
-                                                                    author_avatar: author["avatar"].as_str().map(|s| s.to_string()),
-                                                                    nickname: None,
-                                                                    content: m["content"].as_str().unwrap_or("").to_string(),
-                                                                    timestamp: m["timestamp"].as_str().unwrap_or("").to_string(),
-                                                                    attachments: m["attachments"].as_array().map(|arr| {
-                                                                        arr.iter().filter_map(|a| {
-                                                                            Some(Attachment {
-                                                                                filename: a["filename"].as_str()?.to_string(),
-                                                                                url: a["url"].as_str()?.to_string(),
-                                                                                content_type: a["content_type"].as_str().map(|s| s.to_string()),
-                                                                                width: a["width"].as_u64().map(|v| v as u32),
-                                                                                height: a["height"].as_u64().map(|v| v as u32),
-                                                                                size: a["size"].as_u64().unwrap_or(0),
-                                                                                description: a["description"].as_str().map(|s| s.to_string()),
-                                                                            })
-                                                                        }).collect()
-                                                                    }).unwrap_or_default(),
-                                                                    embeds: m["embeds"].as_array().cloned().unwrap_or_default(),
-                                                                    is_own: false,
-                                                                })
-                                                            }).collect();
-                                                            if page.is_empty() {
-                                                                page_ok = true;
-                                                                done = true;
-                                                                break;
-                                                            }
-                                                            before = page.first().map(|m| m.id.clone());
-                                                            all.extend(page);
-                                                            page_ok = true;
-                                                            if all.len() >= 300 {
-                                                                done = true;
-                                                                break;
-                                                            }
-                                                            tokio::time::sleep(Duration::from_millis(300)).await;
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = event_tx.send(ToApp::Debug(format!("History parse error: {}", e)));
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
-                                                }
-                                            }
-                                        } else {
-                                            let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
-                                            failed = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                    }
-                                }
-                                if failed {
-                                    break;
+                        // Историю тянем отдельной задачей. Раньше загрузка шла
+                        // прямо в цикле команд и блокировала всё остальное:
+                        // один запрос — это до трёх обращений к API с паузами,
+                        // и клик по следующему каналу «зависал» до его конца.
+                        // Повторный клик по тому же каналу игнорируем, иначе
+                        // два одинаковых запроса и лишний риск 429.
+                        let inflight = history_inflight.clone();
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        let cid = channel_id.clone();
+                        tokio::spawn(async move {
+                            {
+                                let mut busy = inflight.lock().await;
+                                if !busy.insert(cid.clone()) {
+                                    let _ = ev.send(ToApp::Debug(format!(
+                                        "History for {} already in flight, skipping",
+                                        &cid[..cid.len().min(14)]
+                                    )));
+                                    return;
                                 }
                             }
-                            if failed {
-                                done = true;
-                            }
-                        }
-
-                        let _ = event_tx.send(ToApp::Debug(format!("History: {} messages total", all.len())));
-                        all.reverse();
-                        let _ = event_tx.send(ToApp::History { channel_id: cid_for_msg.clone(), messages: all });
+                            fetch_history(httpc, tkc, ev.clone(), cid.clone()).await;
+                            inflight.lock().await.remove(&cid);
+                        });
                     }
                     ToGateway::OpenDM { user_id } => {
                         let url = format!("{}/users/@me/channels", API_BASE);

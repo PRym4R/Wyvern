@@ -222,7 +222,7 @@ impl App {
                                         let idx = self.channels.iter().position(|c| c.id == ch.id);
                                         self.selected_channel = idx;
                                         self.scroll_to_bottom = true;
-                                        self.send_cmd(ToGateway::FetchHistory { channel_id: ch.id.clone() });
+                                        self.open_channel(&ch.id);
                                     }
                                 }
                             });
