@@ -46,6 +46,10 @@ pub(crate) struct App {
     pub(crate) login_password: String,
     /// Не-ошибка на экране входа («пароль принят после обрезки пробелов»).
     pub(crate) login_notice: String,
+    /// Путь к файлу хранилища, если он отличается от `~/.wyvern_accounts.json`.
+    /// Нужен тестам: они идут параллельно, и общий env-переопределитель
+    /// приводил к записи в настоящий файл.
+    pub(crate) vault_path_override: Option<std::path::PathBuf>,
     pub(crate) login_selected: Option<String>,
     pub(crate) remember_account: bool,
     pub(crate) saved_accounts: Vec<StoredAccount>,
@@ -90,6 +94,7 @@ impl App {
             master_password: String::new(),
             login_password: String::new(),
             login_notice: String::new(),
+            vault_path_override: None,
             login_selected: None,
             remember_account: true,
             saved_accounts: Vec::new(),
@@ -585,40 +590,53 @@ mod layout_tests {
         assert!(App::load_accounts_with(&encrypted, "").is_none(), "empty password opens nothing");
     }
 
-    /// Изолированный файл хранилища на время теста: никто не трогает
-    /// настоящий ~/.wyvern_accounts.json.
-    struct TempVault {
-        path: std::path::PathBuf,
+    /// Изолированный файл хранилища на время теста. Важно: переопределение
+    /// живёт в конкретном экземпляре App, а не в переменной окружения —
+    /// тесты идут параллельно, и общий env приводил к тому, что тест
+    /// перезаписывал настоящий ~/.wyvern_accounts.json.
+    fn vaulted_app(tag: &str) -> (App, std::path::PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!("wyvern-test-{}-{}.json", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut app = App::new(mpsc::unbounded_channel().1);
+        app.vault_path_override = Some(p.clone());
+        (app, p)
     }
-    impl TempVault {
-        fn new(tag: &str) -> Self {
-            let mut p = std::env::temp_dir();
-            p.push(format!("wyvern-test-{}-{}.json", tag, std::process::id()));
-            let _ = std::fs::remove_file(&p);
-            std::env::set_var("WYVERN_ACCOUNTS_PATH", &p);
-            Self { path: p }
+
+    /// Тесты хранилища не должны трогать настоящий файл пользователя.
+    #[test]
+    fn vault_tests_never_touch_real_file() {
+        let real = App::accounts_path();
+        let before = std::fs::read(&real).ok();
+
+        let (mut app, tmp) = vaulted_app("isolated");
+        app.saved_accounts = vec![StoredAccount { token: "t-iso".into(), username: "u".into() }];
+        app.save_accounts("pw");
+        assert!(tmp.exists(), "тест должен писать во временный файл");
+
+        if let Some(before) = before {
+            let after = std::fs::read(&real).expect("настоящий файл пропал");
+            assert_eq!(before, after, "тест изменил настоящий файл хранилища!");
+        } else {
+            assert!(!real.exists(), "тест создал настоящий файл хранилища: {}", real.display());
         }
-    }
-    impl Drop for TempVault {
-        fn drop(&mut self) {
-            std::env::remove_var("WYVERN_ACCOUNTS_PATH");
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Пробелы в пароле — самая частая причина «неверного пароля».
     #[test]
     fn vault_tolerates_password_spaces() {
         for saved in ["hunter2", "hunter2 ", " hunter2", "hunter2\n"] {
-            let _vault = TempVault::new("space");
-            let accs = vec![StoredAccount { token: "tok-space".into(), username: "bob".into() }];
-            let mut app = App::new(mpsc::unbounded_channel().1);
-            app.saved_accounts = accs;
+            let (mut app, tmp) = vaulted_app("space");
+            app.saved_accounts =
+                vec![StoredAccount { token: "tok-space".into(), username: "bob".into() }];
             app.save_accounts(saved);
-            assert!(App::accounts_path().exists(), "файл не записался");
+            assert!(tmp.exists(), "файл не записался");
 
-            // Вводим без пробелов — должно открыться.
+            // Вводим без пробелов — должно открыться (другой экземпляр App
+            // смотрит в тот же файл, как это делает перезапуск клиента).
             let mut app2 = App::new(mpsc::unbounded_channel().1);
+            app2.vault_path_override = Some(tmp.clone());
             let hint = app2.unlock_vault("hunter2").expect("пароль без пробелов должен подойти");
             assert_eq!(app2.saved_accounts.len(), 1, "аккаунт не загрузился (saved={:?})", saved);
             assert_eq!(app2.saved_accounts[0].username, "bob");
@@ -627,39 +645,40 @@ mod layout_tests {
             } else {
                 assert!(hint.is_some(), "для пароля с пробелами ждём подсказку, saved={:?}", saved);
             }
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
     /// Хранилище без аккаунтов — это не «неверный пароль».
     #[test]
     fn empty_vault_is_not_a_wrong_password() {
-        let _vault = TempVault::new("empty");
+        let (mut app, tmp) = vaulted_app("empty");
         let encrypted = App::encrypt_accounts(&[], "pw123").expect("encrypt");
-        std::fs::write(App::accounts_path(), encrypted).unwrap();
+        std::fs::write(&tmp, encrypted).unwrap();
 
-        let mut app = App::new(mpsc::unbounded_channel().1);
         let res = app.unlock_vault("pw123");
         assert!(res.is_ok(), "пустое хранилище с верным паролем должно открываться: {:?}", res);
         assert!(app.saved_accounts.is_empty());
         assert!(app.accounts_unlocked);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Неверный пароль — честная ошибка, а не тихий пустой список.
     #[test]
     fn wrong_password_still_errors() {
-        let _vault = TempVault::new("wrong");
+        let (mut app, tmp) = vaulted_app("wrong");
         let encrypted = App::encrypt_accounts(
             &[StoredAccount { token: "t".into(), username: "u".into() }],
             "right",
         )
         .expect("encrypt");
-        std::fs::write(App::accounts_path(), encrypted).unwrap();
+        std::fs::write(&tmp, encrypted).unwrap();
 
-        let mut app = App::new(mpsc::unbounded_channel().1);
         let res = app.unlock_vault("wrong");
         let err = res.err().expect("неверный пароль должен давать ошибку");
         assert!(err.contains("Неверный пароль"), "непонятное сообщение: {}", err);
         assert!(!app.accounts_unlocked);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

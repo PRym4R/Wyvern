@@ -79,8 +79,20 @@ impl App {
     }
     pub(crate) fn save_accounts(&self, password: &str) {
         if let Some(s) = Self::encrypt_accounts(&self.saved_accounts, password) {
-            let _ = std::fs::write(Self::accounts_path(), s);
+            // Пишем во временный файл и переименовываем: если клиент убить
+            // посреди записи, старый файл останется целым.
+            let path = self.vault_path();
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, s).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
+    }
+    /// Файл хранилища конкретного экземпляра. Переопределение живёт в полях
+    /// App, а не в переменной окружения: тесты идут параллельно, и общий
+    /// env приводил к тому, что тест писал в настоящий файл.
+    pub(crate) fn vault_path(&self) -> std::path::PathBuf {
+        self.vault_path_override.clone().unwrap_or_else(Self::accounts_path)
     }
     pub(crate) fn mask_token(&self, token: &str) -> String {
         if token.len() <= 8 {
@@ -120,8 +132,8 @@ impl App {
         }
     }
     /// «изменён N мин назад» для файла хранилища, если он есть.
-    pub(crate) fn vault_age_text() -> Option<String> {
-        let meta = std::fs::metadata(Self::accounts_path()).ok()?;
+    pub(crate) fn vault_age_text(&self) -> Option<String> {
+        let meta = std::fs::metadata(self.vault_path()).ok()?;
         let secs = meta.modified().ok()?.elapsed().ok()?.as_secs();
         Some(if secs < 90 {
             format!("изменён {} сек назад", secs)
@@ -142,7 +154,7 @@ impl App {
         if password.is_empty() {
             return Err("Введите пароль хранилища".to_string());
         }
-        let content = match std::fs::read_to_string(Self::accounts_path()) {
+        let content = match std::fs::read_to_string(self.vault_path()) {
             Ok(s) => s,
             Err(_) => {
                 // Файла нет — это первый вход, создаём новое хранилище.
@@ -174,7 +186,7 @@ impl App {
 
         Err(format!(
             "Неверный пароль хранилища (файл {})",
-            Self::accounts_path().display()
+            self.vault_path().display()
         ))
     }
     /// Набор вариантов пароля, которые пробуем подряд: как ввёл, без

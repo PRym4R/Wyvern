@@ -340,7 +340,7 @@ impl App {
         // Подсказка про существующий файл: сразу видно, что аккаунты на
         // диске есть и нужен именно тот пароль, которым их сохраняли.
         if !self.accounts_unlocked {
-            if let Some(age) = App::vault_age_text() {
+            if let Some(age) = self.vault_age_text() {
                 ui.label(
                     RichText::new(format!(
                         "Файл хранилища найден ({}), открой его паролем оттуда",
