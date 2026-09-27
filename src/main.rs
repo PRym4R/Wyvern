@@ -28,10 +28,12 @@ fn main() -> eframe::Result<()> {
         let _ = std::fs::write("/tmp/discord_panic.log", format!("{:?}", info));
     }));
 
+    // Версия в заголовке: бинарник в корне репозитория пересобирают не
+    // всегда, и по заголовку сразу видно, какой именно запущен.
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_min_inner_size([700.0, 500.0])
-            .with_title("Wyvern"),
+            .with_title(format!("Wyvern {}", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
 
