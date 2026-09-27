@@ -909,6 +909,111 @@ mod geometry_tests {
         assert!(drain(&mut h.cmds).is_empty(), "истории больше нет, а запрос ушёл");
     }
 
+    /// То же, но через настоящий путь открытия канала: `open_channel` сам
+    /// просит первую страницу, ответ приходит от гейтвея отдельным событием.
+    /// Проверяем, что в канале оказывается ровно одна страница и никто не
+    /// просит следующую, пока пользователь не доскроллит.
+    #[test]
+    fn opening_a_channel_fetches_exactly_one_page() {
+        let (gw_tx, gw_rx) = mpsc::unbounded_channel::<ToApp>();
+        let (app_tx, mut cmds) = mpsc::unbounded_channel();
+        let mut app = App::new(gw_rx);
+        app.connected = true;
+        app.gw_started = true;
+        app.to_gw = Some(app_tx);
+        app.channels.push(ChatChannel {
+            id: "c0".into(),
+            name: "основной".into(),
+            guild_id: None,
+            channel_type: 0,
+            topic: None,
+            position: 0,
+        });
+        let ctx = egui::Context::default();
+
+        // Клик по каналу.
+        app.open_channel("c0");
+        app.selected_channel = Some(0);
+        frames(&mut app, &ctx, 3);
+
+        let sent = drain(&mut cmds);
+        eprintln!("[TEST] при открытии канала ушло запросов: {sent:?}");
+        assert_eq!(sent.len(), 1, "открытие канала — это один запрос");
+        match &sent[0] {
+            ToGateway::FetchHistory { before, .. } => {
+                assert!(before.is_none(), "первая страница идёт без `before`")
+            }
+            other => panic!("ожидался FetchHistory, пришло {other:?}"),
+        }
+
+        // Гейтвей ответил страницей из 50 сообщений.
+        let page: Vec<ChatMessage> = (0..50).map(message).collect();
+        gw_tx
+            .send(ToApp::History { channel_id: "c0".into(), messages: page, more: true })
+            .unwrap();
+        app.poll(&ctx);
+        frames(&mut app, &ctx, 3);
+
+        eprintln!(
+            "[TEST] в канале {} сообщений, смещение {:.0}, внизу ли: {}",
+            app.messages["c0"].len(),
+            app.chat_offset_y,
+            app.chat_at_bottom
+        );
+        assert_eq!(app.messages["c0"].len(), 50, "в канале должна быть одна страница");
+        assert!(app.chat_at_bottom, "открытый канал показывает новое сообщение, а не начало");
+        assert!(
+            drain(&mut cmds).is_empty(),
+            "пока не доскроллили вверх, следующая страница не нужна"
+        );
+    }
+
+    /// приносить одну страницу, а не «читаем канал целиком». Дошли до
+    /// начала, страница пришла — и всё: читатель сам решает, докручивать ли
+    /// дальше. Иначе клиент в фоне долбит API, пока не упрётся в потолок.
+    #[test]
+    fn scrolling_up_loads_one_page_not_the_whole_channel() {
+        let mut h = app_with_messages(50);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        assert!(
+            drain(&mut h.cmds).is_empty(),
+            "при открытии канала история не должна грузиться сама"
+        );
+
+        // Читатель доскроллил до самого начала.
+        scroll_to(&mut h.app, 0.0);
+        frames(&mut h.app, &ctx, 3);
+        let first_page = drain(&mut h.cmds).len();
+        eprintln!("[TEST] доскроллил вверх: запросов {first_page}");
+
+        // Discord отвечает страницей: «дальше есть». Читатель при этом
+        // остаётся на тех же сообщениях, и новых запросов быть не должно.
+        let mut total = first_page;
+        for round in 0..4 {
+            h.tx
+                .send(ToApp::HistoryMore {
+                    channel_id: "c0".into(),
+                    messages: (1000 + round * 50..1050 + round * 50).map(message).collect(),
+                    more: true,
+                })
+                .unwrap();
+            h.app.poll(&ctx);
+            frames(&mut h.app, &ctx, 3);
+            let got = drain(&mut h.cmds).len();
+            total += got;
+            eprintln!(
+                "[TEST] раунд {round}: сообщений {}, запросов {got}, всего {total}, смещение {:.0}",
+                h.app.messages["c0"].len(),
+                h.app.chat_offset_y
+            );
+        }
+        assert_eq!(
+            total, 1,
+            "одна прокрутка вверх должна стоить одну страницу, а запросов ушло {total}"
+        );
+    }
+
     /// Пустой канал и канал из одного сообщения — обычное дело, и ни то, ни
     /// другое не должно ни падать, ни просить истории, которой нет.
     #[test]
