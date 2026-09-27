@@ -45,107 +45,100 @@ struct SessionState {
     seq: Option<i64>,
 }
 
-/// Сколько сообщений максимум тянуть из одного канала.
-pub(crate) const MAX_HISTORY: usize = 300;
-/// Размер страницы истории (максимум, который отдаёт Discord).
-pub(crate) const HISTORY_PAGE: usize = 100;
+/// Сколько сообщений тянуть за один раз. Discord отдаёт до 100, но начинать
+/// надо с меньшего: пока грузится три страницы, пользователь смотрит в пустой
+/// канал, а потом получает столько текста, что всё равно не прочитает. Как в
+/// Discord — первые 50 сообщений сразу, дальше по мере прокрутки вверх.
+pub(crate) const HISTORY_PAGE: usize = 50;
 
-/// Загрузить историю канала и отдать её в UI.
+/// Загрузить одну страницу истории и отдать её в UI.
 ///
-/// Страницы идут от новых к старым. `before` — самый старый id уже
-/// полученной страницы: Discord отдаёт сообщения от новых к старым, и если
-/// просить `before` от самого нового, он вернёт ту же страницу ещё раз
-/// (раньше так и было — в канале на 91 сообщение приезжало 300 строк с
-/// тройными дублями и лишними запросами).
-async fn fetch_history(
+/// `before` — самый старый id, который уже есть на экране: Discord отдаёт
+/// сообщения от новых к старым, и если просить `before` от самого нового, он
+/// вернёт ту же страницу ещё раз (раньше так и было — в канале на 91 сообщение
+/// приезжало 300 строк с тройными дублями и лишними запросами). `None` — это
+/// первая страница, её мы показываем сразу.
+async fn fetch_history_page(
     httpc: reqwest::Client,
     tkn: String,
     event_tx: mpsc::UnboundedSender<ToApp>,
     channel_id: String,
+    before: Option<String>,
 ) {
-    let mut all: Vec<ChatMessage> = Vec::new();
-    let mut before: Option<String> = None;
-    loop {
-        let url = history_url(&channel_id, before.as_deref());
+    let url = history_url(&channel_id, before.as_deref());
 
-        let mut page: Vec<ChatMessage> = Vec::new();
-        let mut got_page = false;
-        let mut failed = false;
-        let mut attempt = 0u32;
-        while !got_page && attempt < 3 && !failed {
-            attempt += 1;
-            let req = httpc
-                .get(&url)
-                .header("Authorization", &*tkn)
-                .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                .header("X-Super-Properties", &super_props())
-                .header("X-Discord-Locale", "en-US")
-                .header("X-Discord-Timezone", "Europe/Moscow");
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
-                    if status == 429 {
-                        let retry = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(2);
-                        let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
-                        time::sleep(Duration::from_secs(retry)).await;
-                        continue;
+    let mut page: Vec<ChatMessage> = Vec::new();
+    let mut got_page = false;
+    let mut failed = false;
+    let mut attempt = 0u32;
+    while !got_page && attempt < 3 && !failed {
+        attempt += 1;
+        let req = httpc
+            .get(&url)
+            .header("Authorization", &*tkn)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+            .header("X-Super-Properties", &super_props())
+            .header("X-Discord-Locale", "en-US")
+            .header("X-Discord-Timezone", "Europe/Moscow");
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
+                if status == 429 {
+                    let retry = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(2);
+                    let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
+                    time::sleep(Duration::from_secs(retry)).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
+                    failed = true;
+                    break;
+                }
+                match resp.text().await {
+                    Ok(body) => {
+                        let mut warn = |m: String| {
+                            let _ = event_tx.send(ToApp::Debug(m));
+                        };
+                        page = parse_history_page_lenient(&body, &channel_id, &mut warn);
+                        got_page = true;
                     }
-                    if !status.is_success() {
-                        let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
-                        failed = true;
-                        break;
-                    }
-                    match resp.text().await {
-                        Ok(body) => {
-                            let mut warn = |m: String| {
-                                let _ = event_tx.send(ToApp::Debug(m));
-                            };
-                            page = parse_history_page_lenient(&body, &channel_id, &mut warn);
-                            got_page = true;
-                        }
-                        Err(e) => {
-                            let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
-                        }
+                    Err(e) => {
+                        let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
                     }
                 }
-                Err(e) => {
-                    let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
-                    time::sleep(Duration::from_secs(2)).await;
-                }
+            }
+            Err(e) => {
+                let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
+                time::sleep(Duration::from_secs(2)).await;
             }
         }
-        if failed || !got_page {
-            break;
-        }
-        // Пустая страница — истории больше нет.
-        if page.is_empty() {
-            break;
-        }
-        let got = page.len();
-        match next_before_id(&page, before.as_deref()) {
-            Some(id) => before = Some(id),
-            None => {
-                all.extend(page);
-                break;
-            }
-        }
-        all.extend(page);
-        // Короткая страница = дошли до начала канала, ещё страниц не будет.
-        if !more_history_pages(got, all.len()) {
-            break;
-        }
-        time::sleep(Duration::from_millis(300)).await;
+    }
+    if failed || !got_page {
+        // Ничего не пришло — снять «Loading…» должен вызывающий: он ждёт
+        // ответ по этому каналу, а пустую страницу отправлять незачем.
+        return;
     }
 
-    all.reverse();
-    let _ = event_tx.send(ToApp::Debug(format!("History: {} messages total", all.len())));
-    let _ = event_tx.send(ToApp::History { channel_id, messages: all });
+    let got = page.len();
+    let more = more_history_available(got) && next_before_id(&page, before.as_deref()).is_some();
+    let _ = event_tx.send(ToApp::Debug(format!(
+        "History page: {} messages, more={} (before={})",
+        got,
+        more,
+        before.as_deref().map(|b| &b[..b.len().min(14)]).unwrap_or("-")
+    )));
+    let event = if before.is_some() {
+        ToApp::HistoryMore { channel_id, messages: page, more }
+    } else {
+        ToApp::History { channel_id, messages: page, more }
+    };
+    let _ = event_tx.send(event);
 }
 
 /// Адрес страницы истории. Первая страница — без `before`, дальше — от
@@ -171,10 +164,12 @@ pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Opt
     Some(id)
 }
 
-/// Нужно ли догружать страницы: страница должна быть полной, а лимит
-/// ещё не выбран.
-pub(crate) fn more_history_pages(got: usize, total: usize) -> bool {
-    got >= HISTORY_PAGE && total < MAX_HISTORY
+/// Есть ли что грузить дальше вверх. Короткая страница = Discord дошёл до
+/// начала канала: там меньше 50 сообщений и следующего запроса не будет.
+/// Повторяющийся id (страницы пошли по кругу) — тоже конец, иначе запросы
+/// не кончатся.
+pub(crate) fn more_history_available(got: usize) -> bool {
+    got >= HISTORY_PAGE
 }
 
 /// Discord не всегда присылает строку там, где мы ждём строку (например,
@@ -863,12 +858,12 @@ async fn gw_inner(
                             }
                         }
                     }
-                    ToGateway::FetchHistory { channel_id } => {
+                    ToGateway::FetchHistory { channel_id, before } => {
                         // Историю тянем отдельной задачей. Раньше загрузка шла
                         // прямо в цикле команд и блокировала всё остальное:
                         // один запрос — это до трёх обращений к API с паузами,
                         // и клик по следующему каналу «зависал» до его конца.
-                        // Повторный клик по тому же каналу игнорируем, иначе
+                        // Повторный запрос по тому же каналу игнорируем, иначе
                         // два одинаковых запроса и лишний риск 429.
                         let inflight = history_inflight.clone();
                         let httpc = http.clone();
@@ -886,7 +881,7 @@ async fn gw_inner(
                                     return;
                                 }
                             }
-                            fetch_history(httpc, tkc, ev.clone(), cid.clone()).await;
+                            fetch_history_page(httpc, tkc, ev.clone(), cid.clone(), before).await;
                             inflight.lock().await.remove(&cid);
                         });
                     }

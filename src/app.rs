@@ -12,8 +12,11 @@ use crate::models::{
     Theme, UserProfile,
 };
 
-/// Больше этого сообщений на канал не держим в памяти.
-const MAX_MESSAGES_PER_CHANNEL: usize = 300;
+/// Больше этого сообщений на канал не держим в памяти. История теперь
+/// подгружается вверх по мере прокрутки, поэтому потолок нужен обязательно:
+/// без него длинный канал растёт бесконечно, и держать в памяти сотни
+/// сообщений, которых не видно, смысла нет.
+const MAX_MESSAGES_PER_CHANNEL: usize = 500;
 /// Сколько текстур аватаров/иконок guild'ов держим.
 const MAX_AVATAR_CACHE: usize = 192;
 /// Сколько картинок-вложений держим (каждая — это мегабайты VRAM/RAM).
@@ -75,6 +78,39 @@ pub(crate) struct App {
     pub(crate) show_friends: bool,
     pub(crate) friends: Vec<UserProfile>,
     pub(crate) history_loading: Option<String>,
+    /// Идёт ли догрузка более старых сообщений (прокрутка вверх). Отдельно
+    /// от `history_loading`, который означает «канал открыт, первой страницы
+    /// ещё нет»: подгрузка вверх идёт уже по открытому каналу.
+    pub(crate) history_loading_more: bool,
+    /// Старше показанного в канале ничего нет — дошли до начала. Дальше по
+    /// прокрутке вверх не просим, иначе клиент будет снова и снова бить в
+    /// API за страницей, которой не существует.
+    pub(crate) history_exhausted: bool,
+    /// Прокрутка чата в самом низу. По этому признаку новое сообщение
+    /// прокручивает чат вниз, а читающего историю выше не выбрасывает.
+    pub(crate) chat_at_bottom: bool,
+    /// Измеренная высота сообщений по их id. Нужна виртуализации: без неё
+    /// неизвестно, какие сообщения попадают в окно, а рисовать все — это
+    /// десятки тысяч аллокаций на кадр. Ключ — id, а не индекс, поэтому
+    /// подгрузка истории в начало списка кэш не портит.
+    pub(crate) msg_heights: HashMap<String, f32>,
+    /// Префиксные суммы высот: буфер кадра, переиспользуется между кадрами.
+    pub(crate) msg_offsets: Vec<f32>,
+    /// Ширина содержимого чата с прошлого кадра — от неё зависят переносы
+    /// строк, а значит и высоты сообщений.
+    pub(crate) msg_width: f32,
+    /// Высота окна чата с прошлого кадра. Нужна, чтобы открыть список сразу
+    /// на самом низу: egui узнаёт высоту содержимого только после отрисовки,
+    /// а перемотать вниз нужно до неё.
+    pub(crate) chat_inner_h: f32,
+    /// Прокрутка чата: зеркало того, чем сейчас открыт скролл.
+    pub(crate) chat_offset_y: f32,
+    /// На чём держится вид: id сообщения у верхней границы окна и на сколько
+    /// оно выше неё. Когда список меняется (подгрузилась история вверх, у
+    /// сообщения уточнилась высота), это сообщение остаётся на месте.
+    pub(crate) chat_anchor: Option<(String, f32)>,
+    /// Просить ещё более старые сообщения — выставляется при отрисовке.
+    pub(crate) want_older: bool,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -121,6 +157,16 @@ impl App {
             show_friends: false,
             friends: Vec::new(),
             history_loading: None,
+            history_loading_more: false,
+            history_exhausted: false,
+            chat_at_bottom: true,
+            msg_heights: HashMap::new(),
+            msg_offsets: Vec::new(),
+            msg_width: 0.0,
+            chat_inner_h: 0.0,
+            chat_offset_y: 0.0,
+            chat_anchor: None,
+            want_older: false,
             autoselected: false,
             theme_index: 1,
             last_render_key: String::new(),
@@ -178,36 +224,18 @@ impl App {
                     let entry = self.messages.entry(cid).or_default();
                     entry.push(Arc::new(msg));
                     trim_messages(entry);
-                }
-                ToApp::History { channel_id, messages } => {
-                    let entry = self.messages.entry(channel_id.clone()).or_default();
-                    entry.clear();
-                    entry.extend(messages.into_iter().map(Arc::new));
-                    trim_messages(entry);
-                    let stored = entry.len();
-                    // Дамп сообщений — отладочная вещь, пишется только когда
-                    // явно попросили переменной окружения: на каждый выбор
-                    // канала он собирал строку на полэкрана текста.
-                    if std::env::var_os("WYVERN_DUMP").is_some() {
-                        let dump = entry.iter()
-                            .map(|m| format!("[{}] {} (id {}): {}{}", m.timestamp, m.author_name, m.author_id, m.content,
-                                if m.attachments.is_empty() { String::new() } else { format!(" <{} attachments>", m.attachments.len()) }))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
-                    }
-                    let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.clone() };
-                    // Спиннер и прокрутка — только если ответ пришёл для канала,
-                    // который грузится сейчас. Поздний ответ по уже закрытому
-                    // каналу не должен снимать «Loading messages…» у того,
-                    // который ещё грузится: так выглядело как «истории нет».
-                    let for_current = self.history_loading.as_deref() == Some(channel_id.as_str());
-                    if for_current || self.history_loading.is_none() {
-                        self.history_loading = None;
+                    // Внизу ли пользователь — решаем по прошлому кадру: если он
+                    // читает историю выше, новое сообщение не должно выбрасывать
+                    // его в самый конец.
+                    if self.chat_at_bottom {
                         self.scroll_to_bottom = true;
                     }
-                    self.push_debug(format!("Stored {} msgs for channel {}{}", stored, cid_short,
-                        if for_current { "" } else { " (не текущий канал)" }));
+                }
+                ToApp::History { channel_id, messages, more } => {
+                    self.apply_history(&channel_id, messages, more, false);
+                }
+                ToApp::HistoryMore { channel_id, messages, more } => {
+                    self.apply_history(&channel_id, messages, more, true);
                 }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
@@ -316,6 +344,12 @@ impl App {
         self.selected_channel = None;
         self.autoselected = false;
         self.history_loading = None;
+        self.history_loading_more = false;
+        self.history_exhausted = false;
+        self.msg_heights.clear();
+        self.msg_offsets.clear();
+        self.chat_anchor = None;
+        self.chat_offset_y = 0.0;
         self.show_friends = false;
         self.username.clear();
         self.user_id.clear();
@@ -359,10 +393,13 @@ impl App {
             self.add_saved_account(&token, "");
         }
     }
-    /// Открыть канал. История всё равно грузится заново, поэтому сообщения
-    /// других каналов можно выбросить — память не растёт при переключении.
+    /// Открыть канал. Первая страница истории всё равно грузится заново,
+    /// поэтому сообщения других каналов можно выбросить — память не растёт
+    /// при переключении.
     pub(crate) fn open_channel(&mut self, channel_id: &str) {
         self.history_loading = Some(channel_id.to_string());
+        self.history_loading_more = false;
+        self.history_exhausted = false;
         self.messages.retain(|k, _| k == channel_id);
         // Незабранные загрузки прежнего канала больше никто не заберёт: к
         // моменту переключения они уже лежат в канале с готовыми
@@ -372,7 +409,99 @@ impl App {
         // равно перезапросятся.
         self.pending_images.clear();
         self.pending_avatars.clear();
-        self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string() });
+        self.msg_heights.clear();
+        self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
+    }
+    /// Положить страницу истории в список канала.
+    ///
+    /// Первая страница заменяет содержимое, догрузка вверх (`prepend`)
+    /// вставляется в начало. Спиннеры и прокрутка трогаются только у того
+    /// канала, который открыт сейчас: поздний ответ по уже закрытому каналу
+    /// не должен снимать «Loading messages…» у того, который грузится сейчас.
+    fn apply_history(&mut self, channel_id: &str, incoming: Vec<ChatMessage>, more: bool, prepend: bool) {
+        let added = {
+            let entry = self.messages.entry(channel_id.to_string()).or_default();
+            if prepend {
+                // `before` у Discord строгий, но на стыке страниц крайнее
+                // сообщение приходит двумя копиями: убираем лишнюю, иначе
+                // верх списка зарос бы повторами.
+                let dup = entry.first().map(|m| m.id.clone());
+                let mut page: Vec<Arc<ChatMessage>> = incoming.into_iter().map(Arc::new).collect();
+                if let Some(dup) = dup {
+                    page.retain(|m| m.id != dup);
+                }
+                let added = page.len();
+                entry.splice(..0, page);
+                added
+            } else {
+                entry.clear();
+                entry.extend(incoming.into_iter().map(Arc::new));
+                0
+            }
+        };
+        // Потолок: при догрузке вверх выбрасываем самые старые (пользователь
+        // смотрит на новые, а старые всё равно никогда не покажет), при новом
+        // сообщении — тоже, оно новее всего.
+        let stored = {
+            let entry = self.messages.get_mut(channel_id).expect("страницу только что положили");
+            trim_messages(entry);
+            entry.len()
+        };
+        // Дамп сообщений — отладочная вещь, пишется только когда явно
+        // попросили переменной окружения: на каждый выбор канала он собирал
+        // строку на полэкрана текста. По догрузке вверх не пишем: там он
+        // перезаписывал бы файл на каждой странице.
+        if !prepend && std::env::var_os("WYVERN_DUMP").is_some() {
+            if let Some(entry) = self.messages.get(channel_id) {
+                let dump = entry.iter()
+                    .map(|m| format!("[{}] {} (id {}): {}{}", m.timestamp, m.author_name, m.author_id, m.content,
+                        if m.attachments.is_empty() { String::new() } else { format!(" <{} attachments>", m.attachments.len()) }))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
+            }
+        }
+        let for_current = self.current_channel_id() == Some(channel_id);
+        if for_current {
+            self.history_loading = None;
+            self.history_loading_more = false;
+            // Догружать больше некуда либо потому, что Discord сказал «дальше
+            // пусто», либо потому, что сообщений уже потолок.
+            self.history_exhausted = !more || stored >= MAX_MESSAGES_PER_CHANNEL;
+            if !prepend {
+                self.scroll_to_bottom = true;
+                // Список переставлен целиком — измеренные высоты к нему больше
+                // не относятся.
+                self.msg_heights.clear();
+            }
+        }
+        let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.to_string() };
+        self.push_debug(format!("Stored {} msgs ({} new) for channel {}{}", stored, added, cid_short,
+            if for_current { "" } else { " (не текущий канал)" }));
+    }
+    /// Догрузить более старые сообщения: просим страницу от самой старой
+    /// строки, что уже есть в канале. Пока предыдущая страница в пути, повторно
+    /// не спрашиваем — иначе один скролл вверх даст пачку одинаковых запросов.
+    pub(crate) fn request_older_history(&mut self) {
+        if self.history_loading.is_some() || self.history_loading_more || self.history_exhausted {
+            return;
+        }
+        let Some(cid) = self.current_channel_id().map(str::to_string) else { return };
+        let Some(oldest) = self.messages.get(&cid).and_then(|v| v.first()).map(|m| m.id.clone()) else { return };
+        if oldest.is_empty() {
+            // Сообщение без id (наше собственное, пока Discord не подтвердил
+            // отправку) продолжать историю не позволяет: `before` не от чего.
+            self.history_exhausted = true;
+            return;
+        }
+        self.history_loading_more = true;
+        self.send_cmd(ToGateway::FetchHistory { channel_id: cid, before: Some(oldest) });
+    }
+    /// Id канала, который открыт сейчас. Состояние истории и чата относятся
+    /// именно к нему.
+    pub(crate) fn current_channel_id(&self) -> Option<&str> {
+        let ch = self.channels.get(self.selected_channel?)?;
+        Some(ch.id.as_str())
     }
     /// Имя для показа. Возвращаем ссылку на строку самого сообщения: раньше
     /// здесь на каждом кадре клонировалось имя каждого видимого сообщения.
@@ -853,6 +982,7 @@ mod layout_tests {
         tx.send(ToApp::History {
             channel_id: "c1".into(),
             messages: vec![test_msg("m1", "c1", "старое")],
+            more: false,
         })
         .unwrap();
         app.poll(&ctx);
@@ -867,6 +997,7 @@ mod layout_tests {
         tx.send(ToApp::History {
             channel_id: "c2".into(),
             messages: vec![test_msg("m2", "c2", "свежее")],
+            more: false,
         })
         .unwrap();
         app.poll(&ctx);
@@ -898,17 +1029,170 @@ mod layout_tests {
         );
         // Пустая страница — история кончилась.
         assert_eq!(crate::gateway::next_before_id(&[], None), None);
-        // Короткая страница = дошли до начала канала.
-        assert!(!crate::gateway::more_history_pages(3, 3));
-        assert!(crate::gateway::more_history_pages(100, 100));
-        assert!(!crate::gateway::more_history_pages(100, crate::gateway::MAX_HISTORY));
+        // Короткая страница = дошли до начала канала, дальше не просим.
+        assert!(!crate::gateway::more_history_available(3));
+        assert!(!crate::gateway::more_history_available(49));
+        assert!(crate::gateway::more_history_available(50));
+        assert!(crate::gateway::more_history_available(100));
 
         // Адрес страницы: первая без `before`, вторая — от старого id.
         let first = crate::gateway::history_url("42", None);
         assert!(!first.contains("before="), "первая страница без before: {}", first);
-        assert!(first.ends_with("/channels/42/messages?limit=100"), "{}", first);
+        assert!(
+            first.ends_with(&format!("/channels/42/messages?limit={}", crate::gateway::HISTORY_PAGE)),
+            "{}",
+            first
+        );
         let second = crate::gateway::history_url("42", Some("101"));
-        assert!(second.ends_with("/channels/42/messages?limit=100&before=101"), "{}", second);
+        assert!(second.ends_with(&format!("/channels/42/messages?limit={}&before=101", crate::gateway::HISTORY_PAGE)), "{}", second);
+    }
+
+    /// Подгрузка истории вверх по прокрутке: страница добавляется в начало
+    /// списка, а не заменяет его, и крайнее сообщение не дублируется.
+    #[test]
+    fn older_page_is_prepended_without_duplicates() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+
+        // Первая страница: как в Discord, отдаём 50 сообщений.
+        let first: Vec<ChatMessage> = (0..crate::gateway::HISTORY_PAGE)
+            .map(|i| test_msg(&format!("m{}", i + 1), "c1", "новое"))
+            .collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: first, more: true }).unwrap();
+        app.poll(&ctx);
+        let stored = app.messages.get("c1").unwrap().len();
+        assert_eq!(stored, crate::gateway::HISTORY_PAGE);
+        assert!(!app.history_exhausted, "Discord сказал, что история есть дальше");
+        assert!(app.history_loading.is_none(), "спиннер первой страницы снялся");
+
+        // Прокрутили вверх: просим и получаем страницу старше. Крайнее
+        // сообщение приходит в обеих страницах — дубль не нужен.
+        app.request_older_history();
+        assert!(app.history_loading_more, "должен гореть индикатор догрузки");
+        let before = app.messages.get("c1").unwrap()[0].id.clone();
+        let older: Vec<ChatMessage> = (0..crate::gateway::HISTORY_PAGE)
+            .map(|i| test_msg(&format!("m{}", i), "c1", "старое"))
+            .collect();
+        tx.send(ToApp::HistoryMore { channel_id: "c1".into(), messages: older, more: false }).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        // 50 + 49: одно сообщение было на стыке страниц и дубль убрали.
+        assert_eq!(msgs.len(), crate::gateway::HISTORY_PAGE * 2 - 1, "страница должна добавиться, а не заменить");
+        assert_ne!(msgs[0].id, before, "в начале должно быть самое старое");
+        assert_eq!(msgs[0].content, "старое");
+        assert_eq!(msgs[crate::gateway::HISTORY_PAGE].content, "новое", "прежние сообщения не должны пропасть");
+        assert_eq!(
+            msgs.iter().filter(|m| m.id == "m1").count(),
+            1,
+            "крайнее сообщение не должно дублироваться"
+        );
+        assert!(app.history_exhausted, "короткой страницей история признана конченной");
+        assert!(!app.history_loading_more, "индикатор догрузки должен погаснуть");
+    }
+
+    /// Пока страница в пути, повторно по этому каналу не просим: один скролл
+    /// вверх иначе даст пачку одинаковых запросов и лишний риск 429.
+    #[test]
+    fn older_history_requested_once_at_a_time() {
+        let app_ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let page: Vec<ChatMessage> =
+            (0..crate::gateway::HISTORY_PAGE).map(|i| test_msg(&format!("m{}", i + 1), "c1", "x")).collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: page, more: true }).unwrap();
+        app.poll(&app_ctx);
+
+        app.request_older_history();
+        assert!(app.history_loading_more);
+        app.request_older_history();
+        assert!(app.history_loading_more, "второй запрос не должен уйти");
+        // Пока идёт первая страница канала — тоже не просим вверх.
+        app.history_loading_more = false;
+        app.history_loading = Some("c1".into());
+        app.request_older_history();
+        assert!(!app.history_loading_more, "во время первой загрузки вверх не лезем");
+    }
+
+    /// Дойдя до начала канала, клиент больше не бьёт в API: `before` от
+    /// кратчайшей страницы вернул бы её же.
+    #[test]
+    fn exhausted_channel_stops_asking() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        // Короткая страница = начало канала.
+        tx.send(ToApp::History {
+            channel_id: "c1".into(),
+            messages: vec![test_msg("m1", "c1", "единственное")],
+            more: false,
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert!(app.history_exhausted);
+        app.request_older_history();
+        assert!(!app.history_loading_more, "после конца истории запрашивать нельзя");
+    }
+
+    /// Новое сообщение тянет чат вниз только если пользователь и так внизу:
+    /// читающего историю выше выбрасывать в конец нельзя.
+    #[test]
+    fn new_message_scrolls_only_when_at_bottom() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+
+        app.chat_at_bottom = false;
+        app.scroll_to_bottom = false;
+        tx.send(ToApp::Message(test_msg("m1", "c1", "пока нас смотрят историю"))).unwrap();
+        app.poll(&ctx);
+        assert!(!app.scroll_to_bottom, "читающего историю нельзя перематывать вниз");
+
+        app.chat_at_bottom = true;
+        tx.send(ToApp::Message(test_msg("m2", "c1", "новое"))).unwrap();
+        app.poll(&ctx);
+        assert!(app.scroll_to_bottom, "внизу новое сообщение должно тянуть вниз");
     }
 
     /// Элемент кэша с заявленным «весом» в байтах.

@@ -73,7 +73,8 @@ impl App {
                 });
                 let idx = self.channels.len() - 1;
                 self.selected_channel = Some(idx);
-                self.send_cmd(ToGateway::FetchHistory { channel_id: id });
+                self.scroll_to_bottom = true;
+                self.open_channel(&id);
             }
             return;
         }
