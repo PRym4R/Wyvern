@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time;
@@ -101,15 +102,13 @@ async fn fetch_history(
                         break;
                     }
                     match resp.text().await {
-                        Ok(body) => match serde_json::from_str::<Vec<Value>>(&body) {
-                            Ok(arr) => {
-                                page = parse_history_page(&arr, &channel_id);
-                                got_page = true;
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(ToApp::Debug(format!("History parse error: {}", e)));
-                            }
-                        },
+                        Ok(body) => {
+                            let mut warn = |m: String| {
+                                let _ = event_tx.send(ToApp::Debug(m));
+                            };
+                            page = parse_history_page_lenient(&body, &channel_id, &mut warn);
+                            got_page = true;
+                        }
                         Err(e) => {
                             let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
                         }
@@ -178,44 +177,219 @@ pub(crate) fn more_history_pages(got: usize, total: usize) -> bool {
     got >= HISTORY_PAGE && total < MAX_HISTORY
 }
 
-/// Разобрать страницу истории из JSON Discord в сообщения.
-pub(crate) fn parse_history_page(arr: &[Value], channel_id: &str) -> Vec<ChatMessage> {
-    arr.iter()
-        .filter_map(|m| {
-            let author = m.get("author")?;
-            Some(ChatMessage {
-                id: m["id"].as_str().unwrap_or("").to_string(),
-                channel_id: channel_id.to_string(),
-                author_id: author["id"].as_str().unwrap_or("").to_string(),
-                author_name: author["username"].as_str().unwrap_or("?").to_string(),
-                author_avatar: author["avatar"].as_str().map(|s| s.to_string()),
-                nickname: None,
-                content: m["content"].as_str().unwrap_or("").to_string(),
-                timestamp: m["timestamp"].as_str().unwrap_or("").to_string(),
-                attachments: m["attachments"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|a| {
-                                Some(Attachment {
-                                    url: a["url"].as_str()?.to_string(),
-                                    content_type: a["content_type"].as_str().map(|s| s.to_string()),
-                                    description: a["description"].as_str().map(|s| s.to_string()),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                // Эмбеды храним только в урезанном виде: полный JSON стоит
-                // в разы дороже двух нужных полей.
-                embeds: m["embeds"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
-                    .unwrap_or_default(),
-                is_own: false,
-            })
+/// Discord не всегда присылает строку там, где мы ждём строку (например,
+/// `content` у системных сообщений может быть числом). Такое поле берём как
+/// есть: раньше `as_str().unwrap_or("")` тихо подставлял пустую строку, и
+/// ронять из-за этого всю страницу истории нельзя.
+fn de_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?
+        .map(|v| match v {
+            Value::String(s) => s,
+            other => other.to_string(),
         })
-        .collect()
+        .unwrap_or_default())
+}
+
+/// То же, но с «пустым» значением: отсутствие поля и не-строка дают `None`.
+fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| match v {
+        Value::String(s) => Some(s),
+        _ => None,
+    }))
+}
+
+/// Автор сообщения в том виде, в каком его рисует клиент.
+#[derive(serde::Deserialize)]
+struct RawAuthor {
+    #[serde(default, deserialize_with = "de_text")]
+    id: String,
+    #[serde(default, deserialize_with = "de_opt_text")]
+    username: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_text")]
+    avatar: Option<String>,
+}
+
+/// Вложение: только то, что нужно для показа. Имя файла, размеры и тип
+/// вложения клиенту не нужны — `content_type` берём, потому что по нему
+/// решаем, грузить ли картинку вообще.
+#[derive(serde::Deserialize)]
+struct RawAttachment {
+    #[serde(default, deserialize_with = "de_opt_text")]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_text")]
+    content_type: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_text")]
+    description: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawImage {
+    #[serde(default, deserialize_with = "de_opt_text")]
+    url: Option<String>,
+}
+
+/// Эмбед: автор, footer, provider, поля и прочее сюда не входят — serde
+/// пропускает неизвестные поля, не выделяя под них памяти.
+#[derive(serde::Deserialize)]
+struct RawEmbed {
+    #[serde(default, deserialize_with = "de_opt_text")]
+    description: Option<String>,
+    #[serde(default)]
+    image: Option<RawImage>,
+    #[serde(default)]
+    thumbnail: Option<RawImage>,
+    #[serde(default)]
+    video: Option<RawImage>,
+}
+
+impl RawEmbed {
+    fn into_embed(self) -> Option<Embed> {
+        let image_url = [self.image, self.thumbnail, self.video]
+            .into_iter()
+            .flatten()
+            .find_map(|i| i.url)
+            .filter(|u| !u.is_empty());
+        let description = match self.description {
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if trimmed.len() == s.len() {
+                    // Обрезки не было — оставляем уже готовую строку.
+                    Some(s)
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+        if image_url.is_none() && description.is_none() {
+            return None;
+        }
+        Some(Embed { image_url, description })
+    }
+}
+
+/// Сообщение в том виде, в каком оно хранится у нас.
+#[derive(serde::Deserialize)]
+struct RawMessage {
+    #[serde(default, deserialize_with = "de_text")]
+    id: String,
+    #[serde(default, deserialize_with = "de_text")]
+    content: String,
+    #[serde(default, deserialize_with = "de_text")]
+    timestamp: String,
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    #[serde(default)]
+    attachments: Vec<RawAttachment>,
+    #[serde(default)]
+    embeds: Vec<RawEmbed>,
+}
+
+impl RawMessage {
+    /// `None` — сообщение без автора, в чат оно не попадает (как и раньше).
+    fn into_message(self, channel_id: &str) -> Option<ChatMessage> {
+        let author = self.author?;
+        Some(ChatMessage {
+            id: self.id,
+            channel_id: channel_id.to_string(),
+            author_id: author.id,
+            author_name: author.username.unwrap_or_else(|| "?".into()),
+            author_avatar: author.avatar,
+            nickname: None,
+            content: self.content,
+            timestamp: self.timestamp,
+            attachments: self
+                .attachments
+                .into_iter()
+                .filter_map(|a| {
+                    Some(Attachment {
+                        url: a.url?,
+                        content_type: a.content_type,
+                        description: a.description,
+                    })
+                })
+                .collect(),
+            // Эмбеды храним только в урезанном виде: полный JSON стоит
+            // в разы дороже двух нужных полей.
+            embeds: self.embeds.into_iter().filter_map(RawEmbed::into_embed).collect(),
+            is_own: false,
+        })
+    }
+}
+
+/// Разобрать страницу истории из JSON Discord в сообщения.
+///
+/// Страница разбирается сразу в нужные структуры. Если сначала собрать
+/// `serde_json::Value` на всю страницу, а потом вытащить из неё несколько
+/// строк, то на сотне сообщений это десятки тысяч лишних аллокаций и
+/// заметный пик памяти — всё дерево `Value` живёт до конца разбора.
+///
+/// Строгий разбор может упасть, если Discord пришлёт поле не того типа.
+/// Тогда страница разбирается запасным, терпительным способом (см.
+/// [`parse_message_value`]): потерять историю канала из-за одной странной
+/// строки хуже, чем показать её чуть менее подробно.
+pub(crate) fn parse_history_page_lenient(body: &str, channel_id: &str, warn: &mut dyn FnMut(String)) -> Vec<ChatMessage> {
+    match parse_history_page(body, channel_id) {
+        Ok(msgs) => msgs,
+        Err(e) => match serde_json::from_str::<Vec<Value>>(body) {
+            Ok(arr) => {
+                warn(format!("History strict parse failed ({}), fallback used", e));
+                arr.iter().filter_map(|m| parse_message_value(m, channel_id)).collect()
+            }
+            Err(e2) => {
+                warn(format!("History parse error: {} / {}", e, e2));
+                Vec::new()
+            }
+        },
+    }
+}
+
+/// Строгий разбор страницы: ошибка формата возвращается вызывающему.
+pub(crate) fn parse_history_page(body: &str, channel_id: &str) -> Result<Vec<ChatMessage>, serde_json::Error> {
+    let raw: Vec<RawMessage> = serde_json::from_str(body)?;
+    Ok(raw.into_iter().filter_map(|m| m.into_message(channel_id)).collect())
+}
+
+/// Разбор одного сообщения из уже готового дерева `Value` — для живых
+/// событий гейтвея, где дерево уже собрано целиком. `fallback_channel`
+/// нужен на случай, если в событии нет своего `channel_id`.
+pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<ChatMessage> {
+    let author = m.get("author")?;
+    Some(ChatMessage {
+        id: m["id"].as_str().unwrap_or("").to_string(),
+        channel_id: m["channel_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback_channel)
+            .to_string(),
+        author_id: author["id"].as_str().unwrap_or("").to_string(),
+        author_name: author["username"].as_str().unwrap_or("?").to_string(),
+        author_avatar: author["avatar"].as_str().map(|s| s.to_string()),
+        nickname: None,
+        content: m["content"].as_str().unwrap_or("").to_string(),
+        timestamp: m["timestamp"].as_str().unwrap_or("").to_string(),
+        attachments: m["attachments"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        Some(Attachment {
+                            url: a["url"].as_str()?.to_string(),
+                            content_type: a["content_type"].as_str().map(|s| s.to_string()),
+                            description: a["description"].as_str().map(|s| s.to_string()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        embeds: m["embeds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
+            .unwrap_or_default(),
+        is_own: false,
+    })
 }
 
 async fn gw_inner(
@@ -569,33 +743,12 @@ async fn gw_inner(
                                 let _ = event_tx.send(ToApp::Status("Resumed".into()));
                             }
                             "MESSAGE_CREATE" => {
-                                let d = &v["d"];
-                                let author = &d["author"];
-                                let msg = ChatMessage {
-                                    id: d["id"].as_str().unwrap_or("").to_string(),
-                                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
-                                    author_id: author["id"].as_str().unwrap_or("").to_string(),
-                                    author_name: author["username"].as_str().unwrap_or("?").to_string(),
-                                    author_avatar: author["avatar"].as_str().map(|s| s.to_string()),
-                                    nickname: None,
-                                    content: d["content"].as_str().unwrap_or("").to_string(),
-                                    timestamp: d["timestamp"].as_str().unwrap_or("").to_string(),
-                                    attachments: d["attachments"].as_array().map(|arr| {
-                                        arr.iter().filter_map(|a| {
-                                            Some(Attachment {
-                                                url: a["url"].as_str()?.to_string(),
-                                                content_type: a["content_type"].as_str().map(|s| s.to_string()),
-                                                description: a["description"].as_str().map(|s| s.to_string()),
-                                            })
-                                        }).collect()
-                                    }).unwrap_or_default(),
-                                    embeds: d["embeds"]
-                                        .as_array()
-                                        .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
-                                        .unwrap_or_default(),
-                                    is_own: false,
-                                };
-                                let _ = event_tx.send(ToApp::Message(msg));
+                                // Тот же разбор, что и у страницы истории, но
+                                // из уже готового дерева события: пересобирать
+                                // его через serde незачем.
+                                if let Some(msg) = parse_message_value(&v["d"], "") {
+                                    let _ = event_tx.send(ToApp::Message(msg));
+                                }
                             }
                             "GUILD_CREATE" => {
                                 let d = &v["d"];
@@ -791,4 +944,222 @@ Err(e) => {
 
     Ok(())
 
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::{parse_history_page, parse_history_page_lenient, parse_message_value};
+
+    /// Сообщение в том виде, в каком его отдаёт Discord: много полей, которые
+    /// клиенту не нужны (reaction_counts, mentions, flags и прочее).
+    const REAL: &str = r#"[{
+        "id": "1200000000000000001",
+        "channel_id": "900000000000000000",
+        "content": "привет",
+        "timestamp": "2026-09-26T12:00:00.000000+00:00",
+        "type": 0,
+        "pinned": false,
+        "mention_everyone": false,
+        "edited_timestamp": null,
+        "flags": 0,
+        "author": {
+            "id": "800000000000000000",
+            "username": "vasya",
+            "discriminator": "0",
+            "avatar": "abc123",
+            "global_name": "Вася",
+            "bot": false
+        },
+        "attachments": [{
+            "id": "1100000000000000000",
+            "filename": "photo.png",
+            "size": 123456,
+            "width": 1600,
+            "height": 1200,
+            "content_type": "image/png",
+            "description": "схема из чата",
+            "url": "https://cdn.discordapp.com/attachments/1/photo.png",
+            "proxy_url": "https://media.discordapp.net/attachments/1/photo.png"
+        }],
+        "embeds": [{
+            "type": "rich",
+            "title": "заголовок",
+            "author": {"name": "Кто-то", "url": "https://example.com"},
+            "footer": {"text": "подпись"},
+            "provider": {"name": " twitch"},
+            "image": {"url": "https://cdn.discordapp.com/embeds/1/picture.png", "width": 800, "height": 600},
+            "fields": [{"name": "a", "value": "b", "inline": true}]
+        }],
+        "reaction_counts": [{"count": 1, "me": false}],
+        "mentions": []
+    }]"#;
+
+    fn parse_one_in(body: &str, channel_id: &str) -> crate::models::ChatMessage {
+        let mut msgs = parse_history_page(body, channel_id).expect("разбор не должен падать");
+        assert_eq!(msgs.len(), 1, "ожидалось одно сообщение");
+        msgs.pop().unwrap()
+    }
+
+    fn parse_one(body: &str) -> crate::models::ChatMessage {
+        parse_one_in(body, "fallback")
+    }
+
+    #[test]
+    fn history_page_maps_all_used_fields() {
+        let m = parse_one(REAL);
+        assert_eq!(m.id, "1200000000000000001");
+        assert_eq!(m.channel_id, "fallback", "канал страницы важнее поля в сообщении");
+        assert_eq!(m.author_id, "800000000000000000");
+        assert_eq!(m.author_name, "vasya");
+        assert_eq!(m.author_avatar.as_deref(), Some("abc123"));
+        assert_eq!(m.content, "привет");
+        assert_eq!(m.timestamp, "2026-09-26T12:00:00.000000+00:00");
+        assert!(!m.is_own);
+        assert!(m.nickname.is_none());
+
+        assert_eq!(m.attachments.len(), 1);
+        let a = &m.attachments[0];
+        assert_eq!(a.url, "https://cdn.discordapp.com/attachments/1/photo.png");
+        assert_eq!(a.content_type.as_deref(), Some("image/png"));
+        assert_eq!(a.description.as_deref(), Some("схема из чата"));
+
+        assert_eq!(m.embeds.len(), 1);
+        assert_eq!(
+            m.embeds[0].image_url.as_deref(),
+            Some("https://cdn.discordapp.com/embeds/1/picture.png")
+        );
+        assert_eq!(m.embeds[0].description, None, "у эмбеда нет description — выкидываем пустое");
+    }
+
+    /// История и живое сообщение обязаны разбираться одинаково, иначе
+    /// сообщение, приехавшее в реальном времени, будет выглядеть не так, как
+    /// то же сообщение из истории.
+    ///
+    /// Разница одна и намеренная: страница истории берёт канал, для которого
+    /// её запросили, а живое сообщение — свой `channel_id`. Поэтому здесь
+    /// подставляем запасным именно тот канал, который указан в сообщении.
+    #[test]
+    fn history_and_live_parse_agree() {
+        let from_history = parse_one_in(REAL, "900000000000000000");
+        let from_live = parse_message_value(
+            &serde_json::from_str::<serde_json::Value>(REAL).unwrap()[0],
+            "900000000000000000",
+        )
+        .expect("живое сообщение должно разобраться");
+        assert_eq!(from_history.id, from_live.id);
+        assert_eq!(from_history.channel_id, from_live.channel_id);
+        assert_eq!(from_history.author_id, from_live.author_id);
+        assert_eq!(from_history.author_name, from_live.author_name);
+        assert_eq!(from_history.author_avatar, from_live.author_avatar);
+        assert_eq!(from_history.content, from_live.content);
+        assert_eq!(from_history.timestamp, from_live.timestamp);
+        assert_eq!(from_history.attachments.len(), from_live.attachments.len());
+        assert_eq!(from_history.attachments[0].url, from_live.attachments[0].url);
+        assert_eq!(
+            from_history.attachments[0].description, from_live.attachments[0].description
+        );
+        assert_eq!(from_history.embeds.len(), from_live.embeds.len());
+        assert_eq!(from_history.embeds[0].image_url, from_live.embeds[0].image_url);
+    }
+
+    /// Живое сообщение знает свой канал сам; если поля нет — берём запасной.
+    #[test]
+    fn live_message_uses_own_channel_then_fallback() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"id":"1","channel_id":"chan-42","content":"x","author":{"id":"u","username":"n"}}"#).unwrap();
+        let m = parse_message_value(&v, "fallback").unwrap();
+        assert_eq!(m.channel_id, "chan-42");
+        let v2: serde_json::Value =
+            serde_json::from_str(r#"{"id":"1","content":"x","author":{"id":"u","username":"n"}}"#).unwrap();
+        assert_eq!(parse_message_value(&v2, "fallback").unwrap().channel_id, "fallback");
+    }
+
+    /// Сообщение без автора в чат не попадает — как и раньше.
+    #[test]
+    fn message_without_author_is_skipped() {
+        let body = r#"[{"id":"1","content":"системное","author":{"id":"u","username":"n"}},{"id":"2","content":"без автора"}]"#;
+        let msgs = parse_history_page(body, "c").unwrap();
+        assert_eq!(msgs.len(), 1, "сообщение без author пропускается");
+        assert_eq!(msgs[0].id, "1");
+    }
+
+    /// Плохое значение в одном поле не должно ронять всю страницу: раньше
+    /// `as_str().unwrap_or("")` тихо подставлял пустую строку.
+    #[test]
+    fn odd_field_types_do_not_break_the_page() {
+        let body = r#"[{"id":7,"content":12345,"timestamp":null,
+                        "author":{"id":"u","username":null,"avatar":null}},
+                       {"id":"8","content":"ок","author":{"id":"u2","username":"n"}}]"#;
+        let msgs = parse_history_page(body, "c").unwrap();
+        assert_eq!(msgs.len(), 2, "оба сообщения должны остаться");
+        assert_eq!(msgs[0].id, "7");
+        assert_eq!(msgs[0].content, "12345");
+        assert_eq!(msgs[0].timestamp, "");
+        assert_eq!(msgs[0].author_name, "?", "нет username — как раньше показываем «?»");
+        assert!(msgs[0].author_avatar.is_none());
+    }
+
+    /// Совсем пустой объект не должен ронять страницу.
+    #[test]
+    fn empty_and_missing_fields_survive() {
+        let msgs = parse_history_page(r#"[{}]"#, "c").unwrap();
+        assert!(msgs.is_empty(), "без автора сообщение не показываем");
+        let msgs = parse_history_page(r#"[]"#, "c").unwrap();
+        assert!(msgs.is_empty());
+        assert_eq!(parse_history_page("не json", "c").is_err(), true, "битый JSON — ошибка разбора");
+    }
+
+    /// Обрезанное описание эмбеда должно уехать без пробелов, а нормальное —
+    /// без лишней копии (содержимое не меняется).
+    #[test]
+    fn embed_description_is_trimmed() {
+        let body = r#"[{"id":"1","content":"","author":{"id":"u","username":"n"},
+                        "embeds":[{"description":"  текст  "},{"description":"   "}]}]"#;
+        let msgs = parse_history_page(body, "c").unwrap();
+        assert_eq!(msgs[0].embeds.len(), 1, "эмбед из одних пробелов выкидываем");
+        assert_eq!(msgs[0].embeds[0].description.as_deref(), Some("текст"));
+    }
+
+    /// Вложение без url показать нечем — такое отбрасываем, а не ломаем страницу.
+    #[test]
+    fn attachment_without_url_is_dropped() {
+        let body = r#"[{"id":"1","content":"","author":{"id":"u","username":"n"},
+                        "attachments":[{"filename":"x.png"},{"url":"https://cdn.discordapp.com/a/1.png"}]}]"#;
+        let msgs = parse_history_page(body, "c").unwrap();
+        assert_eq!(msgs[0].attachments.len(), 1);
+        assert_eq!(msgs[0].attachments[0].url, "https://cdn.discordapp.com/a/1.png");
+    }
+
+    /// Запасной разобран��: если формат неожиданный (например, `author` пришёл
+    /// не объектом), история всё равно показывается — пусть с пустыми полями.
+    /// Строгий разбор на этом теле падает, а страница не должна пропадать
+    /// целиком из-за одной строки.
+    #[test]
+    fn lenient_parse_survives_unexpected_shape() {
+        let body = r#"[{"id":"1","content":"строка вместо объекта","author":"bob"},
+                       {"id":"2","content":"нормальное","author":{"id":"u","username":"n"}}]"#;
+        assert!(
+            parse_history_page(body, "c").is_err(),
+            "строгий разбор на этом должен ругаться — иначе тест бессмыслен"
+        );
+        let mut warns = Vec::new();
+        let msgs = parse_history_page_lenient(body, "c", &mut |m| warns.push(m));
+        assert_eq!(msgs.len(), 2, "оба сообщения должны показаться");
+        assert_eq!(msgs[0].id, "1");
+        assert_eq!(msgs[0].content, "строка вместо объекта");
+        assert_eq!(msgs[1].author_name, "n");
+        assert_eq!(warns.len(), 1, "о разборе запасным путём пишем в лог");
+        assert!(warns[0].contains("fallback"), "лог должен говорить, что это запасной путь: {}", warns[0]);
+    }
+
+    /// Совсем нечитаемый ответ не должен ни паниковать, ни врать: пустой
+    /// список и понятное сообщение в лог.
+    #[test]
+    fn lenient_parse_reports_garbage() {
+        let mut warns = Vec::new();
+        let msgs = parse_history_page_lenient("не json", "c", &mut |m| warns.push(m));
+        assert!(msgs.is_empty());
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("History parse error"), "{}", warns[0]);
+    }
 }

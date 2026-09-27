@@ -239,9 +239,32 @@ fn memcheck_report() {
     eprintln!("RSS в начале: {:.1} МБ", rss_mb());
 
     let (_, rx) = mpsc::unbounded_channel();
+    let base0 = live();
+    let allocs0 = count();
     let mut app = App::new(rx);
     app.connected = true;
     app.gw_started = true;
+    let ctx = egui::Context::default();
+    let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1052.0, 1054.0),
+        )),
+        ..Default::default()
+    };
+
+    // 0. Пол: пустой клиент без сообщений и картинок. Всё, что дальше
+    // прибавится к этому, — стоимость данных, а не egui, шрифтов и
+    // аллокатора; ниже это и есть настоящая цена картинок.
+    let _ = ctx.run(raw.clone(), |ctx| {
+        app.draw_chat(ctx);
+    });
+    eprintln!(
+        "пол: пустой клиент + 1 кадр — RSS {:.1} МБ, живых байт {:.2} МБ, {} аллокаций",
+        rss_mb(),
+        mb(live() - base0),
+        count() - allocs0
+    );
 
     let cid = "1234567890123456789";
     let json = fixture_json(300);
@@ -250,12 +273,11 @@ fn memcheck_report() {
     let base = live();
     reset_peak();
     let c0 = count();
-    let arr: Vec<Value> = serde_json::from_str(&json).unwrap();
-    let msgs: Vec<ChatMessage> = crate::gateway::parse_history_page(&arr, cid);
+    let msgs: Vec<ChatMessage> =
+        crate::gateway::parse_history_page(&json, cid).expect("фикстура обязана разбираться");
     let n_msgs = msgs.len();
     let peak_parse = peak() - base;
     let allocs_parse = count() - c0;
-    drop(arr);
     let held = live() - base;
     let msgs_bytes = {
         let before = live();
@@ -293,15 +315,6 @@ fn memcheck_report() {
         app.failed_images.insert(u);
     }
     drop(json);
-
-    let ctx = egui::Context::default();
-    let raw = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1052.0, 1054.0),
-        )),
-        ..Default::default()
-    };
 
     // 2. Кэш картинок: 32 обычных + 1 гифка (как сейчас разрешает политика).
     let png = make_png(1600, 1200);
@@ -348,6 +361,27 @@ fn memcheck_report() {
         });
     }
     report("10 кадров отрисовки (чат + списки)", total() - t0, count() - c0);
+
+    // Разбираем, сколько из оставшегося мусора — наш код, а сколько сам egui
+    // (на каждый лейбл он всё равно верстает и кэширует текст). Кэши к этому
+    // моменту прогреты, поэтому числа чуть ниже, чем у первых десяти кадров.
+    let t1 = total();
+    let c1 = count();
+    for _ in 0..10 {
+        let _ = ctx.run(raw.clone(), |ctx| {
+            app.draw_chat(ctx);
+        });
+    }
+    report("из них 10 кадров только чата", total() - t1, count() - c1);
+    let t2 = total();
+    let c2 = count();
+    for _ in 0..10 {
+        let _ = ctx.run(raw.clone(), |ctx| {
+            app.draw_server_list(ctx);
+            app.draw_channel_list(ctx);
+        });
+    }
+    report("из них 10 кадров только списков", total() - t2, count() - c2);
 
     eprintln!("  RSS в конце: {:.1} МБ", rss_mb());
     eprintln!("  всего аллокаций за тест: {}", count());

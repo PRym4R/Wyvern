@@ -23,6 +23,12 @@ const MAX_IMAGE_DIM: u32 = 768;
 /// пикселей — это 9 МБ на анимацию вместо 28.
 const MAX_GIF_DIM: u32 = 448;
 const MAX_GIF_FRAMES: usize = 16;
+/// Сколько пикселей в исходной картинке мы готовы распаковать. В чате она
+/// всё равно ужимается до 768 px, но распаковка идёт по исходнику: Discord
+/// принимает картинки до 10000×10000, а это 400 МБ в один момент, и на
+/// трёх параллельных загрузках клиент на этом умирает. Обычное фото
+/// (12–24 Мпикс) проходит без проблем.
+const MAX_SOURCE_PIXELS: u64 = 40_000_000;
 
 /// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
 /// это новый пул соединений и TLS-сессия на каждый запрос.
@@ -46,8 +52,13 @@ fn shrink(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
     }
 }
 
-fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) {
-    if failed.len() >= MAX_FAILED_IMAGES {
+/// Помещается ли исходник такого размера в лимит: распаковка идёт по
+/// исходным пикселям, а не по тем, что останутся на экране.
+pub(crate) fn source_size_allowed(w: u32, h: u32) -> bool {
+    u64::from(w) * u64::from(h) <= MAX_SOURCE_PIXELS
+}
+
+fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) {    if failed.len() >= MAX_FAILED_IMAGES {
         failed.clear();
     }
     failed.insert(key);
@@ -175,48 +186,73 @@ impl App {
 
         None
     }
+    /// Распаковать статичную картинку с ограничением по размеру. `Limits`
+    /// проверяется до выделения буфера пикселей, поэтому недопустимо
+    /// большая картинка отсекается, а не съедает память.
+    fn decode_static(bytes: &[u8]) -> Option<image::DynamicImage> {
+        use image::ImageReader;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_SOURCE_PIXELS as u32);
+        limits.max_image_height = Some(MAX_SOURCE_PIXELS as u32);
+        limits.max_alloc = Some(MAX_SOURCE_PIXELS * 4);
+        let mut reader = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+        reader.limits(limits);
+        reader.decode().ok()
+    }
+
     pub(crate) fn decode_image_payload(bytes: &[u8]) -> Option<ImagePayload> {
     if bytes.len() < 6 {
         return None;
     }
     let is_gif = &bytes[..6] == b"GIF89a" || &bytes[..6] == b"GIF87a";
     if is_gif {
-            if let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) {
-                use image::AnimationDecoder;
-                if let Ok(frames) = decoder.into_frames().collect_frames() {
-                if frames.len() > 1 {
-                    let mut out = Vec::new();
-                    for fr in frames.into_iter().take(MAX_GIF_FRAMES) {
-                        let (num, den) = fr.delay().numer_denom_ms();
-                        let secs = if den == 0 {
-                            0.1
-                        } else {
-                            (num as f64 / den as f64) / 1000.0
-                        };
-                        let buf = fr.into_buffer();
-                        let (w, h) = buf.dimensions();
-                        if w == 0 || h == 0 {
-                            return None;
-                        }
-                        let frame = image::DynamicImage::ImageRgba8(buf);
-                        let rgba = shrink(frame, MAX_GIF_DIM).into_rgba8();
-                        let (fw, fh) = rgba.dimensions();
-                        if fw == 0 || fh == 0 {
-                            return None;
-                        }
-                        let pixels = rgba.into_raw();
-                        let ci = egui::ColorImage::from_rgba_unmultiplied(
-                            [fw as usize, fh as usize],
-                            &pixels,
-                        );
-                        out.push((ci, secs.max(0.02) as f32));
-                    }
-                    return Some(ImagePayload::Animated { frames: out });
+        if let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) {
+            use image::{AnimationDecoder, ImageDecoder};
+            // Холст проверяем до распаковки: у гифки на 500 кадров по
+            // 1000x1000 кадр — это 4 МБ, а все кадры разом (так было
+            // раньше, через collect_frames) — 2 ГБ.
+            let (cw, ch) = decoder.dimensions();
+            if !source_size_allowed(cw, ch) {
+                return None;
+            }
+            let mut frames = decoder.into_frames();
+            // Кадры читаем по одному и берём только первые
+            // MAX_GIF_FRAMES: остальные всё равно не показываем.
+            let mut out = Vec::new();
+            while out.len() < MAX_GIF_FRAMES {
+                let Some(Ok(fr)) = frames.next() else { break };
+                let (num, den) = fr.delay().numer_denom_ms();
+                let secs = if den == 0 {
+                    0.1
+                } else {
+                    (num as f64 / den as f64) / 1000.0
+                };
+                let buf = fr.into_buffer();
+                let (w, h) = buf.dimensions();
+                if w == 0 || h == 0 {
+                    break;
                 }
+                let frame = image::DynamicImage::ImageRgba8(buf);
+                let rgba = shrink(frame, MAX_GIF_DIM).into_rgba8();
+                let (fw, fh) = rgba.dimensions();
+                if fw == 0 || fh == 0 {
+                    break;
+                }
+                let pixels = rgba.into_raw();
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [fw as usize, fh as usize],
+                    &pixels,
+                );
+                out.push((ci, secs.max(0.02) as f32));
+            }
+            // Один кадр — это просто статичная картинка, её разберёт общий
+            // путь ниже.
+            if out.len() > 1 {
+                return Some(ImagePayload::Animated { frames: out });
             }
         }
     }
-    if let Ok(img) = image::load_from_memory(bytes) {
+    if let Some(img) = Self::decode_static(bytes) {
         let img = shrink(img, MAX_IMAGE_DIM);
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
@@ -414,6 +450,80 @@ mod tests {
             }
             other => panic!("ожидалась анимация, получено {:?}", other.is_some()),
         }
+    }
+
+    /// Гифка с одним кадром — это просто картинка, анимацией она не
+    /// считается.
+    #[test]
+    fn single_frame_gif_is_static() {
+        let mut out = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+            enc.encode_frame(image::Frame::from_parts(
+                RgbaImage::from_pixel(64, 64, Rgba([1, 2, 3, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(50, 1),
+            )).unwrap();
+        }
+        match App::decode_image_payload(&out) {
+            Some(ImagePayload::Static(ci)) => assert_eq!(ci.size, [64, 64]),
+            other => panic!("ожидалась статичная картинка, получено {:?}", other.is_some()),
+        }
+    }
+
+    /// Гифка, холст которой больше лимита, не распаковывается вовсе: кадры
+    /// читаются по одному, но и один кадр такой — это сотни мегабайт.
+    #[test]
+    fn oversized_gif_is_refused() {
+        // Заголовок 10000x10000 = 100 Мпикс, больше MAX_SOURCE_PIXELS.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GIF89a");
+        bytes.extend_from_slice(&10000u16.to_le_bytes());
+        bytes.extend_from_slice(&10000u16.to_le_bytes());
+        bytes.push(0); // без глобальной таблицы
+        bytes.push(0x21); // расширение
+        bytes.push(0xF9); // Graphic Control
+        bytes.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0]);
+        bytes.push(0x3B); // конец
+        assert!(
+            App::decode_image_payload(&bytes).is_none(),
+            "гифка неподходящего размера не должна распаковываться"
+        );
+    }
+
+    /// Слишком большая статичная картинка отсекается до выделения памяти.
+    #[test]
+    fn static_size_limit_is_respected() {
+        // Граница лимита: 39.9 Мпикс ещё можно, 42 — уже нет.
+        assert!(source_size_allowed(7000, 5700), "39.9 Мпикс должны помещаться");
+        assert!(!source_size_allowed(7000, 6000), "42 Мпикс уже не помещаются");
+        assert!(source_size_allowed(64, 64));
+
+        // PNG, который только заголовком обещает 10000x10000: распаковывать
+        // его нельзя, лимит проверяется до выделения буфера пикселей.
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&10000u32.to_be_bytes());
+        ihdr.extend_from_slice(&10000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // RGBA8
+        push_chunk(&mut png, b"IHDR", &ihdr);
+        push_chunk(&mut png, b"IDAT", &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        push_chunk(&mut png, b"IEND", &[]);
+        assert!(
+            App::decode_image_payload(&png).is_none(),
+            "картинка недопустимого размера не должна распаковываться"
+        );
+    }
+
+    fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        // CRC считать не нужно: до данных дело не дойдёт, лимит отсечёт
+        // картинку по заголовку.
+        out.extend_from_slice(&[0, 0, 0, 0]);
     }
 }
 

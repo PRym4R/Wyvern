@@ -374,35 +374,40 @@ impl App {
         self.pending_avatars.clear();
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string() });
     }
-    pub(crate) fn display_name(&self, msg: &ChatMessage) -> String {
-        msg.nickname.clone().unwrap_or_else(|| msg.author_name.clone())
+    /// Имя для показа. Возвращаем ссылку на строку самого сообщения: раньше
+    /// здесь на каждом кадре клонировалось имя каждого видимого сообщения.
+    pub(crate) fn display_name<'a>(&self, msg: &'a ChatMessage) -> &'a str {
+        msg.nickname.as_deref().unwrap_or(msg.author_name.as_str())
     }
-    pub(crate) fn display_content(&self, msg: &ChatMessage) -> String {
+    /// Текст для показа: контент, иначе описание вложения или эмбеда.
+    /// Тоже ссылка, без копии на кадр.
+    pub(crate) fn display_content<'a>(&self, msg: &'a ChatMessage) -> &'a str {
         if !msg.content.trim().is_empty() {
-            return msg.content.clone();
+            return msg.content.as_str();
         }
         for att in &msg.attachments {
             if let Some(d) = &att.description {
                 if !d.trim().is_empty() {
-                    return d.clone();
+                    return d.as_str();
                 }
             }
         }
         for e in &msg.embeds {
             if let Some(d) = &e.description {
                 if !d.is_empty() {
-                    return d.clone();
+                    return d.as_str();
                 }
             }
         }
-        String::new()
+        ""
     }
-    pub(crate) fn short_time(&self, iso: &str) -> String {
+    /// «12:34» из метки времени. Срез исходной строки, копий не делает.
+    pub(crate) fn short_time<'a>(&self, iso: &'a str) -> &'a str {
         let t = iso.trim_start_matches('T');
         if t.len() >= 16 {
-            t[11..16].to_string()
+            &t[11..16]
         } else {
-            iso.to_string()
+            iso
         }
     }
     /// Сообщения текущего канала. Отдаём `Arc`, поэтому вызывающий код

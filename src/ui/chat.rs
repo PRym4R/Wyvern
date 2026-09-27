@@ -42,11 +42,10 @@ impl App {
     pub(crate) fn draw_main_chat(&mut self, ctx: &egui::Context) {
         let msgs = self.current_channel_messages();
 
-        for msg in &msgs {
-            if let Some(avatar_hash) = &msg.author_avatar {
-                let _ = self.download_avatar(ctx, &msg.author_id, avatar_hash);
-            }
-        }
+        // Аватары отдельно prefetch'ить не нужно: каждая строка сообщения и
+        // так достаёт свой аватар (и качает, если его нет). Отдельный проход
+        // только мешал: на нём на каждый кадр выделялось по строке-ключу на
+        // каждое сообщение канала.
 
         let channel_label = self.selected_channel
             .and_then(|i| self.channels.get(i))
@@ -108,6 +107,10 @@ impl App {
                                             .size(12.0).color(self.theme.text_secondary));
                                     });
                                 } else {
+                                    // Буфер под ключ кэша аватарок: раньше
+                                    // на каждое сообщение на каждом кадре
+                                    // выделялась своя строка.
+                                    let mut avatar_key = String::new();
                                     for msg in msgs_for_render {
                                         let display = self.display_name(msg);
                                         let is_own = msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id);
@@ -123,14 +126,14 @@ impl App {
                                                     ui.set_max_width(max_w);
                                                     ui.vertical(|ui| {
                                                         ui.horizontal(|ui| {
-                                                            ui.label(RichText::new(&display).strong().size(14.0).color(self.theme.accent));
+                                                            ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
                                                             if !msg.timestamp.is_empty() {
                                                                 let t = self.short_time(&msg.timestamp);
                                                                 ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
                                                             }
                                                         });
                                                         let content = self.display_content(msg);
-                                                        let content = if content.is_empty() { "* (message)".to_string() } else { content };
+                                                        let content = if content.is_empty() { "* (message)" } else { content };
                                                         ui.label(RichText::new(content).size(14.0).color(self.theme.text));
                                                         self.draw_attachments(ui, msg);
                                                     });
@@ -148,7 +151,13 @@ impl App {
                                                 ui.horizontal(|ui| {
                                                     let size = 36.0;
                                                     let avatar_tex = msg.author_avatar.as_ref()
-                                                        .and_then(|h| self.avatar_cache.get(&format!("{}_{}", msg.author_id, h)).cloned())
+                                                        .and_then(|h| {
+                                                            avatar_key.clear();
+                                                            avatar_key.push_str(&msg.author_id);
+                                                            avatar_key.push('_');
+                                                            avatar_key.push_str(h);
+                                                            self.avatar_cache.get(avatar_key.as_str()).cloned()
+                                                        })
                                                         .or_else(|| {
                                                             if let Some(h) = &msg.author_avatar {
                                                                 self.download_avatar(ui.ctx(), &msg.author_id, h)
@@ -172,14 +181,14 @@ impl App {
                                                     }
                                                     ui.vertical(|ui| {
                                                         ui.horizontal(|ui| {
-                                                            ui.label(RichText::new(&display).strong().size(14.0).color(self.theme.accent));
+                                                            ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
                                                             if !msg.timestamp.is_empty() {
                                                                 let t = self.short_time(&msg.timestamp);
                                                                 ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
                                                             }
                                                         });
                                                         let content = self.display_content(msg);
-                                                        let content = if content.is_empty() { "* (message)".to_string() } else { content };
+                                                        let content = if content.is_empty() { "* (message)" } else { content };
                                                         ui.label(RichText::new(content).size(14.0).color(self.theme.text));
                                                         self.draw_attachments(ui, msg);
                                                     });
