@@ -67,8 +67,21 @@ fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) 
 /// Занять место в лимите одновременных загрузок картинок. `false` — лимит
 /// исчерпан, тогда загрузку лучше отложить до следующего кадра (картинка
 /// попадёт в кэш и больше не будет качаться заново).
+///
+/// Счётчик трогаем только если слот реально достался: простое `fetch_add`
+/// с последующей проверкой увеличивало счётчик на единицу даже при отказе,
+/// и через несколько кадров он уезжал за любой предел навсегда — картинки
+/// переставали грузиться вообще.
 fn take_image_slot() -> bool {
-    IMAGE_DOWNLOADS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) < MAX_CONCURRENT_IMAGE_DOWNLOADS
+    IMAGE_DOWNLOADS_IN_FLIGHT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            if v < MAX_CONCURRENT_IMAGE_DOWNLOADS {
+                Some(v + 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 fn release_image_slot() {
@@ -77,6 +90,16 @@ fn release_image_slot() {
     let _ = IMAGE_DOWNLOADS_IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
         Some(v.saturating_sub(1))
     });
+}
+
+/// Слот, который освобождается сам — в том числе если поток упал на
+/// распаковке. Иначе падение в одном кадре тихо съедало слот навсегда.
+struct ImageSlot;
+
+impl Drop for ImageSlot {
+    fn drop(&mut self) {
+        release_image_slot();
+    }
 }
 
 impl App {
@@ -296,16 +319,16 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let url_moved = url.to_string();
         std::thread::spawn(move || {
+            // Слот отпускается на любом выходе, включая падение.
+            let _slot = ImageSlot;
             if let Ok(resp) = http().get(&url_moved).send() {
                 if let Ok(bytes) = resp.bytes() {
                     if let Some(payload) = Self::decode_image_payload(&bytes) {
-                        release_image_slot();
                         let _ = result_tx.send(Some(payload));
                         return;
                     }
                 }
             }
-            release_image_slot();
             let _ = result_tx.send(None);
         });
         result_rx
@@ -361,11 +384,10 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         }
         // Поток ещё работает — подождём следующего кадра.
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        // Поток умер, не ответив. Запись из карты убираем, иначе картинка
-        // больше никогда не попробует скачаться, а память под этот ключ
-        // утекает.
+        // Поток умер, не ответив. Слот он уже отпустил сам (в том числе при
+        // падении), а запись из карты убираем, иначе картинка больше никогда
+        // не попробует скачаться, и память под этот ключ утекает.
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            release_image_slot();
             self.pending_images.remove(&key);
         }
     }
@@ -378,6 +400,108 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
 mod tests {
     use super::*;
     use image::{ImageEncoder, Rgb, RgbImage, Rgba, RgbaImage};
+
+    /// Тесты, которые трогают счётчик загрузок, идут по очереди: он общий
+    /// на процесс, и параллельный прогон сломал бы проверки.
+    static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Отказ занять слот не должен увеличивать счётчик: иначе он уезжает
+    /// вверх на единицу за каждый отказ, за пару кадров уходит за любой
+    /// предел и картинки не грузятся больше никогда.
+    #[test]
+    fn refused_download_does_not_eat_slot() {
+        let _guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        while take_image_slot() {}
+        let busy = IMAGE_DOWNLOADS_IN_FLIGHT.load(Ordering::SeqCst);
+        for _ in 0..100 {
+            assert!(!take_image_slot(), "слоты выдали сверх лимита");
+        }
+        assert_eq!(
+            IMAGE_DOWNLOADS_IN_FLIGHT.load(Ordering::SeqCst),
+            busy,
+            "отказ занял слот — счётчик уехал вверх"
+        );
+        release_image_slot();
+        assert!(take_image_slot(), "освобождённый слот не вернулся");
+        // Тест не должен влиять на остальные: возвращаем счётчик в ноль.
+        IMAGE_DOWNLOADS_IN_FLIGHT.store(0, Ordering::SeqCst);
+    }
+
+    /// Локальный сервер, отдающий картинку с задержкой: видно, что загрузок
+    /// идёт больше, чем одновременных слотов.
+    fn slow_png_server(bytes: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("не занять порт");
+        let addr = listener.local_addr().unwrap().to_string();
+        let bytes = std::sync::Arc::new(bytes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let bytes = bytes.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    std::thread::sleep(Duration::from_millis(40));
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&bytes);
+                    let _ = stream.flush();
+                });
+            }
+        });
+        addr
+    }
+
+    /// Настоящий путь загрузки целиком: HTTP → распаковка → кэш. Картинок
+    /// специально больше, чем лимит одновременных загрузок: когда отказ
+    /// занимал слот, счётчик уезжал вверх и после первой тройки не
+    /// грузилось вообще ничего.
+    #[test]
+    fn more_images_than_slots_all_load() {
+        let _guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let img = RgbImage::from_pixel(8, 8, Rgb([200, 30, 30]));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), 8, 8, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let addr = slow_png_server(png);
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        let ctx = egui::Context::default();
+        let urls: Vec<String> = (0..MAX_CONCURRENT_IMAGE_DOWNLOADS + 3)
+            .map(|i| format!("http://{}/{}.png", addr, i))
+            .collect();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut loaded = 0;
+        while std::time::Instant::now() < deadline {
+            for u in &urls {
+                let _ = app.download_image(&ctx, u);
+            }
+            loaded = urls
+                .iter()
+                .filter(|u| app.image_cache.get(u).is_some())
+                .count();
+            if loaded == urls.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(loaded, urls.len(), "докачались не все картинки");
+        assert!(
+            app.pending_images.is_empty(),
+            "в очереди остались висящие загрузки: {:?}",
+            app.pending_images.len()
+        );
+        assert_eq!(
+            IMAGE_DOWNLOADS_IN_FLIGHT.load(Ordering::SeqCst),
+            0,
+            "слоты загрузки не вернулись"
+        );
+    }
 
     /// Большая картинка должна уменьшаться до лимита, иначе одна фотка
     /// в 12 МБ съедает столько же VRAM/RAM.
