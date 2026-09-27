@@ -1,7 +1,12 @@
+#[cfg(not(test))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(test))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+#[cfg(test)]
+mod memcheck;
 
 mod app;
 mod crypto;

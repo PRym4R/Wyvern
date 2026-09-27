@@ -9,13 +9,13 @@ impl App {
         style.visuals.window_fill = self.theme.panel_bg;
         style.visuals.widgets.noninteractive.bg_fill = self.theme.channel_bg;
         style.visuals.widgets.inactive.bg_fill = self.theme.input_bg;
-        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, self.theme.text);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, self.theme.text);
         style.visuals.widgets.hovered.bg_fill = self.theme.message_hover;
-        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, self.theme.accent);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, self.theme.accent);
         style.visuals.widgets.active.bg_fill = self.theme.accent;
-        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::BLACK);
+        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, Color32::BLACK);
         style.visuals.selection.bg_fill = self.theme.accent;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::BLACK);
+        style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, Color32::BLACK);
         style.visuals.hyperlink_color = self.theme.accent;
         style.spacing.item_spacing = egui::vec2(8.0, 2.0);
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
@@ -67,41 +67,21 @@ impl App {
             self.last_render_key = key;
             let n_channels = self.channels.len();
             let srect = ctx.screen_rect();
-            self.push_debug(format!("RENDER: sel='{}' sel_cid='{}' msgs={} total_channels={} screen={}x{}", channel_label.clone().unwrap_or_else(|| "none".into()), sel_cid, msgs.len(), n_channels, srect.width().round() as i32, srect.height().round() as i32));
+            let stored = self.messages.get(&sel_cid).map_or(0, |v| v.len());
+            self.push_debug(format!("RENDER: sel='{}' sel_cid='{}' msgs={} stored={} total_channels={} screen={}x{}", channel_label.clone().unwrap_or_else(|| "none".into()), sel_cid, msgs.len(), stored, n_channels, srect.width().round() as i32, srect.height().round() as i32));
         }
 
         match channel_label {
-            Some(label) => {
-                let msg_count = msgs.len();
-                let stored_count = self.selected_channel
-                    .and_then(|i| self.channels.get(i))
-                    .map(|c| self.messages.get(&c.id).map_or(0, |v| v.len()))
-                    .unwrap_or(0);
+            Some(_) => {
                 let sel_id = self.selected_channel
                     .and_then(|i| self.channels.get(i))
                     .map(|c| c.id.clone())
                     .unwrap_or_else(|| "none".into());
                 let stick = self.scroll_to_bottom;
                 let panel_resp = egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(self.theme.channel_bg))
+                    .frame(egui::Frame::new().fill(self.theme.channel_bg))
                     .show(ctx, |ui| {
                         ui.set_min_width(0.0);
-                        let avail_w = ui.available_width();
-                        let avail_h = ui.available_height();
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("CHAT-AREA").strong().size(18.0).color(Color32::from_rgb(0, 255, 0)));
-                            ui.label(RichText::new(format!("w={:.0} h={:.0}", avail_w, avail_h))
-                                .size(12.0).color(Color32::from_rgb(255, 60, 60)));
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(&label).strong().size(14.0).color(self.theme.text));
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(format!("({} msgs / stored {})", msg_count, stored_count))
-                                .size(12.0).color(self.theme.text_secondary));
-                            ui.add_space(6.0);
-                        });
-
-                        ui.separator();
 
                         if self.history_loading.is_some() {
                             ui.horizontal_centered(|ui| {
@@ -134,10 +114,10 @@ impl App {
                                         if is_own {
                                             let max_w = (ui.available_width() * 0.75).clamp(160.0, 480.0);
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                                egui::Frame::none()
+                                                egui::Frame::new()
                                                     .fill(self.theme.self_bg)
-                                                    .stroke(egui::Stroke::new(1.0, self.theme.divider))
-                                                    .rounding(8.0)
+                                                    .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
+                                                    .corner_radius(8.0)
                                                     .inner_margin(egui::Margin::symmetric(10, 8))
                                                     .show(ui, |ui| {
                                                     ui.set_max_width(max_w);
@@ -158,10 +138,10 @@ impl App {
                                             });
                                             ui.add_space(6.0);
                                         } else {
-                                            egui::Frame::none()
+                                            egui::Frame::new()
                                                 .fill(self.theme.message_hover)
-                                                .stroke(egui::Stroke::new(1.0, self.theme.divider))
-                                                .rounding(8.0)
+                                                .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
+                                                .corner_radius(8.0)
                                                 .inner_margin(egui::Margin::symmetric(10, 8))
                                                 .show(ui, |ui| {
                                                 ui.set_min_height(44.0);
@@ -179,7 +159,7 @@ impl App {
                                                             egui::vec2(size, size),
                                                             egui::Image::new(
                                                                 egui::load::SizedTexture::new(tex.id(), egui::vec2(size, size))
-                                                            ).rounding(size / 2.0),
+                                                            ).corner_radius(size / 2.0),
                                                         );
                                                     } else {
                                                         let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());

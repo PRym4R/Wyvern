@@ -9,7 +9,6 @@ pub(crate) enum ToApp {
     Channel(ChatChannel),
     GuildChannels { guild_id: String, channels: Vec<ChatChannel> },
     DMChannel(ChatChannel),
-    UserUpdate { id: String, username: String, avatar: Option<String>, nickname: Option<String> },
     Friends(Vec<UserProfile>),
     Status(String),
     Debug(String),

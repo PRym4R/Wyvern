@@ -18,6 +18,13 @@ const MAX_MESSAGES_PER_CHANNEL: usize = 300;
 const MAX_AVATAR_CACHE: usize = 192;
 /// Сколько картинок-вложений держим (каждая — это мегабайты VRAM/RAM).
 const MAX_IMAGE_CACHE: usize = 32;
+/// Сколько байт может держать кэш картинок. Ограничение по числу картинок
+/// ничего не значит: одна фотка на 1536 пикселей — это 9 МБ, а тридцать
+/// таких — это 280 МБ, и столько памяти клиенту не нужно: в чате картинка
+/// рисуется максимум 360x360.
+const IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
+/// Потолок памяти под аватары: при 64x64 это 192 * 16 КБ = 3 МБ.
+const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 /// Сколько неудачных URL'ов запоминаем, чтобы не качать их снова.
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
 
@@ -105,9 +112,9 @@ impl App {
             from_gw,
             gw_started: false,
             accounts_unlocked: false,
-            avatar_cache: BoundedCache::new(MAX_AVATAR_CACHE),
+            avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
             pending_avatars: HashMap::new(),
-            image_cache: BoundedCache::new(MAX_IMAGE_CACHE),
+            image_cache: BoundedCache::with_budget(MAX_IMAGE_CACHE, IMAGE_CACHE_BUDGET),
             pending_images: HashMap::new(),
             failed_images: HashSet::new(),
             theme: Theme::dark(),
@@ -126,7 +133,14 @@ impl App {
         let line = format!("[GW] {}", msg);
         eprintln!("{}", line);
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/wyvern_layout.log") {
+        // Лог не должен расти вечно: каждые 15 кадров в него падает строка,
+        // за сутки это десятки мегабайт. Переезжаем на .1 и начинаем заново.
+        let path = "/tmp/wyvern_layout.log";
+        let too_big = std::fs::metadata(path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false);
+        if too_big {
+            let _ = std::fs::rename(path, format!("{}.1", path));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{}", line);
         }
         self.debug_log.push(msg);
@@ -171,12 +185,17 @@ impl App {
                     entry.extend(messages.into_iter().map(Arc::new));
                     trim_messages(entry);
                     let stored = entry.len();
-                    let dump = entry.iter()
-                        .map(|m| format!("[{}] {} (id {}): {}{}", m.timestamp, m.author_name, m.author_id, m.content,
-                            if m.attachments.is_empty() { String::new() } else { format!(" <{} attachments>", m.attachments.len()) }))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
+                    // Дамп сообщений — отладочная вещь, пишется только когда
+                    // явно попросили переменной окружения: на каждый выбор
+                    // канала он собирал строку на полэкрана текста.
+                    if std::env::var_os("WYVERN_DUMP").is_some() {
+                        let dump = entry.iter()
+                            .map(|m| format!("[{}] {} (id {}): {}{}", m.timestamp, m.author_name, m.author_id, m.content,
+                                if m.attachments.is_empty() { String::new() } else { format!(" <{} attachments>", m.attachments.len()) }))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
+                    }
                     let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.clone() };
                     // Спиннер и прокрутка — только если ответ пришёл для канала,
                     // который грузится сейчас. Поздний ответ по уже закрытому
@@ -246,25 +265,6 @@ impl App {
                     self.scroll_to_bottom = true;
                     let cid = self.channels[idx].id.clone();
                     self.open_channel(&cid);
-                }
-                ToApp::UserUpdate { id, username, avatar, nickname } => {
-                    for msg in self.messages.values_mut().flat_map(|v| v.iter_mut()) {
-                        if msg.author_id == id {
-                            // Сообщение могло уже раздаваться в рендер, поэтому
-                            // правим копию, а не на месте.
-                            let m = Arc::make_mut(msg);
-                            m.author_name = username.clone();
-                            m.author_avatar = avatar.clone();
-                            if nickname.is_some() {
-                                m.nickname = nickname.clone();
-                            }
-                        }
-                    }
-                    for ch in self.channels.iter_mut() {
-                        if ch.id == id {
-                            ch.name = username.clone();
-                        }
-                    }
                 }
                 ToApp::Friends(list) => {
                     self.friends = list;
@@ -364,6 +364,14 @@ impl App {
     pub(crate) fn open_channel(&mut self, channel_id: &str) {
         self.history_loading = Some(channel_id.to_string());
         self.messages.retain(|k, _| k == channel_id);
+        // Незабранные загрузки прежнего канала больше никто не заберёт: к
+        // моменту переключения они уже лежат в канале с готовыми
+        // декодированными пикселями (до 4 МБ на картинку) — и так и висели
+        // бы до конца сессии. Сбрасываем получателей, и отправитель сразу
+        // отпускает память. Аватары и иконки тоже: в новом канале они всё
+        // равно перезапросятся.
+        self.pending_images.clear();
+        self.pending_avatars.clear();
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string() });
     }
     pub(crate) fn display_name(&self, msg: &ChatMessage) -> String {
@@ -381,9 +389,9 @@ impl App {
             }
         }
         for e in &msg.embeds {
-            if let Some(d) = e["description"].as_str() {
-                if !d.trim().is_empty() {
-                    return d.to_string();
+            if let Some(d) = &e.description {
+                if !d.is_empty() {
+                    return d.clone();
                 }
             }
         }
@@ -396,11 +404,6 @@ impl App {
         } else {
             iso.to_string()
         }
-    }
-    pub(crate) fn guild_channels(&self, guild_id: &str) -> Vec<&ChatChannel> {
-        self.channels.iter()
-            .filter(|ch| ch.guild_id.as_deref() == Some(guild_id) && ch.channel_type == 0)
-            .collect()
     }
     /// Сообщения текущего канала. Отдаём `Arc`, поэтому вызывающий код
     /// копирует только указатели, а не все сообщения целиком.
@@ -448,7 +451,6 @@ mod layout_tests {
             id: "g1".into(),
             name: "Test Guild".into(),
             icon: None,
-            owner_id: "".into(),
         });
         for i in 0..189 {
             a.channels.push(ChatChannel {
@@ -774,9 +776,31 @@ mod layout_tests {
         assert_eq!(app.history_loading.as_deref(), Some("c0"), "пока грузим — должен быть спиннер");
     }
 
+    /// Незабранная загрузка прежнего канала не должна висеть в памяти до
+    /// конца сессии: в канале уже лежат декодированные пиксели (мегабайты
+    /// на картинку), и забрать их уже никто не придёт.
+    #[test]
+    fn switching_channel_drops_pending_downloads() {
+        use crate::models::ImagePayload;
+        let mut app = make_app();
+        let (img_tx, img_rx) = std::sync::mpsc::channel();
+        img_tx
+            .send(Some(ImagePayload::Static(egui::ColorImage::new([512, 512], egui::Color32::BLACK))))
+            .unwrap();
+        app.pending_images.insert("https://cdn.discordapp.com/attachments/1/old.png".into(), img_rx);
+        let (_av_tx, av_rx) = std::sync::mpsc::channel::<Option<egui::ColorImage>>();
+        app.pending_avatars.insert("u1_deadbeef".into(), av_rx);
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_avatars.len(), 1);
+
+        app.open_channel("c0");
+
+        assert!(app.pending_images.is_empty(), "пиксели прежнего канала не должны висеть в памяти");
+        assert!(app.pending_avatars.is_empty(), "незабранные аватары тоже");
+    }
+
     /// Сообщение для тестов истории.
-    fn test_msg(id: &str, channel_id: &str, content: &str) -> ChatMessage {
-        ChatMessage {
+    fn test_msg(id: &str, channel_id: &str, content: &str) -> ChatMessage {        ChatMessage {
             id: id.into(),
             channel_id: channel_id.into(),
             author_id: "u1".into(),
@@ -882,15 +906,58 @@ mod layout_tests {
         assert!(second.ends_with("/channels/42/messages?limit=100&before=101"), "{}", second);
     }
 
+    /// Элемент кэша с заявленным «весом» в байтах.
+    struct Weighted(u32);
+
+    impl crate::models::CacheCost for Weighted {
+        fn cache_bytes(&self) -> usize {
+            self.0 as usize
+        }
+    }
+
     #[test]
     fn bounded_cache_evicts_oldest() {
-        let mut cache = BoundedCache::new(3);
+        let mut cache = BoundedCache::with_budget(3, usize::MAX);
         for i in 0..10 {
-            cache.insert(format!("k{}", i), i);
+            cache.insert(format!("k{}", i), Weighted(i));
         }
         assert_eq!(cache.len(), 3, "кеш не должен расти дальше лимита");
         assert!(!cache.contains_key("k0"), "самый старый должен вытесниться");
         assert!(cache.contains_key("k9"), "свежее должно остаться");
-        assert_eq!(cache.get("k9"), Some(&9));
+        assert_eq!(cache.get("k9").map(|v| v.0), Some(9));
+    }
+
+    /// Ограничение по памяти важнее ограничения по числу: восемь мелких
+    /// аватарок и три большие фотки должны уживаться в одном бюджете.
+    #[test]
+    fn bounded_cache_respects_byte_budget() {
+        let mut cache = BoundedCache::with_budget(100, 250);
+        for i in 0..4u32 {
+            cache.insert(format!("k{}", i), Weighted(100));
+        }
+        assert_eq!(cache.len(), 2, "в бюджет 250 байт влезает только два по 100");
+        assert!(!cache.contains_key("k0"), "самый старый вытесняется первым");
+        assert!(cache.contains_key("k3"), "свежее остаётся");
+        assert_eq!(cache.bytes(), 200, "счётчик памяти должен совпадать с содержимым");
+    }
+
+    /// Перезапись того же ключа не должна удваивать память в счётчике.
+    #[test]
+    fn bounded_cache_replacing_key_keeps_bytes_right() {
+        let mut cache = BoundedCache::with_budget(10, 1000);
+        cache.insert("k".into(), Weighted(100));
+        cache.insert("k".into(), Weighted(250));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 250);
+    }
+
+    /// Картинка крупнее всего бюджета всё равно должна показаться, иначе
+    /// чат просто останется пустым.
+    #[test]
+    fn bounded_cache_keeps_single_item_over_budget() {
+        let mut cache = BoundedCache::with_budget(10, 100);
+        cache.insert("k".into(), Weighted(500));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 500);
     }
 }

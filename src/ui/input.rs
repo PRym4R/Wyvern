@@ -13,7 +13,7 @@ impl App {
             .map(|c| format!("# {}", c.name))
             .unwrap_or_else(|| "No channel selected".into());
 
-        let input_resp = egui::TopBottomPanel::bottom("input_panel")
+        let _input_resp = egui::TopBottomPanel::bottom("input_panel")
             .min_height(56.0)
             .show(ctx, |ui| {
                 let ir = ui.min_rect();
@@ -43,7 +43,7 @@ impl App {
                         let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let send_clicked = send_btn.clicked();
 
-                        if (enter_pressed || send_clicked) {
+                        if enter_pressed || send_clicked {
                             let text = self.input.trim().to_string();
                             if !text.is_empty() {
                                 self.handle_input(&text);

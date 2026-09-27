@@ -8,7 +8,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::messages::{ToApp, ToGateway};
-use crate::models::{Attachment, ChatChannel, ChatMessage, Guild, UserProfile};
+use crate::models::{Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
 use crate::util::super_props;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -179,7 +179,7 @@ pub(crate) fn more_history_pages(got: usize, total: usize) -> bool {
 }
 
 /// Разобрать страницу истории из JSON Discord в сообщения.
-fn parse_history_page(arr: &[Value], channel_id: &str) -> Vec<ChatMessage> {
+pub(crate) fn parse_history_page(arr: &[Value], channel_id: &str) -> Vec<ChatMessage> {
     arr.iter()
         .filter_map(|m| {
             let author = m.get("author")?;
@@ -198,19 +198,20 @@ fn parse_history_page(arr: &[Value], channel_id: &str) -> Vec<ChatMessage> {
                         arr.iter()
                             .filter_map(|a| {
                                 Some(Attachment {
-                                    filename: a["filename"].as_str()?.to_string(),
                                     url: a["url"].as_str()?.to_string(),
                                     content_type: a["content_type"].as_str().map(|s| s.to_string()),
-                                    width: a["width"].as_u64().map(|v| v as u32),
-                                    height: a["height"].as_u64().map(|v| v as u32),
-                                    size: a["size"].as_u64().unwrap_or(0),
                                     description: a["description"].as_str().map(|s| s.to_string()),
                                 })
                             })
                             .collect()
                     })
                     .unwrap_or_default(),
-                embeds: m["embeds"].as_array().cloned().unwrap_or_default(),
+                // Эмбеды храним только в урезанном виде: полный JSON стоит
+                // в разы дороже двух нужных полей.
+                embeds: m["embeds"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
+                    .unwrap_or_default(),
                 is_own: false,
             })
         })
@@ -375,12 +376,10 @@ async fn gw_inner(
                                         if gid.is_empty() { continue; }
                                         let gname = g["name"].as_str().unwrap_or("Unknown").to_string();
                                         let gicon = g["icon"].as_str().map(|s| s.to_string());
-                                        let gowner = g["owner_id"].as_str().unwrap_or("").to_string();
                                         let _ = event_tx.send(ToApp::Guild(Guild {
                                             id: gid.clone(),
                                             name: gname.clone(),
                                             icon: gicon,
-                                            owner_id: gowner,
                                         }));
                                         let _ = event_tx.send(ToApp::Debug(format!("Will load channels for '{}'", &gname)));
                                     }
@@ -518,8 +517,6 @@ async fn gw_inner(
                                                                 friends.push(UserProfile {
                                                                     id: u["id"].as_str().unwrap_or("").to_string(),
                                                                     username: u["username"].as_str().unwrap_or("?").to_string(),
-                                                                    avatar: u["avatar"].as_str().map(|s| s.to_string()),
-                                                                    discriminator: u["discriminator"].as_str().unwrap_or("").to_string(),
                                                                 });
                                                             }
                                                             let _ = egoods.send(ToApp::Friends(friends));
@@ -586,17 +583,16 @@ async fn gw_inner(
                                     attachments: d["attachments"].as_array().map(|arr| {
                                         arr.iter().filter_map(|a| {
                                             Some(Attachment {
-                                                filename: a["filename"].as_str()?.to_string(),
                                                 url: a["url"].as_str()?.to_string(),
                                                 content_type: a["content_type"].as_str().map(|s| s.to_string()),
-                                                width: a["width"].as_u64().map(|v| v as u32),
-                                                height: a["height"].as_u64().map(|v| v as u32),
-                                                size: a["size"].as_u64().unwrap_or(0),
                                                 description: a["description"].as_str().map(|s| s.to_string()),
                                             })
                                         }).collect()
                                     }).unwrap_or_default(),
-                                    embeds: d["embeds"].as_array().cloned().unwrap_or_default(),
+                                    embeds: d["embeds"]
+                                        .as_array()
+                                        .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
+                                        .unwrap_or_default(),
                                     is_own: false,
                                 };
                                 let _ = event_tx.send(ToApp::Message(msg));
@@ -607,7 +603,6 @@ async fn gw_inner(
                                     id: d["id"].as_str().unwrap_or("").to_string(),
                                     name: d["name"].as_str().unwrap_or("Unknown").to_string(),
                                     icon: d["icon"].as_str().map(|s| s.to_string()),
-                                    owner_id: d["owner_id"].as_str().unwrap_or("").to_string(),
                                 };
                                 let _ = event_tx.send(ToApp::Guild(guild));
 
@@ -693,7 +688,7 @@ async fn gw_inner(
                 match cmd {
                     ToGateway::Send { channel_id, content } => {
                         let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-                        let mut req = http.post(&url)
+                        let req = http.post(&url)
                             .header("Authorization", &*tkn)
                             .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                             .header("X-Super-Properties", &super_props())

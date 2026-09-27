@@ -25,11 +25,9 @@ impl App {
             }
         }
         for e in &msg.embeds {
-            for field in ["image", "thumbnail", "video"] {
-                if let Some(u) = e[field]["url"].as_str() {
-                    if let Some(u2) = self.extract_embed_image_url(u) {
-                        urls.push(u2);
-                    }
+            if let Some(u) = &e.image_url {
+                if let Some(u2) = self.extract_embed_image_url(u) {
+                    urls.push(u2);
                 }
             }
         }

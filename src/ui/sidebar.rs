@@ -2,7 +2,6 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
 use crate::messages::ToGateway;
-use crate::models::{ChatChannel, UserProfile};
 
 impl App {
     pub(crate) fn draw_server_list(&mut self, ctx: &egui::Context) {
@@ -10,7 +9,7 @@ impl App {
             .resizable(false)
             .default_width(72.0)
             .exact_width(72.0)
-            .frame(egui::Frame::none().fill(self.theme.bg))
+            .frame(egui::Frame::new().fill(self.theme.bg))
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
@@ -18,7 +17,7 @@ impl App {
                         [48.0, 48.0],
                         egui::Button::new(RichText::new("@").size(20.0).color(Color32::WHITE))
                             .fill(if self.selected_guild.is_none() { self.theme.accent } else { self.theme.input_bg })
-                            .rounding(24.0),
+                            .corner_radius(24.0),
                     );
                     if home_btn.clicked() {
                         self.selected_guild = None;
@@ -43,7 +42,7 @@ impl App {
                                     [48.0, 48.0],
                                     egui::ImageButton::new(
                                         egui::load::SizedTexture::new(img.id(), egui::vec2(48.0, 48.0))
-                                    ).rounding(24.0),
+                                    ).corner_radius(24.0),
                                 )
                             } else {
                                 let label: String = guild.name.chars().take(2).collect();
@@ -51,7 +50,7 @@ impl App {
                                     [48.0, 48.0],
                                     egui::Button::new(RichText::new(&label).size(16.0).color(Color32::WHITE))
                                         .fill(if is_sel { self.theme.accent } else { self.theme.input_bg })
-                                        .rounding(24.0),
+                                        .corner_radius(24.0),
                                 )
                             };
                             if btn.clicked() {
@@ -69,7 +68,7 @@ impl App {
                         [48.0, 48.0],
                         egui::Button::new(RichText::new("◐").size(20.0).color(Color32::WHITE))
                             .fill(self.theme.input_bg)
-                            .rounding(24.0),
+                            .corner_radius(24.0),
                     );
                     if ubtn.clicked() {
                         self.theme_index = (self.theme_index + 1) % 3;
@@ -80,7 +79,7 @@ impl App {
                         [48.0, 42.0],
                         egui::Button::new(RichText::new("👤").size(18.0).color(Color32::WHITE))
                             .fill(if self.connected { self.theme.accent } else { self.theme.input_bg })
-                            .rounding(21.0),
+                            .corner_radius(21.0),
                     );
                     let popup_id = egui::Id::new("account_switcher");
                     if abtn.clicked() {
@@ -128,7 +127,7 @@ impl App {
             .resizable(true)
             .default_width(240.0)
             .min_width(180.0)
-            .frame(egui::Frame::none().fill(self.theme.panel_bg))
+            .frame(egui::Frame::new().fill(self.theme.panel_bg))
             .show(ctx, |ui| {
                 ui.set_min_width(ui.available_width());
 
@@ -144,13 +143,21 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
 
-                        let chs: Vec<ChatChannel> = self.guild_channels(&guild.id).into_iter().cloned().collect();
+                        // Собираем только индексы каналов гильдии, а не копии
+                        // самих каналов: список перерисовывается 20 раз в
+                        // секунду, и полное клонирование на кадр съедало
+                        // тысячи аллокаций.
+                        let ch_idx: Vec<usize> = self.channels.iter()
+                            .enumerate()
+                            .filter(|(_, ch)| {
+                                ch.guild_id.as_deref() == Some(guild.id.as_str()) && ch.channel_type == 0
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for ch in &chs {
-                                let is_sel = self.selected_channel
-                                    .and_then(|i| self.channels.get(i))
-                                    .map(|c| c.id == ch.id)
-                                    .unwrap_or(false);
+                            for i in ch_idx {
+                                let Some(ch) = self.channels.get(i) else { continue };
+                                let is_sel = self.selected_channel == Some(i);
                                 let label = format!("# {}", ch.name);
                                 let response = ui.add_sized(
                                     [ui.available_width(), 32.0],
@@ -161,10 +168,10 @@ impl App {
                                     ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
                                 );
                                 if response.clicked() {
-                                    let idx = self.channels.iter().position(|c| c.id == ch.id);
-                                    self.selected_channel = idx;
+                                    let cid = ch.id.clone();
+                                    self.selected_channel = Some(i);
                                     self.scroll_to_bottom = true;
-                                    self.open_channel(&ch.id);
+                                    self.open_channel(&cid);
                                 }
                             }
                         });
@@ -178,20 +185,32 @@ impl App {
                                 .size(12.0).color(self.theme.text_secondary));
                             ui.add_space(4.0);
                             ui.separator();
+                            // Список друзей и список DM перебираем по индексам и
+                            // копируем только нужные строки: раньше тут на
+                            // каждом кадре клонировался весь список целиком
+                            // (сотни аллокаций 20 раз в секунду).
+                            let friend_count = self.friends.len();
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                let users: Vec<UserProfile> = self.friends.clone();
-                                for f in &users {
-                                    let label = format!("@{}", f.username);
-                                    let fid = f.id.clone();
+                                for i in 0..friend_count {
+                                    let (label, username) = match self.friends.get(i) {
+                                        Some(f) => (format!("@{}", f.username), f.username.clone()),
+                                        None => continue,
+                                    };
                                     let response = ui.add_sized(
                                         [ui.available_width(), 32.0],
                                         egui::Button::new(
                                             RichText::new(&label).size(14.0).color(self.theme.text)
                                         ).fill(Color32::TRANSPARENT),
                                     );
-                                    if response.clicked() && !fid.is_empty() {
-                                        self.push_debug(format!("Clicked friend '{}' (id {})", f.username, &fid[..fid.len().min(12)]));
-                                        self.send_cmd(ToGateway::OpenDM { user_id: fid });
+                                    if response.clicked() {
+                                        if let Some(f) = self.friends.get(i) {
+                                            if f.id.is_empty() {
+                                                continue;
+                                            }
+                                            let fid = f.id.clone();
+                                            self.push_debug(format!("Clicked friend '{}' (id {})", username, &fid[..fid.len().min(12)]));
+                                            self.send_cmd(ToGateway::OpenDM { user_id: fid });
+                                        }
                                     }
                                 }
                             });
@@ -200,29 +219,34 @@ impl App {
                             ui.label(RichText::new("DMs").strong().size(15.0).color(self.theme.text));
                             ui.add_space(4.0);
                             ui.separator();
-                            let dms: Vec<ChatChannel> = self.channels.iter()
-                                .filter(|ch| ch.guild_id.is_none() && (ch.channel_type == 1 || ch.channel_type == 3))
-                                .cloned()
-                                .collect();
+                            let dm_count = self.channels.len();
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for ch in &dms {
+                                for i in 0..dm_count {
+                                    let (cid, cname) = match self.channels.get(i) {
+                                        Some(ch)
+                                            if ch.guild_id.is_none()
+                                                && (ch.channel_type == 1 || ch.channel_type == 3) =>
+                                        {
+                                            (ch.id.clone(), ch.name.clone())
+                                        }
+                                        _ => continue,
+                                    };
                                     let is_sel = self.selected_channel
-                                        .and_then(|i| self.channels.get(i))
-                                        .map(|c| c.id == ch.id)
+                                        .and_then(|s| self.channels.get(s))
+                                        .map(|c| c.id == cid)
                                         .unwrap_or(false);
                                     let response = ui.add_sized(
                                         [ui.available_width(), 32.0],
                                         egui::Button::new(
-                                            RichText::new(&ch.name)
+                                            RichText::new(&cname)
                                                 .color(if is_sel { Color32::WHITE } else { self.theme.text_secondary })
                                                 .size(14.0)
                                         ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
                                     );
                                     if response.clicked() {
-                                        let idx = self.channels.iter().position(|c| c.id == ch.id);
-                                        self.selected_channel = idx;
+                                        self.selected_channel = Some(i);
                                         self.scroll_to_bottom = true;
-                                        self.open_channel(&ch.id);
+                                        self.open_channel(&cid);
                                     }
                                 }
                             });

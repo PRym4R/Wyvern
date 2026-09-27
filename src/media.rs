@@ -9,12 +9,20 @@ use crate::models::{ImagePayload, LoadedImage};
 
 const CDN_BASE: &str = "https://cdn.discordapp.com";
 const MAX_CONCURRENT_AVATAR_DOWNLOADS: usize = 4;
+/// Сколько картинок качается одновременно. Без потолка канал с полсотней
+/// картинок порождает полсотню потоков, и все они одновременно держат в
+/// памяти декодированные пиксели — это сотни мегабайт на ровном месте.
+const MAX_CONCURRENT_IMAGE_DOWNLOADS: usize = 3;
 static AVATAR_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// Большую картинку нет смысла хранить в полном разрешении: в чате она всё
-/// равно рисуется в лучшем случае на ширину окна.
-const MAX_IMAGE_DIM: u32 = 1536;
-const MAX_GIF_DIM: u32 = 640;
-const MAX_GIF_FRAMES: usize = 24;
+static IMAGE_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Большую картинку нет смысла хранить в полном разрешении: в чате она
+/// рисуется максимум 360x360, то есть даже на HiDPI-экране (2x) 768 пикселей
+/// хватает ровно. 1536 превращали одну фотку в 9 МБ текстуры.
+const MAX_IMAGE_DIM: u32 = 768;
+/// Гифка — это сразу много кадров, поэтому кадры мельче. 16 кадров по 448
+/// пикселей — это 9 МБ на анимацию вместо 28.
+const MAX_GIF_DIM: u32 = 448;
+const MAX_GIF_FRAMES: usize = 16;
 
 /// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
 /// это новый пул соединений и TLS-сессия на каждый запрос.
@@ -43,6 +51,21 @@ fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) 
         failed.clear();
     }
     failed.insert(key);
+}
+
+/// Занять место в лимите одновременных загрузок картинок. `false` — лимит
+/// исчерпан, тогда загрузку лучше отложить до следующего кадра (картинка
+/// попадёт в кэш и больше не будет качаться заново).
+fn take_image_slot() -> bool {
+    IMAGE_DOWNLOADS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) < MAX_CONCURRENT_IMAGE_DOWNLOADS
+}
+
+fn release_image_slot() {
+    // saturating: если счётчик когда-то уйдёт в ноль, лучше он останется
+    // нулём, чем завертится и больше не ограничит ничего.
+    let _ = IMAGE_DOWNLOADS_IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 impl App {
@@ -227,6 +250,12 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         return None;
     }
 
+    // Не начинаем новую загрузку, если лимит уже выбран: лишний поток только
+    // зря съест память на декодирование. На следующем кадре попробуем снова.
+    if !self.pending_images.contains_key(&cache_key) && !take_image_slot() {
+        return None;
+    }
+
     let pending = self.pending_images.entry(cache_key.clone()).or_insert_with(|| {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let url_moved = url.to_string();
@@ -234,48 +263,74 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
             if let Ok(resp) = http().get(&url_moved).send() {
                 if let Ok(bytes) = resp.bytes() {
                     if let Some(payload) = Self::decode_image_payload(&bytes) {
+                        release_image_slot();
                         let _ = result_tx.send(Some(payload));
                         return;
                     }
                 }
             }
+            release_image_slot();
             let _ = result_tx.send(None);
         });
         result_rx
     });
 
-    if let Ok(result) = pending.try_recv() {
-        self.pending_images.remove(&key);
-        match result {
-            Some(ImagePayload::Static(color_image)) => {
-                let handle = ctx2.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
-                let loaded = LoadedImage::Static(handle);
-                self.image_cache.insert(key.clone(), loaded.clone());
-                ctx2.request_repaint();
-                return Some(loaded);
-            }
-            Some(ImagePayload::Animated { frames }) => {
-                let mut handles = Vec::with_capacity(frames.len());
-                let mut delays = Vec::with_capacity(frames.len());
-                for (i, (ci, delay)) in frames.into_iter().enumerate() {
-                    let tkey = format!("{}#f{}", key, i);
-                    handles.push(ctx2.load_texture(&tkey, ci, egui::TextureOptions::LINEAR));
-                    delays.push(delay);
-                }
-                if handles.len() > 1 {
-                    let loaded = LoadedImage::Animated {
-                        frames: handles,
-                        delays,
-                        started: std::time::Instant::now(),
-                    };
+    match pending.try_recv() {
+        Ok(result) => {
+            self.pending_images.remove(&key);
+            match result {
+                Some(ImagePayload::Static(color_image)) => {
+                    let handle = ctx2.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
+                    let loaded = LoadedImage::Static(handle);
                     self.image_cache.insert(key.clone(), loaded.clone());
+                    self.push_debug(format!(
+                        "IMG: {} в кэше — {} шт, {:.1} МБ текстур",
+                        key,
+                        self.image_cache.len(),
+                        self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
+                    ));
                     ctx2.request_repaint();
                     return Some(loaded);
                 }
+                Some(ImagePayload::Animated { frames }) => {
+                    let mut handles = Vec::with_capacity(frames.len());
+                    let mut delays = Vec::with_capacity(frames.len());
+                    for (i, (ci, delay)) in frames.into_iter().enumerate() {
+                        let tkey = format!("{}#f{}", key, i);
+                        handles.push(ctx2.load_texture(&tkey, ci, egui::TextureOptions::LINEAR));
+                        delays.push(delay);
+                    }
+                    if handles.len() > 1 {
+                        let frames_count = handles.len();
+                        let loaded = LoadedImage::Animated {
+                            frames: handles,
+                            delays,
+                            started: std::time::Instant::now(),
+                        };
+                        self.image_cache.insert(key.clone(), loaded.clone());
+                        self.push_debug(format!(
+                            "GIF: {} кадров в кэше — {} шт, {:.1} МБ текстур",
+                            frames_count,
+                            self.image_cache.len(),
+                            self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
+                        ));
+                        ctx2.request_repaint();
+                        return Some(loaded);
+                    }
+                }
+                None => {
+                    remember_failed(&mut self.failed_images, key);
+                }
             }
-            None => {
-                remember_failed(&mut self.failed_images, key);
-            }
+        }
+        // Поток ещё работает — подождём следующего кадра.
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        // Поток умер, не ответив. Запись из карты убираем, иначе картинка
+        // больше никогда не попробует скачаться, а память под этот ключ
+        // утекает.
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            release_image_slot();
+            self.pending_images.remove(&key);
         }
     }
 
@@ -358,6 +413,40 @@ mod tests {
                 eprintln!("[TEST] осталось кадров: {}, размер {:?}", frames.len(), frames[0].0.size);
             }
             other => panic!("ожидалась анимация, получено {:?}", other.is_some()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// Тот же путь, что и в `download_image` после получения ответа, только
+    /// без сети: декодируем байты и кладём результат в кэш по его политике.
+    pub(crate) fn cache_image_bytes(&mut self, ctx: &egui::Context, key: &str, bytes: &[u8]) -> bool {
+        match Self::decode_image_payload(bytes) {
+            Some(ImagePayload::Static(color_image)) => {
+                let handle = ctx.load_texture(key, color_image, egui::TextureOptions::LINEAR);
+                self.image_cache
+                    .insert(key.to_string(), LoadedImage::Static(handle));
+                true
+            }
+            Some(ImagePayload::Animated { frames }) => {
+                let mut handles = Vec::with_capacity(frames.len());
+                let mut delays = Vec::with_capacity(frames.len());
+                for (i, (ci, delay)) in frames.into_iter().enumerate() {
+                    handles.push(ctx.load_texture(format!("{}#f{}", key, i), ci, egui::TextureOptions::LINEAR));
+                    delays.push(delay);
+                }
+                if handles.len() > 1 {
+                    self.image_cache.insert(
+                        key.to_string(),
+                        LoadedImage::Animated { frames: handles, delays, started: std::time::Instant::now() },
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
         }
     }
 }
