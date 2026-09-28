@@ -231,14 +231,29 @@ impl App {
                 }
                 ToApp::Message(msg) => {
                     let cid = msg.channel_id.clone();
-                    let entry = self.messages.entry(cid).or_default();
-                    entry.push(Arc::new(msg));
-                    trim_messages(entry);
-                    // Внизу ли пользователь — решаем по прошлому кадру: если он
-                    // читает историю выше, новое сообщение не должно выбрасывать
-                    // его в самый конец.
-                    if self.chat_at_bottom {
-                        self.scroll_to_bottom = true;
+                    // Сообщение может прийти дважды: гейтвей шлёт живую копию
+                    // всего, что появилось после подписки, а та же строка уже
+                    // успела попасть в страницу истории. Дубль в списке рисуется
+                    // дважды, и в чате это видно как «сообщение скопировалось».
+                    let duplicate = !msg.id.is_empty()
+                        && self.messages.get(&cid).is_some_and(|e| {
+                            // Ищем с хвоста: живое сообщение почти всегда там,
+                            // а список не длиннее MAX_MESSAGES_PER_CHANNEL,
+                            // так что просмотр целиком ничего не стоит.
+                            e.iter().rev().any(|m| m.id == msg.id)
+                        });
+                    if duplicate {
+                        self.push_debug(format!("Duplicate live message {} ignored", msg.id));
+                    } else {
+                        let entry = self.messages.entry(cid).or_default();
+                        entry.push(Arc::new(msg));
+                        trim_messages(entry);
+                        // Внизу ли пользователь — решаем по прошлому кадру: если
+                        // он читает историю выше, новое сообщение не должно
+                        // выбрасывать его в самый конец.
+                        if self.chat_at_bottom {
+                            self.scroll_to_bottom = true;
+                        }
                     }
                 }
                 ToApp::History { channel_id, messages, more } => {
@@ -1330,6 +1345,47 @@ mod layout_tests {
         tx.send(ToApp::Message(test_msg("m2", "c1", "новое"))).unwrap();
         app.poll(&ctx);
         assert!(app.scroll_to_bottom, "внизу новое сообщение должно тянуть вниз");
+    }
+
+    /// Сообщение может прийти дважды: гейтвей шлёт живую копию всего, что
+    /// появилось после подписки, а та же строка уже успела попасть в страницу
+    /// истории. Дубль рисуется дважды — в чате это видно как «сообщение
+    /// скопировалось», поэтому повтор по id пропускаем.
+    #[test]
+    fn live_message_already_in_history_is_not_doubled() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+
+        // Страница истории, как её отдаёт Discord: от новых к старым.
+        let page: Vec<ChatMessage> = (1..=3).rev().map(|i| test_msg(&format!("m{i}"), "c1", "из истории")).collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: page, more: false }).unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.messages.get("c1").unwrap().len(), 3);
+
+        // Тот же m3 приходит живым событием — в списке он уже есть.
+        tx.send(ToApp::Message(test_msg("m3", "c1", "из истории"))).unwrap();
+        app.poll(&ctx);
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 3, "живой дубль не должен добавляться");
+        assert_eq!(msgs.iter().filter(|m| m.id == "m3").count(), 1, "сообщение должно быть одно");
+
+        // А вот настоящее новое — в хвост, как обычно.
+        tx.send(ToApp::Message(test_msg("m4", "c1", "новое"))).unwrap();
+        app.poll(&ctx);
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[msgs.len() - 1].id, "m4", "новое сообщение в конце списка");
     }
 
     /// Элемент кэша с заявленным «весом» в байтах.
