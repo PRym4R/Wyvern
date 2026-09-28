@@ -359,16 +359,6 @@ impl App {
                                     if tail > 0.0 {
                                         ui.add_space(tail);
                                     }
-                                    // Якорь берём только когда вид уже выбран
-                                    // пользователем. На кадре, который сам
-                                    // перематывает вниз, держаться не за что.
-                                    self.chat_anchor = if stick {
-                                        None
-                                    } else {
-                                        msgs_for_render
-                                            .get(first)
-                                            .map(|m| (m.id.clone(), offsets[first] - offset))
-                                    };
                                     // Дошли до верха — пора брать более старые
                                     // сообщения. Пока внизу, история не
                                     // грузится: внизу и так есть что читать. И
@@ -439,15 +429,23 @@ impl App {
                         // пользователя от низа — тот проскроллил на пять
                         // пикселей вверх, а его тут же вернуло.
                         self.chat_at_bottom = settled >= max_off - Self::BOTTOM_SLACK;
+                        // Якорь — от того места, где чат встал на самом деле,
+                        // а не от того, которое мы просили. Кадр рисуется на
+                        // запрошенном смещении, а колесо egui применяет уже
+                        // после отрисовки, поэтому «просили» на прошлом кадре.
+                        // Якорь от «просили» закреплял каждый следующий кадр на
+                        // прошлом смещении: колесо листало внутренний счётчик,
+                        // а на экране было одно и то же — «чат копируется».
+                        // Держать низ нечего: там смещение и так просится.
+                        self.chat_anchor = if stick && !moved_by_user {
+                            None
+                        } else {
+                            let top = visible_window(&offsets, settled, inner_h).0;
+                            msgs.get(top).map(|m| (m.id.clone(), offsets[top] - settled))
+                        };
                         scroll_out
                     });
                 self.msg_offsets = offsets;
-                // Если после подсказки прокрутка уехала — значит прокрутил
-                // пользователь (или новое сообщение утянуло чат вниз). Его
-                // воля важнее удержания кадра: якорь сбрасываем.
-                if hint.is_some_and(|h| (self.chat_offset_y - h).abs() > 0.5) {
-                    self.chat_anchor = None;
-                }
                 if self.want_older {
                     self.want_older = false;
                     self.request_older_history();
@@ -703,9 +701,12 @@ mod geometry_tests {
         cmds: mpsc::UnboundedReceiver<ToGateway>,
     }
 
-    /// Колесо должно листать чат в обе стороны. Это ровно то, на что жалуются:
-    /// «не могу листать чат». Прокручиваем настоящим колесом и ждём не кадров,
-    /// а прекращения сдвига — egui сглаживает колесо по нескольким кадрам.
+    /// Колесо должно листать чат в обе стороны. Проверяем именно то, что
+    /// нарисовано: кадр рисуется на смещении, которое мы попросили, а колесо
+    /// egui применяет уже после отрисовки. Поэтому «счётчик смещения уехал»
+    /// и «на экране что-то сдвинулось» — разные вещи, и проверять надо
+    /// второе: иначе тест зелёный, а на экране всё то же самое
+    /// («чат копируется, циклично вижу одно и то же»).
     #[test]
     fn wheel_scrolls_the_chat_in_both_directions() {
         let mut h = app_with_messages(300);
@@ -721,41 +722,97 @@ mod geometry_tests {
         );
 
         // Вверх к началу истории.
-        let up = wheel_until_stop(&mut h.app, &ctx, 120.0);
-        eprintln!("[TEST] наверх за {up} событий: смещение {:.0}", h.app.chat_offset_y);
+        let up = wheel_until_stop(&mut h.app, &ctx, 120.0, true);
+        let (_i, _c, ask) = scroll_sizes(&h.app);
+        eprintln!("[TEST] наверх за {up} событий: на экране смещение {ask:.0}");
         assert!(
-            h.app.chat_offset_y < 1.0,
-            "колесо вверх не довело список до начала: смещение {:.0}",
-            h.app.chat_offset_y
+            ask < 1.0,
+            "колесо вверх не довело список до начала: на экране смещение {ask:.0}"
         );
 
         // И обратно вниз — до последнего сообщения.
-        let down = wheel_until_stop(&mut h.app, &ctx, -120.0);
-        let (inner, content, _ask) = scroll_sizes(&h.app);
+        let down = wheel_until_stop(&mut h.app, &ctx, -120.0, false);
+        let (inner, content, ask) = scroll_sizes(&h.app);
         let bottom = content - inner;
-        eprintln!(
-            "[TEST] вниз за {down} событий: смещение {:.0}, низ {bottom:.0}",
-            h.app.chat_offset_y
-        );
+        eprintln!("[TEST] вниз за {down} событий: на экране {ask:.0}, низ {bottom:.0}");
         assert!(
-            (h.app.chat_offset_y - bottom).abs() < 1.0,
-            "колесо вниз не довело список до низа: смещение {:.0}, низ {bottom:.0}",
-            h.app.chat_offset_y
+            (ask - bottom).abs() < 1.0,
+            "колесо вниз не довело список до низа: на экране {ask:.0}, низ {bottom:.0}"
         );
     }
 
-    /// Крутить колесо, пока смещение перестаёт меняться.
-    fn wheel_until_stop(app: &mut App, ctx: &egui::Context, dy: f32) -> usize {
+    /// Медленное колесо тоже должно двигать нарисованный список. С быстрым
+    /// колесом поломка была не видна: там якорь успевали сбрасывать, и список
+    /// дёргался через кадр. С медленным (трекпад, хвост сглаживания) якорь
+    /// выживал и держал кадр на прошлом смещении — колесо крутится, а на
+    /// экране всё то же самое, циклично. Проверяем по нарисованному кадру.
+    #[test]
+    fn slow_wheel_moves_the_drawn_list() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        let (_i, _c, start) = scroll_sizes(&h.app);
+        assert!(start > 1000.0, "список должен быть заметно выше окна");
+
+        // Мелкий шаг: именно на нём якорь доживал до следующего кадра.
+        let mut stuck = 0;
+        let mut last = start;
+        for _ in 0..60 {
+            wheel_frame(&mut h.app, &ctx, 3.0);
+            let (_i, _c, ask) = scroll_sizes(&h.app);
+            if (ask - last).abs() < 0.5 {
+                stuck += 1;
+            } else {
+                stuck = 0;
+            }
+            last = ask;
+        }
+        let (_i, _c, end) = scroll_sizes(&h.app);
+        eprintln!("[TEST] медленное колесо: {start:.0} -> {end:.0}, замерло {stuck} раз");
+        assert!(
+            stuck < 10,
+            "нарисованный список не идёт за медленным колесом: смещение {start:.0} -> {end:.0}, \
+             {stuck} кадров из 60 стояли на месте"
+        );
+        assert!(
+            start - end > 20.0,
+            "медленное колесо вверх почти не сдвинуло список: {start:.0} -> {end:.0}"
+        );
+    }
+
+    /// Крутить колесо, пока нарисованный список перестаёт двигаться.
+    ///
+    /// Смотрим на `ask` — смещение, по которому нарисован кадр, — и требуем,
+    /// чтобы оно шло именно туда, куда крутят, без рывков обратно. egui
+    /// сглаживает колесо по кадрам, поэтому «перестало двигаться» — это
+    /// несколько одинаковых кадров подряд, а не первое же отсутствие сдвига.
+    fn wheel_until_stop(
+        app: &mut App,
+        ctx: &egui::Context,
+        dy: f32,
+        up: bool,
+    ) -> usize {
         let mut still = 0;
         let mut events = 0;
-        while still < 20 {
-            let before = app.chat_offset_y;
+        while still < 12 {
+            let (_i, _c, before) = scroll_sizes(app);
             wheel_frame(app, ctx, dy);
+            let (_i, _c, after) = scroll_sizes(app);
             events += 1;
-            if (app.chat_offset_y - before).abs() < 0.5 {
+            let delta = after - before;
+            if delta.abs() < 0.5 {
                 still += 1;
             } else {
                 still = 0;
+                // Крутим вверх — список должен идти к началу, и наоборот. Если
+                // он дёргается обратно, значит кадр рисуется не там, где мы
+                // прокрутили: колесо листает счётчик, а картинка стоит.
+                let wrong = if up { delta > 0.5 } else { delta < -0.5 };
+                assert!(
+                    !wrong,
+                    "колесо {} увело список не туда: {before:.0} -> {after:.0} на событии {events}",
+                    if up { "вверх" } else { "вниз" }
+                );
             }
             assert!(events < 4000, "колесо не доводит список до края");
         }
