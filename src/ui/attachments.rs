@@ -24,9 +24,10 @@ const VIDEO_EXTS: [&str; 5] = [".mp4", ".webm", ".ogg", ".m4v", ".mov"];
 /// текстуры, и высота сообщения в списке.
 pub(crate) const MAX_IMAGE_DISPLAY: f32 = 360.0;
 
-/// Место под картинку, которая ещё скачивается. Средняя фотка в чате как раз
-/// столько и занимает; важно, что это число одно и то же для оценки высоты
-/// сообщения и для отрисовки, иначе список дёргается.
+/// Место под картинку, для которой Discord не прислал размер. Берётся
+/// только как последний обходной путь: обычно размер известен заранее, и
+/// резервируется ровно столько места, сколько картинка займёт. Число одно
+/// и то же для оценки высоты сообщения и для отрисовки, иначе список дёргается.
 pub(crate) const IMAGE_PLACEHOLDER: f32 = 180.0;
 
 /// Ссылка на картинку из эмбеда, если её вообще нужно показывать.
@@ -45,22 +46,30 @@ pub(crate) fn embed_image_url(url: &str) -> Option<&str> {
     Some(url)
 }
 
-/// Перебрать картинки сообщения — вложения и эмбеды — и вызвать `f` на каждой.
+/// Перебрать картинки сообщения — вложения и эмбеды — и вызвать `f` на
+/// каждой. Вместе со ссылкой отдаём размер, который Discord прислал рядом с
+/// ней: по нему место под картинку резервируется точно, не дожидаясь
+/// загрузки, и сообщение не меняет высоту, когда картинка наконец приходит.
 ///
 /// Список не собирается: он нужен на каждом кадре и для каждого сообщения
 /// (в том числе для оценки высоты ещё не нарисованных), а копия URL'ов в куче
 /// — ровно та аллокация, ради которой эту строчку когда-то и переписывали.
-pub(crate) fn for_each_image(msg: &ChatMessage, mut f: impl FnMut(&str)) {
+pub(crate) fn for_each_image(msg: &ChatMessage, mut f: impl FnMut(&str, Option<egui::Vec2>)) {
     for att in &msg.attachments {
         if att.content_type.as_deref().map(|ct| ct.starts_with("image/")).unwrap_or(false) {
-            f(att.url.as_str());
+            f(att.url.as_str(), known_size(att.size));
         }
     }
     for e in &msg.embeds {
         if let Some(u) = e.image_url.as_deref().and_then(embed_image_url) {
-            f(u);
+            f(u, known_size(e.image_size));
         }
     }
+}
+
+/// Размер из пары `width`/`height` в виде, который ждёт `display_size`.
+fn known_size(size: Option<[u32; 2]>) -> Option<egui::Vec2> {
+    size.map(|[w, h]| egui::vec2(w as f32, h as f32))
 }
 
 /// Высота картинки в чате: настоящая, если она уже в кэше.
@@ -72,13 +81,23 @@ pub(crate) fn display_size(size: egui::Vec2) -> egui::Vec2 {
     egui::vec2(size.x * scale, size.y * scale)
 }
 
+/// Сколько места займёт картинка в сообщении, когда её ещё нет в кэше.
+/// Размер Discord присылает вместе со ссылкой, поэтому место резервируется
+/// точно и сообщение не скачет на сотни пикселей в момент загрузки. Если
+/// размера нет (старые сообщения, битая ссылка) — берём заглушку.
+pub(crate) fn reserved_size(known: Option<egui::Vec2>) -> egui::Vec2 {
+    match known {
+        Some(s) => display_size(s),
+        None => egui::vec2(MAX_IMAGE_DISPLAY, IMAGE_PLACEHOLDER),
+    }
+}
+
 impl App {
     pub(crate) fn draw_attachments(&mut self, ui: &mut egui::Ui, msg: &ChatMessage) {
         // Ссылка на картинку в уже скачанном виде или место под неё: URL'ы
         // берём из сообщения, а не копируем — список показывается на каждом
         // кадре, и копии URL'ов в куче не нужны.
-        let width = ui.available_width();
-        for_each_image(msg, |url| {
+        for_each_image(msg, |url, known| {
             if let Some(tex) = self.download_image(ui.ctx(), url) {
                 let disp = display_size(tex.size_vec2());
                 if disp.x <= 0.0 || disp.y <= 0.0 {
@@ -95,12 +114,12 @@ impl App {
                         .color(self.theme.text_secondary),
                 );
             } else {
-                // Ждём: место под картинку резервируем сразу, иначе в момент
-                // её появления высота сообщения скачет на сотни пикселей и всё,
-                // что ниже, уезжает вниз.
+                // Ждём: место под картинку резервируем сразу и ровно столько,
+                // сколько она потом займёт, иначе в момент её появления
+                // высота сообщения скачет и всё, что ниже, уезжает вниз.
+                let disp = reserved_size(known);
                 let color = self.theme.input_bg;
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(width, IMAGE_PLACEHOLDER), egui::Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(disp, egui::Sense::hover());
                 ui.painter().rect_filled(rect, 6.0, color);
                 ui.allocate_new_ui(
                     egui::UiBuilder::new()

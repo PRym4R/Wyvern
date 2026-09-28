@@ -77,6 +77,9 @@ impl<V: CacheCost> BoundedCache<V> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Embed {
     pub(crate) image_url: Option<String>,
+    /// Размер картинки, который Discord прислал рядом со ссылкой. По нему
+    /// высоту сообщения можно посчитать, не качая саму картинку.
+    pub(crate) image_size: Option<[u32; 2]>,
     pub(crate) description: Option<String>,
 }
 
@@ -84,9 +87,11 @@ impl Embed {
     /// Достать из эмбеда Discord только то, что клиент рисует. Если рисуть
     /// нечего — `None`, и эмбед не хранится вовсе.
     pub(crate) fn from_json(e: &Value) -> Option<Self> {
-        let image_url = ["image", "thumbnail", "video"]
+        let image = ["image", "thumbnail", "video"]
             .iter()
-            .find_map(|f| e[*f]["url"].as_str())
+            .find_map(|f| e.get(*f).filter(|v| v.is_object()));
+        let image_url = image
+            .and_then(|v| v["url"].as_str())
             .filter(|u| !u.is_empty())
             .map(|u| u.to_string());
         let description = e["description"]
@@ -97,7 +102,25 @@ impl Embed {
         if image_url.is_none() && description.is_none() {
             return None;
         }
-        Some(Embed { image_url, description })
+        let image_size = image.and_then(image_size_of);
+        Some(Embed { image_url, image_size, description })
+    }
+}
+
+/// Размер картинки из пары полей `width`/`height`. Discord шлёт их целыми, но
+/// приводим из строки в том же духе, как `de_opt_text`: поле может оказаться
+/// числом с точкой или строкой, и ронять из-за этого сообщение нельзя.
+pub(crate) fn image_size_of(v: &Value) -> Option<[u32; 2]> {
+    let num = |k: &str| -> Option<u32> {
+        match v.get(k) {
+            Some(Value::Number(n)) => n.as_u64().map(|x| x.min(u64::from(u32::MAX)) as u32),
+            Some(Value::String(s)) => s.trim().parse::<u32>().ok(),
+            _ => None,
+        }
+    };
+    match (num("width"), num("height")) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some([w, h]),
+        _ => None,
     }
 }
 
@@ -121,6 +144,9 @@ pub(crate) struct Attachment {
     pub(crate) url: String,
     pub(crate) content_type: Option<String>,
     pub(crate) description: Option<String>,
+    /// Размер картинки, который Discord прислал рядом со ссылкой. По нему
+    /// высоту сообщения можно посчитать, не качая саму картинку.
+    pub(crate) size: Option<[u32; 2]>,
 }
 
 #[derive(Clone, Debug)]

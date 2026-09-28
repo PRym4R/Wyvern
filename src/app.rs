@@ -103,6 +103,13 @@ pub(crate) struct App {
     /// на самом низу: egui узнаёт высоту содержимого только после отрисовки,
     /// а перемотать вниз нужно до неё.
     pub(crate) chat_inner_h: f32,
+    /// Настоящая высота содержимого списка с прошлого кадра и та, которую мы
+    /// для него запросили. Разница — ошибка оценки высот сообщений, а на
+    /// длинном списке она доходит до десятков пикселей. Без неё низ
+    /// просился бы выше последнего сообщения, и чат переставал считать себя
+    /// внизу: новое сообщение его уже не тянуло.
+    pub(crate) chat_content_h: f32,
+    pub(crate) chat_est_h: f32,
     /// Прокрутка чата: зеркало того, чем сейчас открыт скролл.
     pub(crate) chat_offset_y: f32,
     /// На чём держится вид: id сообщения у верхней границы окна и на сколько
@@ -164,6 +171,8 @@ impl App {
             msg_offsets: Vec::new(),
             msg_width: 0.0,
             chat_inner_h: 0.0,
+            chat_content_h: 0.0,
+            chat_est_h: 0.0,
             chat_offset_y: 0.0,
             chat_anchor: None,
             want_older: false,
@@ -350,6 +359,8 @@ impl App {
         self.msg_offsets.clear();
         self.chat_anchor = None;
         self.chat_offset_y = 0.0;
+        self.chat_content_h = 0.0;
+        self.chat_est_h = 0.0;
         self.show_friends = false;
         self.username.clear();
         self.user_id.clear();

@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
 use crate::models::ChatMessage;
-use crate::ui::attachments::{display_size, for_each_image, IMAGE_PLACEHOLDER};
+use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 
 /// Насколько за границу окна рисуем сообщения. Запас нужен, чтобы при быстром
 /// скролле не появлялись пустые полосы: между колёсами мыши egui успевает
@@ -18,13 +18,20 @@ const MORE_ROW_H: f32 = 20.0;
 
 // Константы оценки высоты сообщения. Держат в одном месте с теми же числами,
 // что задаёт отрисовка, — иначе оценка будет врать всегда в одну сторону.
-// Имя автора и время — одна строка, текст — строки по 18 пикселей, пузырь
-// добавляет поля и рамку, а между сообщениями ещё зазор.
-const NAME_ROW_H: f32 = 20.0;
-const LINE_H: f32 = 18.0;
-const BUBBLE_BASE_H: f32 = 43.0;
-/// Сообщение другого автора никогда не короче аватара с одной строкой.
-const OTHER_MIN_H: f32 = 67.0;
+// Числа сняты замером на живом egui: реальная высота строки шрифта 14 pt —
+// 16.1, а всё, что вокруг неё (поля пузыря, имя с временем, зазор после
+// сообщения), — 48 пикселей. Раньше тут стояло 18 и 63, и список был
+// завышен на 14%: полоса прокрутки врала, а по мере прокрутки длина списка
+// менялась на сотни пикселей — то самое дёрганье, на которое жалуются.
+const NAME_ROW_H: f32 = 18.0;
+const LINE_H: f32 = 16.5;
+const BUBBLE_BASE_H: f32 = 30.0;
+/// Сообщение другого автора никогда не короче аватара с одной строкой: рядом
+/// с именем встаёт 36-пиксельный аватар, и однострочное сообщение от этого
+/// выше. Замерено: 72 пикселя.
+const OTHER_MIN_H: f32 = 72.0;
+/// Зазор после картинки внутри сообщения.
+const IMAGE_GAP: f32 = 6.0;
 /// Средняя ширина символа текста 14 pt. Только для оценки: как только
 /// сообщение попадает на экран, его высоту мы меряем по-настоящему.
 const CHAR_W: f32 = 7.0;
@@ -114,8 +121,11 @@ impl App {
         }
         self.estimate_msg_height(msg, width)
     }
-    /// Высота сообщения «на глаз». Ошибка здесь не страшна: она уходит, как
-    /// только сообщение попадает в кадр и его реальная высота попадает в кэш.
+    /// Высота сообщения «на глаз». Ошибка здесь почти не страшна: она уходит,
+    /// как только сообщение попадает в кадр и его реальная высота попадает в
+    /// кэш. Но когда ошибка систематическая и в одну сторону (как было: плюс
+    /// 14% на каждом сообщении), длина списка плывёт по мере прокрутки, и
+    /// полоса прокрутки под ней едет. Поэтому константы выше сняты замером.
     fn estimate_msg_height(&self, msg: &ChatMessage, width: f32) -> f32 {
         let own = self.is_own_msg(msg);
         // Ширина текста внутри пузыря: у своего сообщения она ограничена
@@ -127,14 +137,14 @@ impl App {
         };
         let lines = estimate_lines(self.display_content(msg).chars().count(), text_w);
         let mut images = 0.0f32;
-        for_each_image(msg, |url| {
+        for_each_image(msg, |url, known| {
+            // Из кэша высота известна точно; иначе берём размер, который
+            // Discord прислал вместе со ссылкой, — он тоже точный.
             let h = match self.image_cache.get(url) {
                 Some(img) => display_size(img.size_vec2()).y,
-                // Картинка ещё скачивается: резервируем то же место, которое
-                // займёт отрисованный «спиннер»-заглушка.
-                None => IMAGE_PLACEHOLDER,
+                None => reserved_size(known).y,
             };
-            images += h + 6.0;
+            images += h + IMAGE_GAP;
         });
         let total = BUBBLE_BASE_H + NAME_ROW_H + lines * LINE_H + images;
         if own { total } else { total.max(OTHER_MIN_H) }
@@ -147,6 +157,19 @@ impl App {
         let (id, dy) = self.chat_anchor.as_ref()?;
         let i = msgs.iter().position(|m| &m.id == id)?;
         Some((offsets[i] - dy).max(0.0))
+    }
+    /// Насколько близко смещение должно быть к низу, чтобы считать, что чат
+    /// внизу. Порог крошечный: пока пользователь крутит колесо, смещение
+    /// меняется на единицы пикселей за кадр, и с большим порогом чат
+    /// не отпускал бы его от низа — на любой сдвиг его тут же тянуло обратно.
+    const BOTTOM_SLACK: f32 = 1.0;
+    /// Держим ли низ. Пока пользователь внизу, список должен оставаться внизу
+    /// сам: подгрузилась история, уточнилась высота сообщения, пришла
+    /// картинка — всё это меняет длину списка, и если не пересчитывать низ
+    /// каждый кадр, чат сам отползает от последнего сообщения и больше не
+    /// возвращается: новое сообщение его уже не утянет.
+    fn keep_at_bottom(&self) -> bool {
+        self.scroll_to_bottom || self.chat_at_bottom
     }
     pub(crate) fn draw_main_chat(&mut self, ctx: &egui::Context) {
         let msgs = self.current_channel_messages();
@@ -182,7 +205,7 @@ impl App {
         match channel_label {
             Some(_) => {
                 let sel_id = sel_cid.clone();
-                let stick = self.scroll_to_bottom;
+                let stick = self.keep_at_bottom();
                 // Буфер префиксных сумм на время кадра живёт отдельно от self:
                 // иначе нельзя одновременно читать сообщения (это ссылка на
                 // self) и писать в тот же буфер. Высоты же кэшируются по id
@@ -201,11 +224,11 @@ impl App {
                     offsets.push(sum);
                 }
                 let total = sum;
-                // Когда чат сам уезжает вниз (первая страница истории или
-                // только что пришедшее сообщение), вид ещё не выбран — держаться
-                // не за что. Якорь здесь только вредит: он закрепил бы прокрутку
-                // там, где она была до перемотки, и новое сообщение так и не
-                // показалось бы.
+                // Когда чат сам уезжает вниз (первая страница истории, новое
+                // сообщение или просто уточнившаяся высота), вид ещё не выбран
+                // — держаться не за что. Якорь здесь только вредит: он закрепил
+                // бы прокрутку там, где она была до перемотки, и новое
+                // сообщение так и не показалось бы.
                 let hint = if stick { None } else { self.anchored_offset(&msgs, &offsets) };
                 // Открываем сразу на низу: сколько места останется под список,
                 // известно заранее (полоса прокрутки высоту не ест). Иначе кадр,
@@ -216,7 +239,17 @@ impl App {
                     ctx.available_rect().height()
                 };
                 let offset = if stick {
-                    (total - inner).max(0.0)
+                    // Просим низ не по оценке высот, а с поправкой на то,
+                    // насколько оценка промахнулась в прошлом кадре. Оценка
+                    // на длинном списке врёт на десятки пикселей, и без
+                    // поправки «низ» уезжал вверх: последнее сообщение
+                    // оказывалось на 35 px выше края, а `chat_at_bottom` гас —
+                    // после этого новое сообщение уже не тянуло чат вниз.
+                    let err = (self.chat_content_h - self.chat_est_h).clamp(
+                        -(total / 2.0),
+                        total / 2.0,
+                    );
+                    (total - inner + err).max(0.0)
                 } else {
                     hint.unwrap_or(self.chat_offset_y)
                 };
@@ -238,8 +271,19 @@ impl App {
                         let scroll_out = egui::ScrollArea::vertical()
                             .id_salt(("chat", &sel_id))
                             .auto_shrink([false, false])
-                            .stick_to_bottom(stick)
-                            .vertical_scroll_offset(hint.unwrap_or(self.chat_offset_y))
+                            // egui просим прилипнуть ко дну только когда мы
+                            // сами туда едем. Если просить это каждый кадр, пока
+                            // пользователь внизу, egui начнёт возвращать его на
+                            // низ сам и колесо перестанет работать. Удержание низа
+                            // делаем сами — смещением, которое передаём строкой
+                            // ниже.
+                            .stick_to_bottom(self.scroll_to_bottom)
+                            // Именно то смещение, по которому мы посчитали
+                            // окно сообщений, а не запомненное с прошлого
+                            // кадра: иначе кадр, который перематывает вниз,
+                            // нарисовал бы верх канала (на один кадр, но
+                            // список дёргается).
+                            .vertical_scroll_offset(offset)
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 self.msg_width = ui.available_width();
@@ -343,23 +387,46 @@ impl App {
                         let content_h = scroll_out.content_size.y;
                         let offset_y = scroll_out.state.offset.y;
                         self.chat_inner_h = inner_h;
-                        self.push_debug(format!("SCROLL: inner_h={:.0} content_h={:.0} offset_y={:.0} stick={}", inner_h, content_h, offset_y, stick));
+                        self.push_debug(format!("SCROLL: inner_h={:.0} content_h={:.0} offset_y={:.0} ask={:.0} stick={}", inner_h, content_h, offset_y, offset, stick));
 
-                        if stick {
-                            // Просили вниз — значит и встали вниз. egui считает
-                            // содержимое только к концу кадра, а перемотать надо
-                            // было до его отрисовки, поэтому доводим руками.
+                        // Доводим перемотку вниз руками только когда она была
+                        // явной (`scroll_to_bottom`): egui считает содержимое
+                        // к концу кадра, а перематывать надо было до его
+                        // отрисовки.
+                        //
+                        // Когда чат просто держится внизу (пользователь внизу,
+                        // длина списка меняется), состояние egui не трогаем
+                        // совсем: удержание делается смещением, которое мы
+                        // просим в начале кадра.
+                        let forced_bottom = self.scroll_to_bottom;
+                        if forced_bottom {
                             let mut st = scroll_out.state;
                             st.offset.y = (content_h - inner_h).max(0.0);
                             st.store(ui.ctx(), scroll_out.id);
-                            self.scroll_to_bottom = false;
+                        }
+                        self.scroll_to_bottom = false;
+                        if forced_bottom {
                             self.chat_anchor = None;
                         }
-                        // Где чат оказался на самом деле: на кадре с
-                        // перемоткой — внизу, иначе там, куда увела
-                        // прокрутка (своя или пользовательская).
-                        let settled = if stick {
-                            (content_h - inner_h).max(0.0)
+                        self.chat_content_h = content_h;
+                        self.chat_est_h = total;
+                        let max_off = (content_h - inner_h).max(0.0);
+                        // Список ушёл и не туда, куда просили, и не на
+                        // настоящий низ — значит прокрутил пользователь
+                        // (колесом или перетаскиванием). Такой результат
+                        // затирать на «дно» нельзя: колесо перестанет листать
+                        // чат совсем, а это ровно то, на что жаловались. Если
+                        // же мы просили примерно в ту же точку, куда список и
+                        // встал (egui подрезал его по настоящей высоте), то
+                        // это наш собственный промах с оценкой, а не прокрутка.
+                        let moved_by_user = (offset_y - offset).abs() > Self::BOTTOM_SLACK
+                            && (offset_y - max_off).abs() > Self::BOTTOM_SLACK;
+                        // Где чат оказался на самом деле: когда держим низ и
+                        // пользователь не трогал прокрутку — точно внизу (с
+                        // поправкой на остаточную ошибку оценки), иначе там,
+                        // куда увела прокрутка.
+                        let settled = if (forced_bottom || stick) && !moved_by_user {
+                            max_off
                         } else {
                             offset_y
                         };
@@ -367,8 +434,11 @@ impl App {
                         self.last_scroll_offset_y = self.last_scroll_offset_y.max(settled);
                         // Прокрутка в самом низу — по этому новое сообщение
                         // будет тянуть чат вниз, а читающего историю выше не
-                        // выбросит.
-                        self.chat_at_bottom = settled >= content_h - inner_h - 12.0;
+                        // выбросит. Порог крошечный: стоит сделать его больше
+                        // пары пикселей, и чат перестанет отпускать
+                        // пользователя от низа — тот проскроллил на пять
+                        // пикселей вверх, а его тут же вернуло.
+                        self.chat_at_bottom = settled >= max_off - Self::BOTTOM_SLACK;
                         scroll_out
                     });
                 self.msg_offsets = offsets;
@@ -633,13 +703,264 @@ mod geometry_tests {
         cmds: mpsc::UnboundedReceiver<ToGateway>,
     }
 
-    /// Всё, что приложение отправило гейтвею, и очистив очередь.
-    fn drain(cmds: &mut mpsc::UnboundedReceiver<ToGateway>) -> Vec<ToGateway> {
-        let mut out = Vec::new();
-        while let Ok(c) = cmds.try_recv() {
-            out.push(c);
+    /// Колесо должно листать чат в обе стороны. Это ровно то, на что жалуются:
+    /// «не могу листать чат». Прокручиваем настоящим колесом и ждём не кадров,
+    /// а прекращения сдвига — egui сглаживает колесо по нескольким кадрам.
+    #[test]
+    fn wheel_scrolls_the_chat_in_both_directions() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        let (inner, content, _ask) = scroll_sizes(&h.app);
+        let bottom = content - inner;
+        assert!(bottom > 1000.0, "список должен быть заметно выше окна");
+        assert!(
+            (h.app.chat_offset_y - bottom).abs() < 1.0,
+            "открытый чат должен быть внизу: смещение {:.0}, низ {bottom:.0}",
+            h.app.chat_offset_y
+        );
+
+        // Вверх к началу истории.
+        let up = wheel_until_stop(&mut h.app, &ctx, 120.0);
+        eprintln!("[TEST] наверх за {up} событий: смещение {:.0}", h.app.chat_offset_y);
+        assert!(
+            h.app.chat_offset_y < 1.0,
+            "колесо вверх не довело список до начала: смещение {:.0}",
+            h.app.chat_offset_y
+        );
+
+        // И обратно вниз — до последнего сообщения.
+        let down = wheel_until_stop(&mut h.app, &ctx, -120.0);
+        let (inner, content, _ask) = scroll_sizes(&h.app);
+        let bottom = content - inner;
+        eprintln!(
+            "[TEST] вниз за {down} событий: смещение {:.0}, низ {bottom:.0}",
+            h.app.chat_offset_y
+        );
+        assert!(
+            (h.app.chat_offset_y - bottom).abs() < 1.0,
+            "колесо вниз не довело список до низа: смещение {:.0}, низ {bottom:.0}",
+            h.app.chat_offset_y
+        );
+    }
+
+    /// Крутить колесо, пока смещение перестаёт меняться.
+    fn wheel_until_stop(app: &mut App, ctx: &egui::Context, dy: f32) -> usize {
+        let mut still = 0;
+        let mut events = 0;
+        while still < 20 {
+            let before = app.chat_offset_y;
+            wheel_frame(app, ctx, dy);
+            events += 1;
+            if (app.chat_offset_y - before).abs() < 0.5 {
+                still += 1;
+            } else {
+                still = 0;
+            }
+            assert!(events < 4000, "колесо не доводит список до края");
         }
-        out
+        events
+    }
+
+    /// Кадр, который держит чат внизу, обязан нарисовать последнее сообщение
+    /// целиком. Если просить низ по одной лишь оценке высот (на длинном списке
+    /// она врёт на десятки пикселей), список откроется чуть выше настоящего
+    /// низа — и нижний край последнего сообщения окажется за кромкой окна.
+    /// Проверяем каждый кадр: в том числе первый, когда оценка ещё ни разу не
+    /// сверялась с измеренной.
+    #[test]
+    fn the_frame_at_the_bottom_draws_the_last_message_whole() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        for i in 0..6 {
+            h.app.poll(&ctx);
+            frame(&mut h.app, &ctx);
+            let (inner, _content, ask) = scroll_sizes(&h.app);
+            let n = h.app.messages["c0"].len();
+            let last = h.app.messages["c0"][n - 1].clone();
+            let h_last = h
+                .app
+                .msg_heights
+                .get(&last.id)
+                .copied()
+                .expect("последнее сообщение должно быть нарисовано");
+            let bottom = h.app.msg_offsets[n - 1] + h_last;
+            assert!(
+                bottom <= ask + inner + 1.0,
+                "кадр {i}: последнее сообщение обрезано нижней кромкой окна — \
+                 оно кончается на {bottom:.1}, а окно на {:.1} (просили смещение {ask:.0})",
+                ask + inner
+            );
+        }
+    }
+
+    /// Оценка высоты не должна врать. Пока числа в оценке держались на глаз,
+    /// список был завышен на 14% на каждом сообщении: длина списка плыла по
+    /// мере прокрутки, низ уезжал, и докрутить чат до конца было нельзя.
+    /// Меряем оценку и настоящую высоту на живом egui и требуем, чтобы
+    /// расхождение было в пределах допуска.
+    #[test]
+    fn estimate_height_is_close_to_the_real_one() {
+        use crate::models::Attachment;
+        let mut h = app_with_messages(1);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 2);
+        let width = h.app.msg_width;
+
+        // Случаи, на которых оценка обычно и врет: чужие и свои сообщения от
+        // одной строки до двадцати, одно длинное слово (его egui не
+        // переносит) и сообщение с картинкой.
+        let mut cases: Vec<(String, ChatMessage)> = Vec::new();
+        for (who, own) in [("чужое", false), ("своё", true)] {
+            for lines in [1usize, 2, 5, 10, 20] {
+                let mut m = message(lines);
+                m.is_own = own;
+                m.author_id = "u0".into();
+                m.content = "слово ".repeat(lines * 12);
+                cases.push((format!("{who} {lines} строк"), m));
+            }
+            let mut m = message(99);
+            m.is_own = own;
+            m.author_id = "u0".into();
+            m.content = "ы".repeat(400);
+            cases.push((format!("{who} длинное слово"), m));
+            let mut m = message(98);
+            m.is_own = own;
+            m.author_id = "u0".into();
+            m.content = "с картинкой".into();
+            m.attachments.push(Attachment {
+                url: "https://example.invalid/i.png".into(),
+                content_type: Some("image/png".into()),
+                description: None,
+                size: Some([100, 200]),
+            });
+            cases.push((format!("{who} с картинкой"), m));
+        }
+
+        let mut sum_est = 0.0;
+        let mut sum_real = 0.0;
+        for (name, m) in &cases {
+            let est = h.app.estimate_msg_height(m, width);
+            // Рисуем по одному: список короткий и в окно влезает целиком.
+            h.app.messages.insert("c0".into(), vec![Arc::new(m.clone())]);
+            scroll_to(&mut h.app, 0.0);
+            frame(&mut h.app, &ctx);
+            frame(&mut h.app, &ctx);
+            let real = h.app.msg_heights.get(&m.id).copied().unwrap_or(0.0);
+            assert!(
+                (est - real).abs() <= real * 0.15 + 12.0,
+                "{name}: оценка {est:.0} против настоящих {real:.0}"
+            );
+            sum_est += est;
+            sum_real += real;
+        }
+        // Общая длина списка тоже должна сходиться: полоса прокрутки рисует
+        // длину по оценке, и ошибка в ней видна глазом.
+        assert!(
+            (sum_est - sum_real).abs() <= sum_real * 0.05,
+            "длина списка по оценке {sum_est:.0} против настоящей {sum_real:.0}"
+        );
+    }
+
+    /// Низ списка должен быть достижим и последнее сообщение должно стоять
+    /// впритык к нижней кромке окна: на этом и стоит «я не могу проскроллить
+    /// чат вниз».
+    #[test]
+    fn bottom_is_reachable_and_last_message_sits_at_the_edge() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        // Прокручиваем вниз подстановкой смещения — так же, как сообщает egui
+        // после колеса, — и проверяем, что низ достижим и удерживается.
+        for step in 1..=40 {
+            let (inner, content, _ask) = scroll_sizes(&h.app);
+            let max = (content - inner).max(0.0);
+            scroll_to(&mut h.app, max * step as f32 / 40.0);
+            frame(&mut h.app, &ctx);
+            assert!(
+                h.app.chat_offset_y <= max + 1.0,
+                "смещение {step} больше низа: {:.0} при {max:.0}",
+                h.app.chat_offset_y
+            );
+        }
+
+        let (inner, content, _ask) = scroll_sizes(&h.app);
+        let max = content - inner;
+        // Последнее сообщение должно заканчиваться у низа окна, а не висеть
+        // над ним (список не долистался) и не торчать за краем (докрутилось
+        // лишнее).
+        let n = h.app.messages["c0"].len();
+        let last_bottom = h.app.msg_offsets[n] - h.app.chat_offset_y;
+        assert!(
+            (last_bottom - inner).abs() <= inner * 0.05,
+            "последнее сообщение не у низа окна: {last_bottom:.1} при окне {inner:.0} (смещение {:.0}, низ {max:.0})",
+            h.app.chat_offset_y
+        );
+    }
+
+    /// Пока пользователь внизу, список обязан остаться внизу сам. Длина списка
+    /// меняется на ходу: подгружается история вверх, у сообщений уточняется
+    /// высота, приходят картинки. Если низ не пересчитывать каждый кадр, чат
+    /// отползает от последнего сообщения и больше не возвращается — новое
+    /// сообщение его уже не утянет.
+    #[test]
+    fn bottom_is_held_while_the_list_changes_under_it() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        assert!(h.app.chat_at_bottom, "после открытия чат должен быть внизу");
+
+        // Пришло новое сообщение: ниже списка стало длиннее, смещение обязано
+        // потянуться следом.
+        let before = h.app.chat_offset_y;
+        h.tx.send(ToApp::Message(message(9999))).unwrap();
+        h.app.poll(&ctx);
+        frame(&mut h.app, &ctx);
+        assert!(
+            h.app.chat_offset_y > before,
+            "новое сообщение не утянуло чат вниз: было {before:.0}, стало {:.0}",
+            h.app.chat_offset_y
+        );
+        assert!(h.app.chat_at_bottom, "после нового сообщения чат должен быть внизу");
+
+        // Под сообщением в кадре уточнилась высота (настоящая больше той, что
+        // предполагала оценка). Список стал длиннее — низ должен поехать за ним.
+        let grew = h
+            .app
+            .msg_heights
+            .values_mut()
+            .next()
+            .map(|h| {
+                *h += 40.0;
+                *h
+            })
+            .expect("кэш высот не пуст после кадров");
+        frame(&mut h.app, &ctx);
+        // Размеры снимаем после кадра: высота сообщения выросла именно в нём.
+        let (inner, content, _ask) = scroll_sizes(&h.app);
+        let max = content - inner;
+        assert!(
+            (h.app.chat_offset_y - max).abs() < 1.0,
+            "чат отполз от низа после роста сообщения: смещение {:.0}, низ {max:.0} (высота выросла на {grew:.0})",
+            h.app.chat_offset_y
+        );
+        assert!(h.app.chat_at_bottom, "после уточнения высоты чат должен быть внизу");
+
+        // А вот читатель истории: если пользователь ушёл вверх, его не должно
+        // выбросить вниз.
+        let up = total_height(&h.app) * 0.4;
+        scroll_to(&mut h.app, up);
+        frame(&mut h.app, &ctx);
+        assert!(!h.app.chat_at_bottom, "пользователь ушёл вверх — чат не внизу");
+        let held = h.app.chat_offset_y;
+        frame(&mut h.app, &ctx);
+        frame(&mut h.app, &ctx);
+        assert!(
+            (h.app.chat_offset_y - held).abs() < 1.0,
+            "чат утёк вниз у читающего историю: {held:.0} -> {:.0}",
+            h.app.chat_offset_y
+        );
     }
 
     /// Один кадр приложения.
@@ -655,17 +976,61 @@ mod geometry_tests {
         }
     }
 
+    /// Кадр с настоящим колесом мыши над окном чата. `dy` — знак egui:
+    /// положительное значение тянет список к началу, отрицательное — к новым
+    /// сообщениям.
+    ///
+    /// Курсор ставим посередине чата и каждый кадр сдвигаем на полпикселя:
+    /// egui считает указатель наведённым, только если он двигался за кадр, иначе
+    /// колесо не доходит до скролла и тест врал бы в обратную сторону.
+    fn wheel_frame(app: &mut App, ctx: &egui::Context, dy: f32) {
+        NUDGE.with(|n| {
+            let shift = n.get();
+            n.set(if shift >= 1.0 { 0.0 } else { shift + 0.5 });
+            let mut input = screen();
+            input
+                .events
+                .push(egui::Event::PointerMoved(egui::Pos2::new(600.0 + shift, 500.0)));
+            input.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                modifiers: egui::Modifiers::default(),
+            });
+            let _ = ctx.run(input, |ctx| app.draw_chat(ctx));
+        });
+    }
+
+    thread_local! {
+        /// Счётчик для дрожания указателя, см. `wheel_frame`.
+        static NUDGE: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    }
+
+    /// Всё, что приложение отправило гейтвею, и очистить очередь.
+    fn drain(cmds: &mut mpsc::UnboundedReceiver<ToGateway>) -> Vec<ToGateway> {
+        let mut out = Vec::new();
+        while let Ok(c) = cmds.try_recv() {
+            out.push(c);
+        }
+        out
+    }
+
     /// Поставить прокрутку в `off` и забыть якорь: так мы притворяемся, что
-    /// пользователь промотал список сам.
+    /// пользователь промотал список сам. Заодно снимаем признак «чат внизу»
+    /// — иначе приложение (справедливо) решит, что пользователь всё ещё внизу,
+    /// и вернёт список вниз.
     fn scroll_to(app: &mut App, off: f32) {
         app.scroll_to_bottom = false;
+        app.chat_at_bottom = false;
         app.chat_anchor = None;
         app.chat_offset_y = off;
     }
 
-    /// Размеры скролла из отладочной строки `SCROLL: inner_h=… content_h=…`.
+    /// Размеры скролла из отладочной строки `SCROLL: inner_h=… content_h=…
+    /// offset_y=… ask=…`: высота окна, высота содержимого и смещение, которое
+    /// мы просили (по нему нарисован кадр).
+    ///
     /// Кэшируются они у нас только здесь, но зато всегда свежие.
-    fn scroll_sizes(app: &App) -> (f32, f32) {
+    fn scroll_sizes(app: &App) -> (f32, f32, f32) {
         let line = app
             .debug_log
             .iter()
@@ -674,6 +1039,7 @@ mod geometry_tests {
             .expect("отладочная строка скролла");
         let mut inner = 0.0;
         let mut content = 0.0;
+        let mut ask = 0.0;
         for part in line.split_whitespace() {
             if let Some(v) = part.strip_prefix("inner_h=") {
                 inner = v.parse().expect("inner_h");
@@ -681,8 +1047,14 @@ mod geometry_tests {
             if let Some(v) = part.strip_prefix("content_h=") {
                 content = v.parse().expect("content_h");
             }
+            // Смещение, которое мы просили: по нему считалось окно сообщений
+            // и по нему нарисован кадр. Именно его проверяем — «куда встал
+            // чат после кадра» проверяется отдельно.
+            if let Some(v) = part.strip_prefix("ask=") {
+                ask = v.parse().expect("ask");
+            }
         }
-        (inner, content)
+        (inner, content, ask)
     }
 
     /// Высота всего списка по префиксным суммам кадра.
@@ -701,7 +1073,7 @@ mod geometry_tests {
         // Как при открытии канала: первая страница истории, чат внизу.
         frames(&mut h.app, &ctx, 3);
 
-        let (inner, content) = scroll_sizes(&h.app);
+        let (inner, content, _ask) = scroll_sizes(&h.app);
         let measured = h.app.msg_heights.len();
         eprintln!("[TEST] inner={inner:.0} content={content:.0} измерено={measured}");
         assert!(measured > 0, "ни одно сообщение не нарисовано");
@@ -728,7 +1100,7 @@ mod geometry_tests {
         let mut h = app_with_messages(300);
         let ctx = egui::Context::default();
         frames(&mut h.app, &ctx, 3);
-        let (inner, _content) = scroll_sizes(&h.app);
+        let (inner, _content, _ask) = scroll_sizes(&h.app);
 
         // Метки середины, начала и самого низа списка.
         let total = total_height(&h.app);
@@ -821,7 +1193,7 @@ mod geometry_tests {
         // Сверяемся с высотой содержимого того же кадра: сумма в msg_offsets
         // посчитана до того, как высота нового сообщения была измерена, и
         // отстаёт на величину ошибки оценки.
-        let (inner, content) = scroll_sizes(&h.app);
+        let (inner, content, _ask) = scroll_sizes(&h.app);
         let bottom = content - inner;
         eprintln!("[TEST] внизу: offset={:.0}, низ={bottom:.0}", h.app.chat_offset_y);
         assert!(
@@ -1023,7 +1395,7 @@ mod geometry_tests {
             let ctx = egui::Context::default();
             scroll_to(&mut h.app, 0.0);
             frames(&mut h.app, &ctx, 3);
-            let (_inner, content) = scroll_sizes(&h.app);
+            let (_inner, content, _ask) = scroll_sizes(&h.app);
             eprintln!("[TEST] {n} сообщений: скролл {content:.0}");
             assert!(content < 500.0, "{n} сообщений: скролл {content:.0} — список раздут");
             if n == 0 {
@@ -1032,5 +1404,65 @@ mod geometry_tests {
             let sent = drain(&mut h.cmds);
             assert!(sent.is_empty(), "в канале из {n} сообщений просить нечего, а ушло {sent:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wheel_probe {
+    use eframe::egui;
+    use std::sync::Mutex;
+
+    /// Смещение последнего нарисованного скролла: состояние egui приватно,
+    /// поэтому забираем его сами — так же, как в тестах геометрии берём размеры
+    /// из отладочной строки.
+    static OFFSET: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+
+    /// Минимальный ScrollArea без нашего кода: доходит ли до него колесо,
+    /// поданное через RawInput. Если и здесь не доходит — дело в том, как мы
+    /// кормим egui событиями, а не в чате.
+    #[test]
+    fn plain_scroll_area_reacts_to_wheel() {
+        let ctx = egui::Context::default();
+        let screen = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let mut shift = 0.0f32;
+        let mut run = |n: usize, dy: f32| {
+            for _ in 0..n {
+                let mut input = screen.clone();
+                input.events.push(egui::Event::PointerMoved(egui::Pos2::new(400.0 + shift, 300.0)));
+                input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    modifiers: egui::Modifiers::default(),
+                });
+                shift = if shift >= 1.0 { 0.0 } else { shift + 0.5 };
+                let _ = ctx.run(input, |ctx| {
+                    let out = egui::CentralPanel::default()
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("probe")
+                                .show(ui, |ui| {
+                                    ui.allocate_space(egui::vec2(ui.available_width(), 5000.0));
+                                })
+                                .state
+                                .offset
+                                .y
+                        })
+                        .inner;
+                    OFFSET.lock().unwrap().push(out);
+                });
+            }
+        };
+        run(1, 0.0);
+        let before = OFFSET.lock().unwrap().last().copied().unwrap_or(0.0);
+        run(20, -120.0);
+        let after = OFFSET.lock().unwrap().last().copied().unwrap_or(0.0);
+        eprintln!("[PROBE] смещение {before:.1} -> {after:.1}");
+        assert!(
+            (after - before).abs() > 10.0,
+            "egui сам по себе не отреагировал на колесо: {before:.1} -> {after:.1}"
+        );
     }
 }

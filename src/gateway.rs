@@ -9,7 +9,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::messages::{ToApp, ToGateway};
-use crate::models::{Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
+use crate::models::{image_size_of, Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
 use crate::util::super_props;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -193,6 +193,13 @@ fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>,
     }))
 }
 
+/// Размер картинки из полей `width`/`height`. Discord шлёт их целыми, но берём
+/// через `image_size_of` — оно терпит и строку, и число с точкой, а нечётное
+/// значение не должно ронять разбор сообщения.
+fn de_opt_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[u32; 2]>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.as_ref().and_then(image_size_of))
+}
+
 /// Автор сообщения в том виде, в каком его рисует клиент.
 #[derive(serde::Deserialize)]
 struct RawAuthor {
@@ -204,9 +211,9 @@ struct RawAuthor {
     avatar: Option<String>,
 }
 
-/// Вложение: только то, что нужно для показа. Имя файла, размеры и тип
-/// вложения клиенту не нужны — `content_type` берём, потому что по нему
-/// решаем, грузить ли картинку вообще.
+/// Вложение: только то, что нужно для показа. Имя файла клиенту не нужно,
+/// `content_type` берём, потому что по нему решаем, грузить ли картинку
+/// вообще, а размеры — по ним мы знаем высоту сообщения, не качая картинку.
 #[derive(serde::Deserialize)]
 struct RawAttachment {
     #[serde(default, deserialize_with = "de_opt_text")]
@@ -215,12 +222,16 @@ struct RawAttachment {
     content_type: Option<String>,
     #[serde(default, deserialize_with = "de_opt_text")]
     description: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_size")]
+    size: Option<[u32; 2]>,
 }
 
 #[derive(serde::Deserialize)]
 struct RawImage {
     #[serde(default, deserialize_with = "de_opt_text")]
     url: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_size")]
+    size: Option<[u32; 2]>,
 }
 
 /// Эмбед: автор, footer, provider, поля и прочее сюда не входят — serde
@@ -239,11 +250,12 @@ struct RawEmbed {
 
 impl RawEmbed {
     fn into_embed(self) -> Option<Embed> {
-        let image_url = [self.image, self.thumbnail, self.video]
+        let image = [self.image, self.thumbnail, self.video]
             .into_iter()
             .flatten()
-            .find_map(|i| i.url)
-            .filter(|u| !u.is_empty());
+            .find(|i| i.url.as_deref().is_some_and(|u| !u.is_empty()));
+        let image_url = image.as_ref().and_then(|i| i.url.clone());
+        let image_size = image.and_then(|i| i.size);
         let description = match self.description {
             Some(s) => {
                 let trimmed = s.trim();
@@ -261,7 +273,7 @@ impl RawEmbed {
         if image_url.is_none() && description.is_none() {
             return None;
         }
-        Some(Embed { image_url, description })
+        Some(Embed { image_url, image_size, description })
     }
 }
 
@@ -303,6 +315,7 @@ impl RawMessage {
                         url: a.url?,
                         content_type: a.content_type,
                         description: a.description,
+                        size: a.size,
                     })
                 })
                 .collect(),
@@ -374,6 +387,7 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
                             url: a["url"].as_str()?.to_string(),
                             content_type: a["content_type"].as_str().map(|s| s.to_string()),
                             description: a["description"].as_str().map(|s| s.to_string()),
+                            size: image_size_of(a),
                         })
                     })
                     .collect()
@@ -1125,7 +1139,7 @@ mod parse_tests {
         assert_eq!(msgs[0].attachments[0].url, "https://cdn.discordapp.com/a/1.png");
     }
 
-    /// Запасной разобран��: если формат неожиданный (например, `author` пришёл
+    /// Запасной разбор: если формат неожиданный (например, `author` пришёл
     /// не объектом), история всё равно показывается — пусть с пустыми полями.
     /// Строгий разбор на этом теле падает, а страница не должна пропадать
     /// целиком из-за одной строки.
