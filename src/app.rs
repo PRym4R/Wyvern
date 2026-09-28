@@ -32,7 +32,8 @@ const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
 
 /// Оставляем только последние N сообщений: иначе активный канал в шумном
-/// чате раздувает память бесконечно.
+/// чате раздувает память бесконечно. Список идёт от старых к новым, поэтому
+/// выбрасываются самые старые.
 fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>) {
     if entry.len() > MAX_MESSAGES_PER_CHANNEL {
         let extra = entry.len() - MAX_MESSAGES_PER_CHANNEL;
@@ -430,6 +431,17 @@ impl App {
     /// канала, который открыт сейчас: поздний ответ по уже закрытому каналу
     /// не должен снимать «Loading messages…» у того, который грузится сейчас.
     fn apply_history(&mut self, channel_id: &str, incoming: Vec<ChatMessage>, more: bool, prepend: bool) {
+        // Discord отдаёт страницу от новых к старым, а список должен идти от
+        // старых к новым. Только тогда первая строка списка — самая старая, и
+        // от неё берётся `before` для догрузки вверх, а потолок выбрасывает
+        // самые старые, а не самые новые.
+        //
+        // Без разворота `before` уходил от самого нового сообщения, Discord
+        // присылал ту же страницу ещё раз, и каждая догрузка вверх подставляла
+        // её в начало: чат рос копиями одних и тех же сообщений, и прокрутка
+        // вверх циклично показывала одно и то же.
+        let mut incoming = incoming;
+        incoming.reverse();
         let added = {
             let entry = self.messages.entry(channel_id.to_string()).or_default();
             if prepend {
@@ -491,8 +503,12 @@ impl App {
             if for_current { "" } else { " (не текущий канал)" }));
     }
     /// Догрузить более старые сообщения: просим страницу от самой старой
-    /// строки, что уже есть в канале. Пока предыдущая страница в пути, повторно
-    /// не спрашиваем — иначе один скролл вверх даст пачку одинаковых запросов.
+    /// строки, что уже есть в канале. Это именно первая строка списка — список
+    /// идёт от старых к новым (см. `apply_history`); если бы порядок был
+    /// другим, `before` ушёл бы от самого нового сообщения, Discord вернул бы
+    /// ту же страницу, и чат пошёл бы по кругу. Пока предыдущая страница в
+    /// пути, повторно не спрашиваем — иначе один скролл вверх даст пачку
+    /// одинаковых запросов.
     pub(crate) fn request_older_history(&mut self) {
         if self.history_loading.is_some() || self.history_loading_more || self.history_exhausted {
             return;
@@ -1076,41 +1092,89 @@ mod layout_tests {
         app.selected_channel = Some(0);
         app.open_channel("c1");
 
-        // Первая страница: как в Discord, отдаём 50 сообщений.
-        let first: Vec<ChatMessage> = (0..crate::gateway::HISTORY_PAGE)
-            .map(|i| test_msg(&format!("m{}", i + 1), "c1", "новое"))
-            .collect();
+        // Первая страница ровно такая, какую присылает Discord: от новых к
+        // старым, самое старое — m51. В списке она должна лежать в конце.
+        let first: Vec<ChatMessage> = (51..=100).rev().map(|i| test_msg(&format!("m{i}"), "c1", "новое")).collect();
+        assert_eq!(first[0].id, "m100", "Discord отдаёт страницу от новых к старым");
         tx.send(ToApp::History { channel_id: "c1".into(), messages: first, more: true }).unwrap();
         app.poll(&ctx);
         let stored = app.messages.get("c1").unwrap().len();
         assert_eq!(stored, crate::gateway::HISTORY_PAGE);
         assert!(!app.history_exhausted, "Discord сказал, что история есть дальше");
         assert!(app.history_loading.is_none(), "спиннер первой страницы снялся");
+        // В списке порядок обратный: от старых к новым.
+        let first_stored = app.messages.get("c1").unwrap();
+        assert_eq!(first_stored[0].id, "m51", "в начале списка самое старое");
+        assert_eq!(first_stored[stored - 1].id, "m100", "в конце самое новое");
 
-        // Прокрутили вверх: просим и получаем страницу старше. Крайнее
-        // сообщение приходит в обеих страницах — дубль не нужен.
+        // Прокрутили вверх: просим и получаем страницу строго старше.
         app.request_older_history();
         assert!(app.history_loading_more, "должен гореть индикатор догрузки");
-        let before = app.messages.get("c1").unwrap()[0].id.clone();
-        let older: Vec<ChatMessage> = (0..crate::gateway::HISTORY_PAGE)
-            .map(|i| test_msg(&format!("m{}", i), "c1", "старое"))
-            .collect();
+        let older: Vec<ChatMessage> = (1..=50).rev().map(|i| test_msg(&format!("m{i}"), "c1", "старое")).collect();
         tx.send(ToApp::HistoryMore { channel_id: "c1".into(), messages: older, more: false }).unwrap();
         app.poll(&ctx);
 
         let msgs = app.messages.get("c1").unwrap();
-        // 50 + 49: одно сообщение было на стыке страниц и дубль убрали.
-        assert_eq!(msgs.len(), crate::gateway::HISTORY_PAGE * 2 - 1, "страница должна добавиться, а не заменить");
-        assert_ne!(msgs[0].id, before, "в начале должно быть самое старое");
-        assert_eq!(msgs[0].content, "старое");
-        assert_eq!(msgs[crate::gateway::HISTORY_PAGE].content, "новое", "прежние сообщения не должны пропасть");
+        assert_eq!(msgs.len(), crate::gateway::HISTORY_PAGE * 2, "страница должна добавиться, а не заменить");
+        // Главное здесь — порядок и отсутствие повторов. Именно их нарушение
+        // выглядело как «чат копируется»: страницы приходили по кругу, и под
+        // каждым новым запросом появлялись те же самые сообщения.
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        let want: Vec<String> = (1..=100).map(|i| format!("m{i}")).collect();
         assert_eq!(
-            msgs.iter().filter(|m| m.id == "m1").count(),
-            1,
-            "крайнее сообщение не должно дублироваться"
+            ids,
+            want.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "список должен идти строго от старых к новым, без повторов"
+        );
+        assert_eq!(msgs[0].content, "старое", "в начале самое старое");
+        assert_eq!(
+            msgs[msgs.len() - 1].content,
+            "новое",
+            "прежние сообщения не должны пропасть"
         );
         assert!(app.history_exhausted, "короткой страницей история признана конченной");
         assert!(!app.history_loading_more, "индикатор догрузки должен погаснуть");
+    }
+
+    /// На стыке страниц одно сообщение может прийти в обеих — дубль убираем.
+    /// Иначе оно мигало бы дважды подряд при прокрутке вверх.
+    #[test]
+    fn boundary_message_is_not_duplicated() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let first: Vec<ChatMessage> = (51..=100).rev().map(|i| test_msg(&format!("m{i}"), "c1", "x")).collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: first, more: true }).unwrap();
+        app.poll(&ctx);
+
+        // Старше — но самое старое сообщение (m51) Discord прислал снова.
+        let older: Vec<ChatMessage> = (1..=51).rev().map(|i| test_msg(&format!("m{i}"), "c1", "x")).collect();
+        tx.send(ToApp::HistoryMore { channel_id: "c1".into(), messages: older, more: false }).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(
+            msgs.iter().filter(|m| m.id == "m51").count(),
+            1,
+            "сообщение на стыке страниц должно быть одно"
+        );
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        let want: Vec<String> = (1..=100).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            ids,
+            want.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "список должен идти от старых к новым без повторов"
+        );
     }
 
     /// Пока страница в пути, повторно по этому каналу не просим: один скролл
@@ -1144,6 +1208,68 @@ mod layout_tests {
         app.history_loading = Some("c1".into());
         app.request_older_history();
         assert!(!app.history_loading_more, "во время первой загрузки вверх не лезем");
+    }
+
+    /// Страница от Discord приходит от новых к старым, а хранить её надо от
+    /// старых к новым. Если хранить как прислали, первой в списке оказывается
+    /// самая новая строка, и `before` для догрузки вверх берётся от неё:
+    /// Discord присылает ту же страницу ещё раз, клиент подставляет её в
+    /// начало — и список растёт копиями одних и тех же сообщений. Именно это
+    /// и было видно в чате: прокручиваешь вверх и циклично видишь одни и те же
+    /// сообщения.
+    #[test]
+    fn discord_page_is_stored_oldest_first_and_paged_from_the_oldest() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+
+        // Страница ровно такая, какую присылает Discord: от новых к старым.
+        let page: Vec<ChatMessage> = (1..=crate::gateway::HISTORY_PAGE)
+            .rev()
+            .map(|i| test_msg(&format!("m{i}"), "c1", "x"))
+            .collect();
+        assert_eq!(page[0].id, format!("m{}", crate::gateway::HISTORY_PAGE));
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: page, more: true }).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").expect("страница сохранена");
+        assert_eq!(
+            msgs[0].id, "m1",
+            "список должен идти от старых к новым, иначе первым окажется самое новое"
+        );
+        assert_eq!(
+            msgs[msgs.len() - 1].id,
+            format!("m{}", crate::gateway::HISTORY_PAGE),
+            "самое новое сообщение страницы должно быть в конце списка"
+        );
+
+        // Догрузка вверх идёт от самой старой строки, а не от самой новой:
+        // иначе Discord вернёт ту же страницу.
+        app.request_older_history();
+        let sent: Vec<ToGateway> = std::iter::from_fn(|| cmd_rx.try_recv().ok()).collect();
+        let before = sent
+            .iter()
+            .find_map(|c| match c {
+                ToGateway::FetchHistory { before, .. } => before.clone(),
+                _ => None,
+            })
+            .expect("запрос истории вверх должен уйти");
+        assert_eq!(
+            before, "m1",
+            "догружать надо от самой старой страницы, а не от самой новой"
+        );
     }
 
     /// Дойдя до начала канала, клиент больше не бьёт в API: `before` от
