@@ -3,7 +3,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::app::App;
 
 use crate::messages::ToGateway;
-use crate::models::{ChatChannel, ChatMessage};
+use crate::models::{ChatChannel, ChatMessage, LOCAL_ID_PREFIX};
 
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
@@ -81,8 +81,16 @@ impl App {
 
         if let Some(idx) = self.selected_channel {
             let cid = self.channels[idx].id.clone();
+            // Показываем своё сообщение сразу, не дожидаясь Discord. Настоящий
+            // id у него ещё нет, поэтому даём заведомо ненастоящий, помеченный
+            // префиксом: когда придёт MESSAGE_CREATE, клиент заменит эту
+            // строку на присланную, а не добавит вторую копию. Раньше id был
+            // пустой, проверка дубля по id его не видела, и каждое отправленное
+            // сообщение показывалось дважды.
+            let local_id = format!("{}{}", LOCAL_ID_PREFIX, self.next_local_id);
+            self.next_local_id += 1;
             self.messages.entry(cid.clone()).or_default().push(std::sync::Arc::new(ChatMessage {
-                id: String::new(),
+                id: local_id,
                 channel_id: cid.clone(),
                 author_id: self.user_id.clone(),
                 author_name: self.username.clone(),

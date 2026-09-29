@@ -148,6 +148,20 @@ pub(crate) struct ChatMessage {
     pub(crate) is_own: bool,
 }
 
+/// Префикс id сообщения, которое клиент показал сам, ещё до ответа Discord.
+/// Такой id ненастоящий: его нельзя ни искать в переписке, ни отправлять в
+/// API как `before` для пагинации.
+pub(crate) const LOCAL_ID_PREFIX: &str = "local:";
+
+impl ChatMessage {
+    /// Сообщение нарисовано нами самим, а не пришло от Discord. Такое живёт в
+    /// списке, пока Discord не подтвердит отправку: показывать сразу приятно,
+    /// но id у него нет и вместо него — счётчик.
+    pub(crate) fn is_local_echo(&self) -> bool {
+        self.id.starts_with(LOCAL_ID_PREFIX)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Attachment {
     pub(crate) url: String,

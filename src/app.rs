@@ -97,6 +97,10 @@ pub(crate) struct App {
     pub(crate) msg_heights: HashMap<String, f32>,
     /// Префиксные суммы высот: буфер кадра, переиспользуется между кадрами.
     pub(crate) msg_offsets: Vec<f32>,
+    /// Счётчик для id неподтверждённых собственных сообщений. Он общий на всё
+    /// приложение, а не на канал: id должен быть уникален в пределах сеанса,
+    /// чтобы эхо находилось однозначно.
+    pub(crate) next_local_id: u64,
     /// Ширина содержимого чата с прошлого кадра — от неё зависят переносы
     /// строк, а значит и высоты сообщений.
     pub(crate) msg_width: f32,
@@ -170,6 +174,7 @@ impl App {
             chat_at_bottom: true,
             msg_heights: HashMap::new(),
             msg_offsets: Vec::new(),
+            next_local_id: 0,
             msg_width: 0.0,
             chat_inner_h: 0.0,
             chat_content_h: 0.0,
@@ -245,9 +250,16 @@ impl App {
                     if duplicate {
                         self.push_debug(format!("Duplicate live message {} ignored", msg.id));
                     } else {
-                        let entry = self.messages.entry(cid).or_default();
-                        entry.push(Arc::new(msg));
-                        trim_messages(entry);
+                        // Наше собственное сообщение мы показали сами, ещё до
+                        // ответа Discord, под заведомо ненастоящим id. Пришедшее
+                        // подтверждение занимает его место — иначе в чате
+                        // оказывались две копии одного и того же текста.
+                        let replaced = self.replace_local_echo(&cid, &msg);
+                        if !replaced {
+                            let entry = self.messages.entry(cid).or_default();
+                            entry.push(Arc::new(msg));
+                            trim_messages(entry);
+                        }
                         // Внизу ли пользователь — решаем по прошлому кадру: если
                         // он читает историю выше, новое сообщение не должно
                         // выбрасывать его в самый конец.
@@ -524,20 +536,54 @@ impl App {
     /// ту же страницу, и чат пошёл бы по кругу. Пока предыдущая страница в
     /// пути, повторно не спрашиваем — иначе один скролл вверх даст пачку
     /// одинаковых запросов.
+    ///
+    /// Наше собственное неподтверждённое сообщение пропускаем: его id ненастоящий
+    /// и в переписке Discord такого нет.
     pub(crate) fn request_older_history(&mut self) {
         if self.history_loading.is_some() || self.history_loading_more || self.history_exhausted {
             return;
         }
         let Some(cid) = self.current_channel_id().map(str::to_string) else { return };
-        let Some(oldest) = self.messages.get(&cid).and_then(|v| v.first()).map(|m| m.id.clone()) else { return };
-        if oldest.is_empty() {
-            // Сообщение без id (наше собственное, пока Discord не подтвердил
-            // отправку) продолжать историю не позволяет: `before` не от чего.
+        let Some(oldest) = self
+            .messages
+            .get(&cid)
+            .and_then(|v| v.iter().find(|m| !m.is_local_echo() && !m.id.is_empty()))
+            .map(|m| m.id.clone())
+        else {
+            // В списке нет ни одного настоящего сообщения — продолжать историю
+            // не от чего. Свое неподтверждённое в счёт не идёт: его id в
+            // переписке Discord не существует.
             self.history_exhausted = true;
             return;
-        }
+        };
         self.history_loading_more = true;
         self.send_cmd(ToGateway::FetchHistory { channel_id: cid, before: Some(oldest) });
+    }
+    /// Пришло подтверждение нашей отправки: занять им место локального эха.
+    ///
+    /// Мы показываем своё сообщение сразу, не дожидаясь Discord, и подставляем
+    /// ему заведомо ненастоящий id. Если бы мы просто добавили присланное
+    /// сообщение, в чате оказались бы две копии одного текста: у эха id пустой
+    /// либо служебный, а у ответа настоящий, и проверка дубля их не видела.
+    ///
+    /// Возвращает `true`, если эхо нашлось и было заменено.
+    fn replace_local_echo(&mut self, channel_id: &str, msg: &ChatMessage) -> bool {
+        // Подтверждать отправку может только наше собственное сообщение.
+        if self.user_id.is_empty() || msg.author_id != self.user_id {
+            return false;
+        }
+        let Some(entry) = self.messages.get_mut(channel_id) else { return false };
+        // Ищем с хвоста: эхо добавляется в конец, и подтверждения приходят в том
+        // же порядке. Текст сравниваем — Discord его на отправке не меняет.
+        // Если эха нет (например, список перезагрузили историей), сообщение
+        // добавится как обычное, и это правильно.
+        match entry.iter().rposition(|m| m.is_local_echo() && m.content == msg.content) {
+            Some(idx) => {
+                entry[idx] = Arc::new(msg.clone());
+                true
+            }
+            None => false,
+        }
     }
     /// Id канала, который открыт сейчас. Состояние истории и чата относятся
     /// именно к нему.
@@ -1347,7 +1393,113 @@ mod layout_tests {
         assert!(app.scroll_to_bottom, "внизу новое сообщение должно тянуть вниз");
     }
 
-    /// Сообщение может прийти дважды: гейтвей шлёт живую копию всего, что
+    /// Своё сообщение показывается сразу, не дожидаясь Discord, и пришедшее
+    /// подтверждение должно занять его место, а не встать рядом вторым.
+    /// Раньше у эха был пустой id, у ответа — настоящий, проверка дубля их не
+    /// видела, и каждое отправленное сообщение появлялось в чате дважды.
+    #[test]
+    fn own_message_is_replaced_not_duplicated() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.user_id = "me".into();
+        app.username = "Я".into();
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        // Пустой ответ Discord затянет экран — для этого теста не нужно.
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: vec![], more: false }).unwrap();
+        app.poll(&ctx);
+
+        // Отправили: в чате сразу появилось одно сообщение, но id ненастоящий.
+        app.handle_input("привет");
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 1, "локальное эхо должно появиться сразу");
+        assert!(msgs[0].is_local_echo(), "у неподтверждённого сообщения id служебный");
+
+        // Discord подтвердил отправку тем же текстом и настоящим id.
+        let mut from_discord = test_msg("9001", "c1", "привет");
+        from_discord.author_id = "me".into();
+        from_discord.author_name = "Я".into();
+        from_discord.timestamp = "2026-01-01T00:05:00.000Z".into();
+        tx.send(ToApp::Message(from_discord)).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 1, "подтверждение должно занять место эха, а не добавиться рядом");
+        assert_eq!(msgs[0].id, "9001", "в списке должен остаться настоящий id");
+        assert_eq!(msgs[0].content, "привет");
+        assert!(!msgs[0].is_local_echo());
+
+        // Второе сообщение с тем же текстом — тоже: эха теперь два, значит
+        // каждое подтверждение находит своё, а не первое попавшееся.
+        app.handle_input("привет");
+        assert_eq!(app.messages.get("c1").unwrap().len(), 2);
+        let mut again = test_msg("9002", "c1", "привет");
+        again.author_id = "me".into();
+        tx.send(ToApp::Message(again)).unwrap();
+        app.poll(&ctx);
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 2, "и здесь не должно быть дубля");
+        assert_eq!(msgs[0].id, "9001", "порядок сообщений не должен меняться");
+        assert_eq!(msgs[1].id, "9002");
+
+        // Чужое сообщение с тем же текстом эхо не трогает: оно не наше.
+        let mut foreign = test_msg("9003", "c1", "привет");
+        foreign.author_id = "u-other".into();
+        tx.send(ToApp::Message(foreign)).unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.messages.get("c1").unwrap().len(), 3);
+    }
+
+    /// Служебный id неподтверждённого сообщения нельзя отправлять в Discord
+    /// как `before`: такого id в переписке нет, и API вернёт ошибку.
+    #[test]
+    fn local_echo_id_never_goes_to_pagination() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.user_id = "me".into();
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        // Первая страница в этом тесте не приходит: снимаем ожидание вручную,
+        // чтобы дойти до самой проверки.
+        app.history_loading = None;
+        let _ = tx;
+        // Запрос первой страницы от открытия канала — он к делу не относится.
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+
+        // В списке только наше неотправленное сообщение — продолжать историю
+        // не от чего, и клиент не должен стучаться в API.
+        app.handle_input("ещё не отправлено");
+        app.request_older_history();
+        let sent: Vec<ToGateway> = std::iter::from_fn(|| cmd_rx.try_recv().ok()).collect();
+        let asks_history = sent.iter().any(|c| matches!(c, ToGateway::FetchHistory { .. }));
+        assert!(!asks_history, "нельзя пагинировать по ненастоящему id: {:?}", sent);
+        assert!(app.history_exhausted);
+        // Спиннер догрузки не должен гореть при этом.
+        assert!(!app.history_loading_more);
+    }
+
+    /// Живое сообщение уже в истории — дубль пропускается.
     /// появилось после подписки, а та же строка уже успела попасть в страницу
     /// истории. Дубль рисуется дважды — в чате это видно как «сообщение
     /// скопировалось», поэтому повтор по id пропускаем.
