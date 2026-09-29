@@ -9,7 +9,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::messages::{ToApp, ToGateway};
-use crate::models::{image_size_of, Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
+use crate::models::{image_size_of, size_from, Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
 use crate::util::super_props;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -193,11 +193,15 @@ fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>,
     }))
 }
 
-/// Размер картинки из полей `width`/`height`. Discord шлёт их целыми, но берём
-/// через `image_size_of` — оно терпит и строку, и число с точкой, а нечётное
-/// значение не должно ронять разбор сообщения.
-fn de_opt_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<[u32; 2]>, D::Error> {
-    Ok(Option::<Value>::deserialize(d)?.as_ref().and_then(image_size_of))
+/// Одно число, пришедшее числом или строкой. Discord в размерах шлёт целое,
+/// но в тексте JSON может прийти и строкой, и нечётное значение не должно
+/// ронять разбор сообщения.
+fn de_opt_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| match v {
+        Value::Number(n) => n.as_u64().map(|x| x.min(u64::from(u32::MAX)) as u32),
+        Value::String(s) => s.trim().parse::<u32>().ok(),
+        _ => None,
+    }))
 }
 
 /// Автор сообщения в том виде, в каком его рисует клиент.
@@ -222,16 +226,27 @@ struct RawAttachment {
     content_type: Option<String>,
     #[serde(default, deserialize_with = "de_opt_text")]
     description: Option<String>,
-    #[serde(default, deserialize_with = "de_opt_size")]
-    size: Option<[u32; 2]>,
+    /// Размер картинки в пикселях. Discord шлёт его полями `width`/`height`,
+    /// а `size` у вложения — это размер ФАЙЛА в байтах, он нам не нужен.
+    ///
+    /// Раньше здесь стояло поле `size` с разбором через `image_size_of`, и
+    /// размер не приходил никогда: `image_size_of` ищет ключи `width`/`height`
+    /// внутри значения поля `size`, а там лежит число, ключей в котором нет.
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    width: Option<u32>,
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    height: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
 struct RawImage {
     #[serde(default, deserialize_with = "de_opt_text")]
     url: Option<String>,
-    #[serde(default, deserialize_with = "de_opt_size")]
-    size: Option<[u32; 2]>,
+    /// Как и у вложения: пиксели приходят полями `width`/`height`.
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    width: Option<u32>,
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    height: Option<u32>,
 }
 
 /// Эмбед: автор, footer, provider, поля и прочее сюда не входят — serde
@@ -255,7 +270,7 @@ impl RawEmbed {
             .flatten()
             .find(|i| i.url.as_deref().is_some_and(|u| !u.is_empty()));
         let image_url = image.as_ref().and_then(|i| i.url.clone());
-        let image_size = image.and_then(|i| i.size);
+        let image_size = image.and_then(|i| size_from(i.width, i.height));
         let description = match self.description {
             Some(s) => {
                 let trimmed = s.trim();
@@ -315,7 +330,7 @@ impl RawMessage {
                         url: a.url?,
                         content_type: a.content_type,
                         description: a.description,
-                        size: a.size,
+                        size: size_from(a.width, a.height),
                     })
                 })
                 .collect(),
@@ -1031,12 +1046,19 @@ mod parse_tests {
         assert_eq!(a.url, "https://cdn.discordapp.com/attachments/1/photo.png");
         assert_eq!(a.content_type.as_deref(), Some("image/png"));
         assert_eq!(a.description.as_deref(), Some("схема из чата"));
+        // Размер в пикселях приходит полями `width`/`height`, а `size` у
+        // вложения — это размер файла в байтах. Раньше поле называлось `size`
+        // и разбиралось как пара пикселей, из-за чего размер не приходил
+        // никогда: по нему резервируется место под картинку, и без него
+        // высота сообщения прыгала на 180 px при загрузке.
+        assert_eq!(a.size, Some([1600, 1200]), "размер картинки должен доходить из истории");
 
         assert_eq!(m.embeds.len(), 1);
         assert_eq!(
             m.embeds[0].image_url.as_deref(),
             Some("https://cdn.discordapp.com/embeds/1/picture.png")
         );
+        assert_eq!(m.embeds[0].image_size, Some([800, 600]), "размер картинки эмбеда — тоже");
         assert_eq!(m.embeds[0].description, None, "у эмбеда нет description — выкидываем пустое");
     }
 
@@ -1067,8 +1089,14 @@ mod parse_tests {
         assert_eq!(
             from_history.attachments[0].description, from_live.attachments[0].description
         );
+        // Размер картинки — тоже: раньше именно здесь пути разходились
+        // (история отдавала `None`, живое сообщение — настоящие пиксели), и
+        // тест этого не замечал, потому что размер не сравнивал.
+        assert_eq!(from_history.attachments[0].size, from_live.attachments[0].size);
+        assert_eq!(from_history.attachments[0].size, Some([1600, 1200]));
         assert_eq!(from_history.embeds.len(), from_live.embeds.len());
         assert_eq!(from_history.embeds[0].image_url, from_live.embeds[0].image_url);
+        assert_eq!(from_history.embeds[0].image_size, from_live.embeds[0].image_size);
     }
 
     /// Живое сообщение знает свой канал сам; если поля нет — берём запасной.

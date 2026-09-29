@@ -107,9 +107,21 @@ impl Embed {
     }
 }
 
-/// Размер картинки из пары полей `width`/`height`. Discord шлёт их целыми, но
-/// приводим из строки в том же духе, как `de_opt_text`: поле может оказаться
-/// числом с точкой или строкой, и ронять из-за этого сообщение нельзя.
+/// Размер в пикселях из отдельных полей `width`/`height`. Discord шлёт их
+/// целыми, но приводим из строки в том же духе, как `de_opt_text`: поле может
+/// оказаться числом с точкой или строкой, и ронять из-за этого сообщение
+/// нельзя.
+pub(crate) fn size_from(width: Option<u32>, height: Option<u32>) -> Option<[u32; 2]> {
+    match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some([w, h]),
+        _ => None,
+    }
+}
+
+/// То же, но размер вычитывается из готового дерева `Value` — так разбираются
+/// живые события гейтвея, где дерево уже собрано целиком. Оба пути обязаны
+/// звать `size_from`, иначе они разойдутся: раньше история и живое сообщение
+/// давали разный размер одной и той же картинки.
 pub(crate) fn image_size_of(v: &Value) -> Option<[u32; 2]> {
     let num = |k: &str| -> Option<u32> {
         match v.get(k) {
@@ -118,10 +130,7 @@ pub(crate) fn image_size_of(v: &Value) -> Option<[u32; 2]> {
             _ => None,
         }
     };
-    match (num("width"), num("height")) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => Some([w, h]),
-        _ => None,
-    }
+    size_from(num("width"), num("height"))
 }
 
 #[derive(Clone, Debug)]
