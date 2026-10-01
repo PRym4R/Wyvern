@@ -67,17 +67,37 @@ impl App {
     }
     /// Разобрать содержимое файла: `None` — пароль не подошёл (в отличие от
     /// пустого списка, который означает «аккаунтов пока нет»).
+    ///
+    /// Старый открытый формат здесь намеренно не разбирается: в нём пароля нет
+    /// вовсе, и «подошёл любой» — это не проверка. См. `legacy_accounts` и
+    /// `unlock_vault`.
     pub(crate) fn load_accounts_with(content: &str, password: &str) -> Option<Vec<StoredAccount>> {
         if password.is_empty() {
             return None;
         }
-        // Старый формат: незашифрованный список.
-        if let Ok(v) = serde_json::from_str::<Vec<StoredAccount>>(content) {
-            return Some(v);
-        }
         Self::decrypt_accounts(content, password)
     }
+    /// Старый формат хранилища — обычный список, без шифрования.
+    ///
+    /// Такой файл открывается без пароля (так он и был записан), и раньше это
+    /// считалось «пароль подошёл». Опасность не в том, что файл открыт — он и
+    /// так открыт, — а в том, что происходило следом: `unlock_vault` запоминал
+    /// введённый пароль как пароль хранилища, а первая же запись (добавили
+    /// аккаунт, обновили имя) перешифровывала файл этим паролем. Опечатка при
+    /// вводе — и хранилище молча переезжало на пароль с опечаткой, вернуть
+    /// прежний уже нечем, и никакого «миграция старого формата» никто не видел.
+    pub(crate) fn legacy_accounts(content: &str) -> Option<Vec<StoredAccount>> {
+        serde_json::from_str::<Vec<StoredAccount>>(content).ok()
+    }
     pub(crate) fn save_accounts(&self, password: &str) {
+        // Старый открытый файл сам себя не перезаписывает. Пароль в нём не
+        // проверялся, поэтому запись перешифровала бы хранилище тем, что
+        // случайно оказалось в поле ввода, — и доступ к своим аккаунтам был бы
+        // потерян молча. Пока пользователь не подтвердил пароль явно
+        // (`confirm_legacy_migration`), файл не трогаем.
+        if self.vault_legacy {
+            return;
+        }
         if let Some(s) = Self::encrypt_accounts(&self.saved_accounts, password) {
             // Пишем во временный файл и переименовываем: если клиент убить
             // посреди записи, старый файл останется целым.
@@ -169,10 +189,28 @@ impl App {
                 self.saved_accounts = Vec::new();
                 self.master_password = password.to_string();
                 self.accounts_unlocked = true;
+                self.vault_legacy = false;
                 self.refresh_active_index();
                 return Ok(None);
             }
         };
+
+        // Старый открытый формат: пароля в файле нет, поэтому «подошёл» любой
+        // ввод. Впускаем (данные и так открыты), но помечаем хранилище как
+        // требующее подтверждения: до него файл не перезаписывается, иначе
+        // опечатка в пароле молча закрыла бы хранилище не тем паролем.
+        if let Some(accounts) = Self::legacy_accounts(&content) {
+            self.saved_accounts = accounts;
+            self.master_password = password.to_string();
+            self.accounts_unlocked = true;
+            self.vault_legacy = true;
+            self.refresh_active_index();
+            return Ok(Some(
+                "Хранилище старого формата: в нём нет пароля. Пароль, который ты ввёл, станет \
+                 паролем хранилища только после подтверждения — нажми «Закрепить пароль»."
+                    .to_string(),
+            ));
+        }
 
         // Под пробелы/невидимые символы: их легко принести из буфера обмена
         // или случайно нажать пробел, а потом не вспомнить.
@@ -238,7 +276,7 @@ impl App {
     /// хранилище именно тот пароль, которым файл на самом деле открылся.
     fn try_variants(content: &str, variants: &[String]) -> Option<(usize, Vec<StoredAccount>)> {
         #[cfg(test)]
-        LAST_SEARCH_WIDTH.store(0, std::sync::atomic::Ordering::SeqCst);
+        set_last_search_width(0);
         let first = variants.first()?;
         if let Some(accounts) = Self::load_accounts_with(content, first) {
             return Some((0, accounts));
@@ -256,7 +294,7 @@ impl App {
                 })
                 .collect();
             #[cfg(test)]
-            LAST_SEARCH_WIDTH.store(handles.len(), std::sync::atomic::Ordering::SeqCst);
+            set_last_search_width(handles.len());
             // Из подошедших берём вариант с наименьшим номером, иначе выбор
             // зависел бы от того, кто из потоков успел раньше.
             let mut best: Option<(usize, Vec<StoredAccount>)> = None;
@@ -269,6 +307,19 @@ impl App {
             }
             best
         })
+    }
+    /// Закрепить пароль за старым открытым хранилищем.
+    ///
+    /// Вызывается только по явному нажатию: до него файл не перезаписывается
+    /// (см. `save_accounts`), потому что пароль в старом формате никак не
+    /// проверялся и опечатка в нём закрыла бы хранилище не тем паролем молча.
+    pub(crate) fn confirm_legacy_migration(&mut self) {
+        if !self.vault_legacy {
+            return;
+        }
+        self.vault_legacy = false;
+        let pw = self.master_password.clone();
+        self.save_accounts(&pw);
     }
     /// ЛКМ по аккаунту в нижней ленте: выбрать его и спросить пароль.
     pub(crate) fn select_account(&mut self, token: String) {
@@ -389,16 +440,31 @@ mod mask_tests {
 #[cfg(test)]
 pub(crate) static VAULT_COST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Сколько потоков поднял перебор вариантов пароля в последний раз — только
-/// для тестов.
+// Сколько потоков поднял перебор вариантов пароля в последний раз — только для
+// тестов. Потоковый, а не общий: тесты идут параллельно, и общий счётчик
+// показывал бы чужой перебор — тогда проверка верного пароля падала бы из-за
+// соседнего теста. Значение ставит тот поток, который вызвал `try_variants`,
+// поэтому потокового и достаточно.
+#[cfg(test)]
+thread_local! {
+    static LAST_SEARCH_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Сколько потоков поднял перебор вариантов пароля в последний раз.
 ///
 /// По секундомеру параллельность проверить нельзя: на загруженной машине
 /// (а машина разработчика вполне может быть занята игрой) запас между
 /// последовательным перебором и параллельным слишком мал, и проверка мигала бы
 /// то так, то этак. Счётчик потоков отвечает на тот же вопрос точно.
 #[cfg(test)]
-pub(crate) static LAST_SEARCH_WIDTH: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) fn last_search_width() -> usize {
+    LAST_SEARCH_WIDTH.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn set_last_search_width(width: usize) {
+    LAST_SEARCH_WIDTH.with(|n| n.set(width));
+}
 
 #[cfg(test)]
 mod vault_cost_tests {
@@ -458,7 +524,7 @@ mod vault_cost_tests {
 
         assert!(app.unlock_vault(" неправильный ").is_err(), "с неверным паролем вход отклоняется");
         assert_eq!(
-            super::LAST_SEARCH_WIDTH.load(Ordering::SeqCst),
+            super::last_search_width(),
             variants.len() - 1,
             "семь оставшихся вариантов должны считаться разом: подряд это 71 мс ожидания в потоке интерфейса"
         );
@@ -474,7 +540,7 @@ mod vault_cost_tests {
         app.save_accounts("правильный");
         assert!(app.unlock_vault("правильный").is_ok());
         assert_eq!(
-            super::LAST_SEARCH_WIDTH.load(Ordering::SeqCst),
+            super::last_search_width(),
             0,
             "первый вариант подошёл — потоки не нужны"
         );
@@ -537,5 +603,125 @@ mod vault_cost_tests {
         let padded = App::password_variants(" пароль ");
         assert_eq!(padded[1], "пароль", "обрезанный идёт вторым");
         assert_eq!(padded.len(), variants.len() + 1);
+    }
+}
+
+/// Старый открытый формат хранилища: пароля в файле нет, и это не значит, что
+/// «подошёл любой пароль».
+#[cfg(test)]
+mod legacy_vault_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    static TAG: AtomicU64 = AtomicU64::new(0);
+
+    /// Экземпляр клиента со своим файлом хранилища: тесты идут параллельно.
+    fn app_with_file(contents: Option<&str>) -> (App, std::path::PathBuf) {
+        let tag = TAG.fetch_add(1, Ordering::SeqCst);
+        let mut p = std::env::temp_dir();
+        p.push(format!("wyvern-test-legacy-{}-{}.json", std::process::id(), tag));
+        let _ = std::fs::remove_file(&p);
+        if let Some(c) = contents {
+            std::fs::write(&p, c).unwrap();
+        }
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.vault_path_override = Some(p.clone());
+        (app, p)
+    }
+
+    /// Содержимое старого формата: обычный список без шифрования.
+    fn legacy_contents() -> String {
+        let accounts = vec![StoredAccount { token: "старый-токен".into(), username: "вася".into() }];
+        serde_json::to_string(&accounts).unwrap()
+    }
+
+    /// Открытый список — это не «пароль подошёл».
+    ///
+    /// Раньше `load_accounts_with` разбирал его до всякой проверки пароля и
+    /// отдавал аккаунты. Дальше `unlock_vault` запоминал введённый пароль как
+    /// пароль хранилища, и первая же запись перешифровывала файл этим паролем:
+    /// опечатка при вводе — и доступ к своим аккаунтам потерян молча, без
+    /// всякого «миграция старого формата».
+    #[test]
+    fn plaintext_list_is_not_a_password_check() {
+        let contents = legacy_contents();
+        for password in ["любой", "другой", "", "любой "] {
+            assert!(
+                App::load_accounts_with(&contents, password).is_none(),
+                "открытый список не должен открываться паролем {password:?}: пароля в нём нет"
+            );
+        }
+        // Но разобрать его как старый формат можно — и это отдельный ответ.
+        assert_eq!(App::legacy_accounts(&contents).map(|a| a.len()), Some(1));
+        assert!(App::legacy_accounts("{\"salt\":\"x\"}").is_none());
+    }
+
+    /// До подтверждения старый файл не перезаписывается: иначе опечатка в
+    /// пароле молча закрыла бы хранилище не тем паролем.
+    #[test]
+    fn legacy_vault_is_not_rewritten_before_confirmation() {
+        let contents = legacy_contents();
+        let (mut app, tmp) = app_with_file(Some(&contents));
+
+        let notice = app.unlock_vault("опечатка").expect("старый формат должен открываться");
+        assert!(notice.is_some(), "пользователю надо сказать про старый формат");
+        assert!(app.vault_legacy, "хранилище должно быть помечено как требующее подтверждения");
+        assert_eq!(app.saved_accounts.len(), 1, "аккаунты из старого файла должны быть видны");
+
+        // Любая обычная запись (добавили аккаунт, обновили имя) файл не трогает.
+        app.add_saved_account("новый-токен", "петя");
+        app.save_accounts("опечатка");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            contents,
+            "старый открытый файл нельзя перешифровывать, пока пароль не подтверждён"
+        );
+
+        // Явное подтверждение — и файл переезжает в зашифрованный формат.
+        app.confirm_legacy_migration();
+        assert!(!app.vault_legacy, "после подтверждения ждать больше нечего");
+        let after = std::fs::read_to_string(&tmp).unwrap();
+        assert_ne!(after, contents, "после подтверждения файл должен быть перезаписан");
+        assert!(after.contains("salt") && after.contains("nonce"), "файл должен быть зашифрован");
+        assert_eq!(App::load_accounts_with(&after, "опечатка").map(|a| a.len()), Some(2));
+        assert!(
+            App::load_accounts_with(&after, "правильный").is_none(),
+            "хранилище закрыто именно введённым паролем — тем, который подтвердили"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Обычное зашифрованное хранилище миграция не задевает: флаг не встаёт, и
+    /// запись идёт как раньше.
+    #[test]
+    fn encrypted_vault_is_untouched_by_the_legacy_path() {
+        let (mut app, tmp) = app_with_file(None);
+        app.saved_accounts = vec![StoredAccount { token: "т".into(), username: "вася".into() }];
+        app.save_accounts("правильный");
+
+        assert!(app.unlock_vault("правильный").is_ok());
+        assert!(!app.vault_legacy, "зашифрованный файл — не старый формат");
+        app.add_saved_account("ещё-токен", "петя");
+        assert_eq!(
+            App::load_accounts_with(&std::fs::read_to_string(&tmp).unwrap(), "правильный")
+                .map(|a| a.len()),
+            Some(2),
+            "новый аккаунт должен сохраниться"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Неверный пароль к зашифрованному файлу по-прежнему отклоняется, и это не
+    /// путается со старым форматом.
+    #[test]
+    fn encrypted_vault_still_rejects_a_wrong_password() {
+        let (mut app, tmp) = app_with_file(None);
+        app.save_accounts("правильный");
+        assert!(app.unlock_vault("неправильный").is_err());
+        assert!(!app.vault_legacy);
+        assert!(app.unlock_vault("правильный").is_ok());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

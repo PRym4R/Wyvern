@@ -75,6 +75,10 @@ pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) token_input: String,
     pub(crate) master_password: String,
+    /// Хранилище оказалось старого, открытого формата: пароля в нём нет, и
+    /// «подошёл любой» — не проверка. Пока флаг стоит, файл не перезаписывается:
+    /// иначе опечатка в пароле молча закрыла бы хранилище не тем паролем.
+    pub(crate) vault_legacy: bool,
     pub(crate) login_password: String,
     /// Не-ошибка на экране входа («пароль принят после обрезки пробелов»).
     pub(crate) login_notice: String,
@@ -197,6 +201,7 @@ impl App {
             input: String::new(),
             token_input: String::new(),
             master_password: String::new(),
+            vault_legacy: false,
             login_password: String::new(),
             login_notice: String::new(),
             vault_path_override: None,

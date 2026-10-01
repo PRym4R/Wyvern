@@ -85,6 +85,7 @@ impl App {
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
         ctx.set_style(style);
 
+        self.draw_legacy_vault_banner(ctx);
         self.draw_server_list(ctx);
         let r1 = ctx.available_rect();
         self.draw_channel_list(ctx);
