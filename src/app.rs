@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,7 +108,11 @@ pub(crate) struct App {
     /// `status`, а тот рисуется на экране входа — то есть в чате о неудаче
     /// не говорилось вообще ничего, и сообщение просто исчезало.
     pub(crate) send_error: Option<String>,
-    pub(crate) debug_log: Vec<String>,
+    /// Последние строки отладочного журнала. `VecDeque`, а не `Vec`: при
+    /// вытеснении самой старой строки `remove(0)` сдвигал весь вектор (до
+    /// сотни элементов) на каждой новой строке, а строк бывает и по десятку
+    /// на кадр.
+    pub(crate) debug_log: VecDeque<String>,
     /// Писать ли отладочный лог на диск и в stderr. См. `debug_to_disk_from_env`.
     pub(crate) debug_to_disk: bool,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
@@ -226,7 +230,7 @@ impl App {
             active_index: None,
             status: String::new(),
             send_error: None,
-            debug_log: Vec::new(),
+            debug_log: VecDeque::new(),
             debug_to_disk: debug_to_disk_from_env(),
             to_gw: None,
             from_gw,
@@ -290,9 +294,9 @@ impl App {
                 let _ = writeln!(f, "{}", line);
             }
         }
-        self.debug_log.push(msg);
+        self.debug_log.push_back(msg);
         if self.debug_log.len() > 100 {
-            self.debug_log.remove(0);
+            self.debug_log.pop_front();
         }
     }
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
@@ -2544,5 +2548,26 @@ mod layout_tests {
         assert!(path.exists(), "с включённым флагом строка должна попасть в файл");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Вытеснение старой строки журнала — из начала очереди, а не сдвигом
+    /// всего вектора.
+    ///
+    /// Тест держит два условия разом: контракт (не длиннее 100, уходят
+    /// самые старые, остаются самые новые) и структуру — иначе `remove(0)`
+    /// втихую вернётся, и на каждой строке будет сдвигаться сотня элементов.
+    #[test]
+    fn debug_log_evicts_oldest_from_the_front() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.debug_to_disk = false;
+        for i in 0..150 {
+            app.push_debug(format!("строка {i}"));
+        }
+
+        let log: &std::collections::VecDeque<String> = &app.debug_log;
+        assert_eq!(log.len(), 100, "журнал не должен превышать сто строк");
+        assert_eq!(log.front().map(String::as_str), Some("строка 50"));
+        assert_eq!(log.back().map(String::as_str), Some("строка 149"));
     }
 }

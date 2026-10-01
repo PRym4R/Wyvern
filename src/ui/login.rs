@@ -409,7 +409,7 @@ impl App {
             ui.label(RichText::new(&self.status).size(13.0).color(ERROR_RED));
         } else if !self.login_notice.is_empty() {
             ui.label(RichText::new(&self.login_notice).size(13.0).color(self.theme.accent));
-        } else if let Some(last) = self.debug_log.last() {
+        } else if let Some(last) = self.debug_log.back() {
             ui.label(RichText::new(format!("Last: {}", last))
                 .size(11.0)
                 .color(self.theme.text_secondary));
