@@ -16,6 +16,24 @@ const DEBUG_PREFIX: &str = "/debug ";
 /// Сколько ждёт подтверждения, прежде чем команда забудется.
 const DEBUG_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Уже́с самой узкой полосы под поле ввода. Меньше не полезно ни печатать, ни
+/// читать, но вернуться к нулю поле тоже не должно.
+const MIN_INPUT_WIDTH: f32 = 60.0;
+/// Сколько места в строке ввода уходит на отступ, название канала, кнопку
+/// «Send» и зазоры.
+const INPUT_CHROME: f32 = 110.0;
+
+/// Ширина поля ввода по свободному месту в строке.
+///
+/// Раньше здесь было голое `available_width() - 110`, и панель каналов могла
+/// оставить строке 28 пикселей: ширина уходила в минус, egui в релизной
+/// сборке тихо рисует такой прямоугольник пустым, и поле ввода просто
+/// исчезало — печатать можно, не видно ничего. Панели каналов теперь ограничена
+/// сверху, но и без неё отрицательной ширины быть не должно.
+pub(crate) fn input_width(available: f32) -> f32 {
+    (available - INPUT_CHROME).max(MIN_INPUT_WIDTH)
+}
+
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
         let has_channel = self.selected_channel.is_some();
@@ -39,8 +57,10 @@ impl App {
                         ui.label(RichText::new("← select a channel on the left").italics()
                             .size(12.0).color(self.theme.text_secondary));
                     } else {
+                        let field_w = input_width(ui.available_width());
+                        self.push_debug(format!("INPUT_FIELD: w={:.0}", field_w));
                         let resp = ui.add_sized(
-                            [ui.available_width() - 110.0, 36.0],
+                            [field_w, 36.0],
                             egui::TextEdit::singleline(&mut self.input)
                                 .hint_text("Type a message and press Enter, or click Send...")
                                 .margin(egui::Margin::symmetric(12, 8)),
@@ -151,5 +171,128 @@ impl App {
         self.open_channel(id);
         self.status = format!("канал {id} добавлен");
         self.push_debug(format!("Debug channel added: {id}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::models::ChatChannel;
+
+    /// Приложение с открытым каналом в самом узком поддерживаемом окне.
+    fn narrow_app() -> (App, egui::Context) {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.connected = true;
+        app.gw_started = true;
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        let ctx = egui::Context::default();
+        (app, ctx)
+    }
+
+    fn frame() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0))),
+            ..Default::default()
+        }
+    }
+
+    /// Ширина поля не должна уходить в минус ни при какой свободной ширине
+    /// строки. Отрицательный прямоугольник egui рисует пустым, то есть поле
+    /// исчезает, а панель каналов к тому же ещё и не вернуть обратно, пока не
+    /// расширишь окно.
+    #[test]
+    fn input_width_never_goes_negative() {
+        assert_eq!(input_width(0.0), MIN_INPUT_WIDTH);
+        assert_eq!(input_width(28.0), MIN_INPUT_WIDTH, "28 px в строке — это худший случай");
+        assert_eq!(input_width(110.0), MIN_INPUT_WIDTH);
+        assert_eq!(input_width(710.0), 600.0, "на просторной строке поле должно расти");
+        for available in (0..=1000).step_by(7) {
+            let w = input_width(available as f32);
+            assert!(w >= MIN_INPUT_WIDTH, "ширина {available} дала {w}");
+        }
+    }
+
+    /// Панель каналов растянута мышью на всё окно, как это делает пользователь:
+    /// поле ввода обязано остаться видимым. Раньше верхней границы у панели не
+    /// было, и на 700-пиксельном окне строка ввода получала 28 px, из которых
+    /// кнопка с отступами забирала больше, чем оставалось.
+    #[test]
+    fn stretched_channel_panel_leaves_the_input_visible() {
+        let (mut app, ctx) = narrow_app();
+
+        // Один кадр, чтобы egui записал состояние панели, затем подкладываем
+        // ему ту ширину, до которой пользователь может её растянуть.
+        let _ = ctx.run(frame(), |ctx| {
+            app.draw_server_list(ctx);
+            app.draw_channel_list(ctx);
+            app.draw_input_bar(ctx);
+        });
+        // Тянем правый край панели мышью вправо, как это делает пользователь.
+        // Край панели — это рельс серверов (72) плюс её собственная ширина.
+        let edge = 72.0 + 240.0;
+        let y = 300.0;
+        for step in 0..24 {
+            let x = edge + (620.0 - edge) * (step as f32) / 24.0;
+            let mut f = frame();
+            f.events.push(egui::Event::PointerMoved(egui::Pos2::new(x, y)));
+            if step == 0 {
+                f.events.push(egui::Event::PointerButton {
+                    pos: egui::Pos2::new(x, y),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            if step == 23 {
+                f.events.push(egui::Event::PointerButton {
+                    pos: egui::Pos2::new(x, y),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let _ = ctx.run(f, |ctx| {
+                app.draw_server_list(ctx);
+                app.draw_channel_list(ctx);
+                app.draw_input_bar(ctx);
+            });
+        }
+
+        let panel_w = app.channel_panel_w;
+        assert!(
+            panel_w > 300.0,
+            "тест должен действительно растянуть панель мышью, а получилось {panel_w}"
+        );
+        assert!(
+            panel_w <= 360.5,
+            "панель каналов должна быть ограничена сверху, а не съедать окно: {panel_w}"
+        );
+
+        let line = app
+            .debug_log
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("INPUT_FIELD:"))
+            .expect("отладочная строка ширины поля");
+        let w: f32 = line
+            .split_whitespace()
+            .find_map(|p| p.strip_prefix("w="))
+            .expect("ширина в строке")
+            .parse()
+            .expect("число");
+        assert!(
+            w >= MIN_INPUT_WIDTH,
+            "поле ввода схлопнулось при растянутой панели каналов: {w} px"
+        );
     }
 }

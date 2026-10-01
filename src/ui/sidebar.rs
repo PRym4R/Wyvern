@@ -136,12 +136,20 @@ impl App {
             });
     }
     pub(crate) fn draw_channel_list(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("channels")
+        let panel = egui::SidePanel::left("channels")
             .resizable(true)
             .default_width(240.0)
             .min_width(180.0)
-            .frame(egui::Frame::new().fill(self.theme.panel_bg))
-            .show(ctx, |ui| {
+            // Верхней границы не было вовсе, и панель растягивалась мышью на
+            // всю ширину окна. В самом узком окне (минимум 700 px, минус рельс
+            // серверов — 628) на строку ввода оставалось 28 px, из которых
+            // кнопка «Send» и отступы забирали больше, чем оставалось: ширина
+            // поля уходила в минус. В релизной сборке поле схлопывалось в ноль
+            // и печатать было нечем, в отладочной egui паниковала на отрицательном
+            // прямоугольнике.
+            .max_width(360.0)
+            .frame(egui::Frame::new().fill(self.theme.panel_bg));
+        let resp = panel.show(ctx, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 match self.selected_guild {
@@ -288,6 +296,13 @@ impl App {
                     }
                 }
             });
+        // Ширину панели запоминаем и пишем в лог только когда она изменилась:
+        // панель тянут мышью, и по этой строке видно, до чего её растянули.
+        let panel_w = resp.response.rect.width();
+        if (panel_w - self.channel_panel_w).abs() > 0.5 {
+            self.channel_panel_w = panel_w;
+            self.push_debug(format!("CHANNELS_PANEL: w={panel_w:.0}"));
+        }
     }
 }
 

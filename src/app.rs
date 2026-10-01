@@ -129,6 +129,9 @@ pub(crate) struct App {
     /// Отладочная команда, ждущая подтверждения: канал, который добавит
     /// повторный ввод. `None` — ничего не ждём.
     pub(crate) pending_debug_add: Option<(String, std::time::Instant)>,
+    /// Ширина панели каналов в прошлом кадре. Нужна, чтобы писать о её
+    /// изменении в лог по одному разу, а не двадцать раз в секунду.
+    pub(crate) channel_panel_w: f32,
     /// Последняя неудача при загрузке истории: для какого канала и почему.
     /// Пока строка стоит, канал не должен ни крутить бесконечный спиннер, ни
     /// молча выглядеть пустым — пользователь обязан видеть, что история не
@@ -223,6 +226,7 @@ impl App {
             history_exhausted: false,
             trimmed_newest: 0,
             pending_debug_add: None,
+            channel_panel_w: 0.0,
             history_error: None,
             chat_at_bottom: true,
             msg_heights: HashMap::new(),
