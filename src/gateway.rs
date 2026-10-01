@@ -70,6 +70,7 @@ async fn fetch_history_page(
     let mut page: Vec<ChatMessage> = Vec::new();
     let mut got_page = false;
     let mut failed = false;
+    let mut reason = String::new();
     let mut attempt = 0u32;
     while !got_page && attempt < 3 && !failed {
         attempt += 1;
@@ -92,11 +93,19 @@ async fn fetch_history_page(
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(2);
                     let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
+                    reason = "Discord просит подождать (лимит запросов)".to_string();
                     time::sleep(Duration::from_secs(retry)).await;
                     continue;
                 }
                 if !status.is_success() {
                     let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
+                    // 403 — нет прав на канал. Повтор не поможет, и молчать
+                    // об этом нельзя: пользователь видит пустой канал.
+                    reason = if status == 403 {
+                        "нет прав на канал".to_string()
+                    } else {
+                        format!("сервер ответил {}", status)
+                    };
                     failed = true;
                     break;
                 }
@@ -110,18 +119,26 @@ async fn fetch_history_page(
                     }
                     Err(e) => {
                         let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
+                        reason = "не удалось прочитать ответ".to_string();
                     }
                 }
             }
             Err(e) => {
                 let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
+                reason = "нет связи с Discord".to_string();
                 time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
     if failed || !got_page {
-        // Ничего не пришло — снять «Loading…» должен вызывающий: он ждёт
-        // ответ по этому каналу, а пустую страницу отправлять незачем.
+        // Ничего не пришло. Раньше здесь был просто `return`, и это ломало
+        // приложение: тот, кто ждал ответа (спиннер первой страницы в
+        // `history_loading` или догрузки вверх в `history_loading_more`),
+        // ждал вечно. Одна неудача — и канал становился нечитаемым навсегда.
+        if reason.is_empty() {
+            reason = "история не пришла".to_string();
+        }
+        let _ = event_tx.send(ToApp::HistoryFailed { channel_id, before, reason });
         return;
     }
 

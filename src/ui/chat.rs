@@ -264,6 +264,15 @@ impl App {
                                 ui.spinner();
                                 ui.label(RichText::new("Loading messages...").size(12.0).color(self.theme.text_secondary));
                             });
+                        } else if let Some((_, reason)) = self.history_error.as_ref() {
+                            // История не пришла. Молча показывать пустой канал
+                            // нельзя: это выглядит как «в канале ничего нет», и
+                            // пользователь заново кликает по каналу в надежде.
+                            ui.horizontal_centered(|ui| {
+                                ui.label(RichText::new(format!("Не удалось загрузить историю: {reason}"))
+                                    .size(12.0)
+                                    .color(self.theme.text_secondary));
+                            });
                         }
 
                         let msgs_for_render = &msgs;
@@ -296,6 +305,16 @@ impl App {
                                         ui.horizontal(|ui| {
                                             ui.spinner();
                                             ui.label(RichText::new("Loading older messages...").size(12.0).color(self.theme.text_secondary));
+                                        });
+                                    } else if let Some((_, reason)) = self.history_error.as_ref() {
+                                        // Догрузка вверх не вышла. Спиннер здесь
+                                        // горел бы вечно, а колесо перестало бы
+                                        // работать: прокрутка вверх считается
+                                        // запросом истории.
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("Не удалось догрузить: {reason}"))
+                                                .size(12.0)
+                                                .color(self.theme.text_secondary));
                                         });
                                     }
                                 });

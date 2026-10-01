@@ -87,6 +87,11 @@ pub(crate) struct App {
     /// прокрутке вверх не просим, иначе клиент будет снова и снова бить в
     /// API за страницей, которой не существует.
     pub(crate) history_exhausted: bool,
+    /// Последняя неудача при загрузке истории: для какого канала и почему.
+    /// Пока строка стоит, канал не должен ни крутить бесконечный спиннер, ни
+    /// молча выглядеть пустым — пользователь обязан видеть, что история не
+    /// пришла, иначе канал выглядит как сломанный.
+    pub(crate) history_error: Option<(String, String)>,
     /// Прокрутка чата в самом низу. По этому признаку новое сообщение
     /// прокручивает чат вниз, а читающего историю выше не выбрасывает.
     pub(crate) chat_at_bottom: bool,
@@ -171,6 +176,7 @@ impl App {
             history_loading: None,
             history_loading_more: false,
             history_exhausted: false,
+            history_error: None,
             chat_at_bottom: true,
             msg_heights: HashMap::new(),
             msg_offsets: Vec::new(),
@@ -273,6 +279,9 @@ impl App {
                 }
                 ToApp::HistoryMore { channel_id, messages, more } => {
                     self.apply_history(&channel_id, messages, more, true);
+                }
+                ToApp::HistoryFailed { channel_id, before, reason } => {
+                    self.history_failed(&channel_id, before.as_deref(), &reason);
                 }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
@@ -383,6 +392,7 @@ impl App {
         self.history_loading = None;
         self.history_loading_more = false;
         self.history_exhausted = false;
+        self.history_error = None;
         self.msg_heights.clear();
         self.msg_offsets.clear();
         self.chat_anchor = None;
@@ -439,6 +449,9 @@ impl App {
         self.history_loading = Some(channel_id.to_string());
         self.history_loading_more = false;
         self.history_exhausted = false;
+        // Прежняя неудача показывалась для этого же канала — при новой
+        // попытке она больше не актуальна.
+        self.history_error = None;
         self.messages.retain(|k, _| k == channel_id);
         // Незабранные загрузки прежнего канала больше никто не заберёт: к
         // моменту переключения они уже лежат в канале с готовыми
@@ -528,6 +541,35 @@ impl App {
         let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.to_string() };
         self.push_debug(format!("Stored {} msgs ({} new) for channel {}{}", stored, added, cid_short,
             if for_current { "" } else { " (не текущий канал)" }));
+    }
+    /// Страница истории не пришла: снять ожидание, показать почему.
+    ///
+    /// Раньше на этот случай не было события вовсе, и тот, кто ждал ответа,
+    /// ждал вечно: одна сетевая ошибка или один 403 оставляли канал с
+    /// бесконечным спиннером, а догрузка вверх не работала больше никогда —
+    /// она проверяет те же флаги.
+    ///
+    /// `before` говорит, чьего ответа мы ждали: `None` — первой страницы,
+    /// `Some` — догрузки вверх. Снять надо именно тот флаг: неудача по чужому
+    /// каналу не должна трогать текущий.
+    fn history_failed(&mut self, channel_id: &str, before: Option<&str>, reason: &str) {
+        if before.is_none() {
+            // Ждал ли кто-то первую страницу именно этого канала? Поздний
+            // ответ по уже закрытому каналу трогать нечего.
+            if self.history_loading.as_deref() == Some(channel_id) {
+                self.history_loading = None;
+            }
+        } else {
+            self.history_loading_more = false;
+        }
+        // Больше не долбим в API: 403 не лечится сам, а при обрыве сети
+        // пользователь откроет канал заново и получит свежую попытку.
+        if self.current_channel_id() == Some(channel_id) {
+            self.history_exhausted = true;
+            self.history_error = Some((channel_id.to_string(), reason.to_string()));
+            self.scroll_to_bottom = true;
+        }
+        self.push_debug(format!("History failed for {} ({}): {}", &channel_id[..channel_id.len().min(14)], before.is_some(), reason));
     }
     /// Догрузить более старые сообщения: просим страницу от самой старой
     /// строки, что уже есть в канале. Это именно первая строка списка — список
@@ -1497,6 +1539,118 @@ mod layout_tests {
         assert!(app.history_exhausted);
         // Спиннер догрузки не должен гореть при этом.
         assert!(!app.history_loading_more);
+    }
+
+    /// Одна неудачная загрузка истории не должна делать канал нечитаемым
+    /// навсегда. Раньше на неудачу не было события вовсе, и ждавший ответа
+    /// ждал вечно: спиннер «Loading messages…» горел сутками, а колесо вверх
+    /// переставало работать, потому что догрузка проверяет те же флаги.
+    #[test]
+    fn failed_history_clears_the_spinner_and_explains() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        assert_eq!(app.history_loading.as_deref(), Some("c1"));
+
+        // Сеть отдала 403, три попытки — и сдалась.
+        tx.send(ToApp::HistoryFailed {
+            channel_id: "c1".into(),
+            before: None,
+            reason: "нет прав на канал".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert_eq!(app.history_loading, None, "спиннер первой страницы должен погаснуть");
+        assert_eq!(
+            app.history_error.as_ref().map(|(c, r)| (c.as_str(), r.as_str())),
+            Some(("c1", "нет прав на канал")),
+            "пользователь должен видеть, что произошло"
+        );
+        assert!(app.history_exhausted, "после 403 больше не долбим в API");
+        // Канал при этом снова рабочий: догрузка вверх не залипает.
+        assert!(!app.history_loading_more);
+    }
+
+    /// То же для догрузки вверх: одна неудача — и «Loading older messages…»
+    /// горел бы вечно, а колесо перестало бы листать историю.
+    #[test]
+    fn failed_older_page_clears_its_own_spinner() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let page: Vec<ChatMessage> = (1..=crate::gateway::HISTORY_PAGE)
+            .rev()
+            .map(|i| test_msg(&format!("m{i}"), "c1", "x"))
+            .collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: page, more: true }).unwrap();
+        app.poll(&ctx);
+        app.request_older_history();
+        assert!(app.history_loading_more);
+
+        tx.send(ToApp::HistoryFailed {
+            channel_id: "c1".into(),
+            before: Some("m1".into()),
+            reason: "нет связи с Discord".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert!(!app.history_loading_more, "спиннер догрузки должен погаснуть");
+        assert_eq!(app.history_loading, None, "нечего было и гасить — первая страница уже пришла");
+        assert_eq!(app.history_error.as_ref().map(|(_, r)| r.as_str()), Some("нет связи с Discord"));
+    }
+
+    /// Неудача по чужому каналу не должна трогать текущий: у него своя загрузка.
+    #[test]
+    fn failed_history_of_other_channel_leaves_current_alone() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        for id in ["c1", "c2"] {
+            app.channels.push(ChatChannel {
+                id: id.into(),
+                name: "chan".into(),
+                guild_id: None,
+                channel_type: 1,
+                topic: None,
+                position: 0,
+            });
+        }
+        app.selected_channel = Some(1);
+        app.open_channel("c2");
+        assert_eq!(app.history_loading.as_deref(), Some("c2"));
+
+        tx.send(ToApp::HistoryFailed {
+            channel_id: "c1".into(),
+            before: None,
+            reason: "нет прав на канал".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert_eq!(app.history_loading.as_deref(), Some("c2"), "чужой канал не должен снимать наш спиннер");
+        assert!(app.history_error.is_none(), "и показывать чужую ошибку в нашем канале нельзя");
     }
 
     /// Живое сообщение уже в истории — дубль пропускается.
