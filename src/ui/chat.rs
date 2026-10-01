@@ -328,6 +328,30 @@ impl App {
                                                 .size(12.0)
                                                 .color(self.theme.text_secondary));
                                         });
+                                    } else if self.trimmed_newest > 0 {
+                                        // Потолок по памяти достигнут: чтобы втиснуть
+                                        // загруженную страницу, пришлось убрать из
+                                        // окна самые новые сообщения. Молча они
+                                        // пропадали бы, и верх истории выглядел бы
+                                        // просто концом переписки.
+                                        let dropped = self.trimmed_newest;
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "Достигнут предел: в этом канале хранится не больше {} сообщений",
+                                                    crate::app::MAX_MESSAGES_PER_CHANNEL
+                                                ))
+                                                .size(12.0)
+                                                .color(self.theme.text_secondary),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{dropped} новых скрыто — открой канал заново, чтобы увидеть их"
+                                                ))
+                                                .size(11.0)
+                                                .color(self.theme.text_secondary),
+                                            );
+                                        });
                                     }
                                 });
                                 if msgs_for_render.is_empty() && self.history_loading.is_none() {

@@ -17,7 +17,7 @@ use crate::models::{
 /// подгружается вверх по мере прокрутки, поэтому потолок нужен обязательно:
 /// без него длинный канал растёт бесконечно, и держать в памяти сотни
 /// сообщений, которых не видно, смысла нет.
-const MAX_MESSAGES_PER_CHANNEL: usize = 500;
+pub(crate) const MAX_MESSAGES_PER_CHANNEL: usize = 500;
 /// Сколько текстур аватаров/иконок guild'ов держим.
 const MAX_AVATAR_CACHE: usize = 192;
 /// Сколько картинок-вложений держим (каждая — это мегабайты VRAM/RAM).
@@ -32,14 +32,34 @@ const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 /// Сколько неудачных URL'ов запоминаем, чтобы не качать их снова.
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
 
-/// Оставляем только последние N сообщений: иначе активный канал в шумном
-/// чате раздувает память бесконечно. Список идёт от старых к новым, поэтому
-/// выбрасываются самые старые.
-fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>) {
-    if entry.len() > MAX_MESSAGES_PER_CHANNEL {
-        let extra = entry.len() - MAX_MESSAGES_PER_CHANNEL;
-        entry.drain(..extra);
+/// Оставляем не больше N сообщений: иначе активный канал в шумном чате
+/// раздувает память бесконечно. Список идёт от старых к новым, и какой конец
+/// резать — зависит от того, куда смотрит пользователь.
+///
+/// `keep_newest` — смотрим на новые сообщения (пришло своё или первая
+/// страница канала): тогда выбрасываются самые старые, до которых человек
+/// всё равно не доберётся.
+///
+/// `keep_newest = false` — смотрим вверх, на догруженную историю. Раньше
+/// обрезка шла от начала списка в обоих случаях, и страница, только что
+/// загруженная по прокрутке вверх, тут же выбрасывалась: список и так был
+/// полон, и верх истории молча упирался в стену (Б-7). Теперь на место
+/// пришедшей страницы уходят самые новые — те, к чему человек поднялся
+/// не ради.
+///
+/// Сколько ушло новых, возвращаем: об этом надо сказать пользователю, иначе
+/// сообщения просто пропадают из вида.
+fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>, keep_newest: bool) -> usize {
+    let extra = entry.len().saturating_sub(MAX_MESSAGES_PER_CHANNEL);
+    if extra == 0 {
+        return 0;
     }
+    if keep_newest {
+        entry.drain(..extra);
+    } else {
+        entry.truncate(MAX_MESSAGES_PER_CHANNEL);
+    }
+    extra
 }
 
 pub(crate) struct App {
@@ -101,6 +121,11 @@ pub(crate) struct App {
     /// прокрутке вверх не просим, иначе клиент будет снова и снова бить в
     /// API за страницей, которой не существует.
     pub(crate) history_exhausted: bool,
+    /// Сколько самых новых сообщений пришлось выбросить, чтобы втиснуть
+    /// догруженную вверх страницу в потолок по памяти. Показывается в чате:
+    /// иначе сообщения пропадают из вида молча, а верх истории выглядит так,
+    /// будто он кончился.
+    pub(crate) trimmed_newest: usize,
     /// Последняя неудача при загрузке истории: для какого канала и почему.
     /// Пока строка стоит, канал не должен ни крутить бесконечный спиннер, ни
     /// молча выглядеть пустым — пользователь обязан видеть, что история не
@@ -193,6 +218,7 @@ impl App {
             history_loading: None,
             history_loading_more: false,
             history_exhausted: false,
+            trimmed_newest: 0,
             history_error: None,
             chat_at_bottom: true,
             msg_heights: HashMap::new(),
@@ -281,7 +307,9 @@ impl App {
                         if !replaced {
                             let entry = self.messages.entry(cid).or_default();
                             entry.push(Arc::new(msg));
-                            trim_messages(entry);
+                            // Своё сообщение пришло, когда пользователь смотрит
+                            // на новые: место уходит самым старым.
+                            trim_messages(entry, true);
                         }
                         // Внизу ли пользователь — решаем по прошлому кадру: если
                         // он читает историю выше, новое сообщение не должно
@@ -530,6 +558,7 @@ impl App {
         // Прежняя неудача показывалась для этого же канала — при новой
         // попытке она больше не актуальна.
         self.history_error = None;
+        self.trimmed_newest = 0;
         self.messages.retain(|k, _| k == channel_id);
         // Незабранные загрузки прежнего канала больше никто не заберёт: к
         // моменту переключения они уже лежат в канале с готовыми
@@ -597,14 +626,23 @@ impl App {
                 0
             }
         };
-        // Потолок: при догрузке вверх выбрасываем самые старые (пользователь
-        // смотрит на новые, а старые всё равно никогда не покажет), при новом
-        // сообщении — тоже, оно новее всего.
-        let stored = {
+        // Потолок. С какой стороны резать — см. `trim_messages`: при своём
+        // сообщении или первой странице выбрасываются самые старые, при
+        // догрузке вверх — самые новые, потому что пользователь поднялся
+        // именно к старым.
+        let (stored, dropped_newest) = {
             let entry = self.messages.get_mut(channel_id).expect("страницу только что положили");
-            trim_messages(entry);
-            entry.len()
+            let dropped = trim_messages(entry, !prepend);
+            (entry.len(), dropped)
         };
+        // Первую страницу канала грузим целиком заново, поэтому счётчик сбросим:
+        // он относится к прежнему окну истории.
+        if !prepend {
+            self.trimmed_newest = 0;
+        }
+        if dropped_newest > 0 {
+            self.trimmed_newest = dropped_newest;
+        }
         // Дамп сообщений — отладочная вещь, пишется только когда явно
         // попросили переменной окружения: на каждый выбор канала он собирал
         // строку на полэкрана текста. По догрузке вверх не пишем: там он
@@ -1133,7 +1171,7 @@ mod layout_tests {
             msg.id = format!("m{}", i);
             entry.push(Arc::new(msg.clone()));
         }
-        trim_messages(&mut entry);
+        trim_messages(&mut entry, true);
         assert_eq!(entry.len(), MAX_MESSAGES_PER_CHANNEL);
         // Остались самые новые, порядок сохранён.
         assert_eq!(entry[0].id, "m50");
@@ -1818,6 +1856,78 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// Догруженная вверх страница не должна тут же выбрасываться, когда список
+/// уже упёрся в потолок по памяти.
+///
+/// Сценарий: в канале набралось 500 сообщений, пользователь прокручивает
+/// вверх, страница приходит — и `trim_messages` режет список от начала, то
+/// есть выбрасывает ровно то, что только что загрузилось. Верх истории молча
+/// упирается в стену: колесо крутится, запрос уходит, а в чате ничего не
+/// меняется.
+#[test]
+    fn older_page_survives_the_memory_ceiling() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        // Список полон: 500 последних сообщений, от m0 до m499.
+        let full: Vec<Arc<ChatMessage>> = (0..MAX_MESSAGES_PER_CHANNEL)
+            .map(|i| Arc::new(test_msg(&format!("m{i}"), "c1", "x")))
+            .collect();
+        app.messages.insert("c1".into(), full);
+
+        let older: Vec<ChatMessage> = (1..=50).rev().map(|i| test_msg(&format!("old{i}"), "c1", "старое")).collect();
+        tx.send(ToApp::HistoryMore { channel_id: "c1".into(), messages: older, more: false }).unwrap();
+        app.poll(&ctx);
+
+        let entry = app.messages.get("c1").unwrap();
+        assert_eq!(entry.len(), MAX_MESSAGES_PER_CHANNEL, "потолок по памяти должен держаться");
+        assert_eq!(
+            entry[0].id, "old1",
+            "только что загруженная страница обязана остаться в чате, а не исчезнуть"
+        );
+        // На её месте ушли самые новые — и об этом сказано пользователю.
+        assert_eq!(
+            app.trimmed_newest, 50,
+            "сколько сообщений скрыто, должно быть известно: показать это молча нельзя"
+        );
+        assert_eq!(
+            entry[MAX_MESSAGES_PER_CHANNEL - 1].id, "m449",
+            "уйти должны самые новые, а не самые старые"
+        );
+    }
+
+    /// Обратная сторона: обычное обновление (своё сообщение, первая страница)
+    /// должно по-прежнему выбрасывать старые. Иначе шумный канал раздует
+    /// память, ради чего потолок и стоит.
+    #[test]
+    fn new_message_still_drops_the_oldest_ones() {
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        let mut entry: Vec<Arc<ChatMessage>> = (0..MAX_MESSAGES_PER_CHANNEL)
+            .map(|i| Arc::new(test_msg(&format!("m{i}"), "c1", "x")))
+            .collect();
+        entry.push(Arc::new(test_msg("mine", "c1", "моё")));
+        app.messages.insert("c1".into(), entry);
+
+        let dropped = trim_messages(app.messages.get_mut("c1").unwrap(), true);
+        let entry = app.messages.get("c1").unwrap();
+        assert_eq!(entry.len(), MAX_MESSAGES_PER_CHANNEL);
+        assert_eq!(entry[0].id, "m1", "своё сообщение вытесняет самое старое");
+        assert_eq!(entry[MAX_MESSAGES_PER_CHANNEL - 1].id, "mine");
+        assert_eq!(dropped, 1, "сколько выброшено — известно, но это не предел окна");
     }
 
     /// Переключение аккаунта должно поднимать поколение гейтвея: события
