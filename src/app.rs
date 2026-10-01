@@ -1066,6 +1066,10 @@ mod layout_tests {
     /// Пробелы в пароле — самая частая причина «неверного пароля».
     #[test]
     fn vault_tolerates_password_spaces() {
+        // Перебор вариантов пароля считает сотни тысяч итераций PBKDF2, а
+        // измеряющие время тесты ходят параллельно: без замка они мешали бы
+        // друг другу.
+        let _guard = crate::crypto::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for saved in ["hunter2", "hunter2 ", " hunter2", "hunter2\n"] {
             let (mut app, tmp) = vaulted_app("space");
             app.saved_accounts =

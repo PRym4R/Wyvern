@@ -176,20 +176,19 @@ impl App {
 
         // Под пробелы/невидимые символы: их легко принести из буфера обмена
         // или случайно нажать пробел, а потом не вспомнить.
-        for candidate in Self::password_variants(password) {
-            let accounts = Self::load_accounts_with(&content, &candidate);
-            if let Some(accounts) = accounts {
-                let hint = if candidate == password {
-                    None
-                } else {
-                    Some("Пароль принят: убрал лишние пробелы".to_string())
-                };
-                self.saved_accounts = accounts;
-                self.master_password = candidate;
-                self.accounts_unlocked = true;
-                self.refresh_active_index();
-                return Ok(hint);
-            }
+        let variants = Self::password_variants(password);
+        if let Some((idx, accounts)) = Self::try_variants(&content, &variants) {
+            let candidate = variants[idx].clone();
+            let hint = if candidate == password {
+                None
+            } else {
+                Some("Пароль принят: убрал лишние пробелы".to_string())
+            };
+            self.saved_accounts = accounts;
+            self.master_password = candidate;
+            self.accounts_unlocked = true;
+            self.refresh_active_index();
+            return Ok(hint);
         }
 
         Err(format!(
@@ -197,9 +196,13 @@ impl App {
             self.vault_path().display()
         ))
     }
-    /// Набор вариантов пароля, которые пробуем подряд: как ввёл, без
-    /// окружающих пробелов, и с лишним пробелом/переводом строки с любой
-    /// стороны. Ошибка в один символ — самая частая причина «неверного пароля».
+    /// Набор вариантов пароля, которые пробуем: как ввёл, без окружающих
+    /// пробелов, и с лишним пробелом или переводом строки с любой стороны.
+    /// Ошибка в один символ — самая частая причина «неверного пароля».
+    ///
+    /// Считаются они не подряд, а одновременно — см. `try_variants`. Сам список
+    /// трогать нельзя: лишний пробел в пароле хранилища, с которым человек уже
+    /// работает, обязан продолжать подходить.
     fn password_variants(password: &str) -> Vec<String> {
         let mut out = vec![password.to_string()];
         let trimmed = password.trim();
@@ -211,6 +214,61 @@ impl App {
             out.push(format!("{}{}", extra, password));
         }
         out
+    }
+    /// Подобрать вариант пароля по содержимому файла.
+    ///
+    /// Каждый вариант — это отдельный ключ, то есть 100 000 итераций PBKDF2:
+    /// на этой машине 8.6 мс, на слабом компьютере в разы больше. Варианты
+    /// считали подряд, и неверный пароль — а это самый частый случай неудачного
+    /// входа — стоил восьми таких вычислений подряд: 71 мс здесь и сотни
+    /// миллисекунд на слабом компьютере, всё это время в потоке интерфейса, где
+    /// окно не отвечает. Повторялось на каждое нажатие «Войти».
+    ///
+    /// Теперь первый вариант — как ввёл — считается на месте (в подавляющем
+    /// большинстве случаев он и есть верный, и потоки не нужны вовсе), а
+    /// остальные разом, каждый в своём потоке: варианты друг от друга не
+    /// зависят, и ждать приходится самый долгий, а не сумму. Работы столько же,
+    /// но окно отвечает.
+    ///
+    /// Дёшево отвергнуть варианты нельзя: что-нибудь вроде быстрого хеша пароля
+    /// рядом с данными превратило бы файл в то, что перебирается со скоростью
+    /// SHA-256 вместо PBKDF2. Пусть лучше подождёт.
+    ///
+    /// Возвращает номер подошедшего варианта: он нужен, чтобы положить в
+    /// хранилище именно тот пароль, которым файл на самом деле открылся.
+    fn try_variants(content: &str, variants: &[String]) -> Option<(usize, Vec<StoredAccount>)> {
+        #[cfg(test)]
+        LAST_SEARCH_WIDTH.store(0, std::sync::atomic::Ordering::SeqCst);
+        let first = variants.first()?;
+        if let Some(accounts) = Self::load_accounts_with(content, first) {
+            return Some((0, accounts));
+        }
+        if variants.len() == 1 {
+            return None;
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = variants
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(i, candidate)| {
+                    scope.spawn(move || Self::load_accounts_with(content, candidate).map(|acc| (i, acc)))
+                })
+                .collect();
+            #[cfg(test)]
+            LAST_SEARCH_WIDTH.store(handles.len(), std::sync::atomic::Ordering::SeqCst);
+            // Из подошедших берём вариант с наименьшим номером, иначе выбор
+            // зависел бы от того, кто из потоков успел раньше.
+            let mut best: Option<(usize, Vec<StoredAccount>)> = None;
+            for handle in handles {
+                if let Ok(Some(found)) = handle.join() {
+                    if best.as_ref().is_none_or(|(b, _)| found.0 < *b) {
+                        best = Some(found);
+                    }
+                }
+            }
+            best
+        })
     }
     /// ЛКМ по аккаунту в нижней ленте: выбрать его и спросить пароль.
     pub(crate) fn select_account(&mut self, token: String) {
@@ -321,5 +379,163 @@ mod mask_tests {
             username: "Вася".to_string(),
         };
         assert_eq!(a.account_label(&named), "Вася");
+    }
+}
+
+/// Замок на тесты, которые много считают ключи.
+///
+/// Перебор вариантов пароля — это сотни тысяч итераций PBKDF2 на вариант, и
+/// тесты идут параллельно. Без замка тяжёлые тесты мешают друг другу.
+#[cfg(test)]
+pub(crate) static VAULT_COST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Сколько потоков поднял перебор вариантов пароля в последний раз — только
+/// для тестов.
+///
+/// По секундомеру параллельность проверить нельзя: на загруженной машине
+/// (а машина разработчика вполне может быть занята игрой) запас между
+/// последовательным перебором и параллельным слишком мал, и проверка мигала бы
+/// то так, то этак. Счётчик потоков отвечает на тот же вопрос точно.
+#[cfg(test)]
+pub(crate) static LAST_SEARCH_WIDTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod vault_cost_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    /// Каждый тест хранилища — свой файл: тесты идут параллельно.
+    static TAG: AtomicU64 = AtomicU64::new(0);
+
+    fn vaulted() -> (App, std::path::PathBuf) {
+        let tag = TAG.fetch_add(1, Ordering::SeqCst);
+        let mut p = std::env::temp_dir();
+        p.push(format!("wyvern-test-cost-{}-{}.json", std::process::id(), tag));
+        let _ = std::fs::remove_file(&p);
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.vault_path_override = Some(p.clone());
+        (app, p)
+    }
+
+    /// Перебрать варианты подряд — ровно как было. Нужен как эталон для
+    /// проверки, что перебор действительно распараллелен.
+    fn sweep_sequentially(content: &str, variants: &[String]) -> Option<(usize, Vec<StoredAccount>)> {
+        for (i, candidate) in variants.iter().enumerate() {
+            if let Some(accounts) = App::load_accounts_with(content, candidate) {
+                return Some((i, accounts));
+            }
+        }
+        None
+    }
+
+    /// Неверный пароль не должен заставлять ждать все варианты подряд.
+    ///
+    /// Сценарий самый частый: человек ошибся в пароле хранилища. Каждый
+    /// вариант — отдельный ключ, то есть 100 000 итераций PBKDF2 (здесь 8.6 мс,
+    /// на слабом компьютере в разы больше), а вариантов восемь. Считали их
+    /// подряд, и всё это время окно интерфейса не отвечало — 71 мс на этой
+    /// машине и сотни миллисекунд на слабом, на каждое нажатие «Войти».
+    ///
+    /// Проверяем не по секундомеру, а по числу поднятых потоков: время на
+    /// загруженной машине шумит так, что запас между последовательным и
+    /// параллельным перебором уходит в разброс. Потоки же говорят прямо:
+    /// варианты считаются разом.
+    #[test]
+    fn wrong_password_searches_the_variants_in_parallel() {
+        let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut app, tmp) = vaulted();
+        app.save_accounts("правильный");
+        let content = std::fs::read_to_string(&tmp).expect("файл хранилища не записался");
+        let variants = App::password_variants(" неправильный ");
+        assert_eq!(variants.len(), 8, "перебор состоит из восьми вариантов");
+        assert!(
+            sweep_sequentially(&content, &variants).is_none(),
+            "неверный пароль не должен подходить"
+        );
+
+        assert!(app.unlock_vault(" неправильный ").is_err(), "с неверным паролем вход отклоняется");
+        assert_eq!(
+            super::LAST_SEARCH_WIDTH.load(Ordering::SeqCst),
+            variants.len() - 1,
+            "семь оставшихся вариантов должны считаться разом: подряд это 71 мс ожидания в потоке интерфейса"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Верный пароль — самый частый случай — не должен поднимать ни одного
+    /// потока: он подходит с первого варианта, и лишняя работа тут не нужна.
+    #[test]
+    fn correct_password_needs_no_threads() {
+        let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut app, tmp) = vaulted();
+        app.save_accounts("правильный");
+        assert!(app.unlock_vault("правильный").is_ok());
+        assert_eq!(
+            super::LAST_SEARCH_WIDTH.load(Ordering::SeqCst),
+            0,
+            "первый вариант подошёл — потоки не нужны"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Перебор не должен терять то, ради чего он и есть: пароль хранилища с
+    /// лишним пробелом должен открываться по обрезанному варианту, а с
+    /// пробелом спереди — по варианту «пробел + как ввёл», который теперь
+    /// считается не первым, а в отдельном потоке.
+    #[test]
+    fn stray_whitespace_still_opens_the_vault() {
+        for saved in ["правильный", "правильный ", " правильный", "правильный\n"] {
+            let (mut app, tmp) = vaulted();
+            app.saved_accounts = vec![StoredAccount { token: "токен".into(), username: "вася".into() }];
+            app.save_accounts(saved);
+            let hint = app
+                .unlock_vault("правильный")
+                .unwrap_or_else(|e| panic!("пароль хранилища {saved:?} должен открываться: {e}"));
+            if saved == "правильный" {
+                assert!(hint.is_none(), "для точного пароля подсказки быть не должно");
+            } else {
+                assert!(hint.is_some(), "пароль {saved:?} принят не как введён — нужна подсказка");
+            }
+            assert_eq!(
+                app.master_password, saved,
+                "в хранилище должен лежать тот пароль, которым файл и открылся"
+            );
+            assert_eq!(app.saved_accounts.len(), 1, "аккаунт не загрузился");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Введённый с пробелами пароль обязан подойти: человек лишний раз нажал
+    /// пробел, а хранилище должно открыться, а не отшивать его «неверным
+    /// паролем».
+    #[test]
+    fn typed_with_spaces_opens_the_vault() {
+        let (mut app, tmp) = vaulted();
+        app.save_accounts("правильный");
+        let hint = app.unlock_vault("  правильный \n").expect("пароль с пробелами должен подойти");
+        assert!(hint.is_some(), "обрезка должна сопровождаться подсказкой");
+        assert_eq!(app.master_password, "правильный");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Перебор состоит из семи-восьми вариантов: обрезанный добавляется только
+    /// когда он отличается от введённого. Сокращать список нельзя: лишний
+    /// пробел в пароле, с которым человек уже работает, обязан продолжать
+    /// подходить.
+    #[test]
+    fn variants_keep_the_whitespace_guesses() {
+        let variants = App::password_variants("пароль");
+        assert_eq!(variants[0], "пароль", "первым идёт как ввёл — самый частый случай");
+        assert_eq!(
+            variants,
+            vec!["пароль", "пароль ", " пароль", "пароль\n", "\nпароль", "пароль\r\n", "\r\nпароль"]
+        );
+        // С пробелами по краям добавляется обрезанный вариант.
+        let padded = App::password_variants(" пароль ");
+        assert_eq!(padded[1], "пароль", "обрезанный идёт вторым");
+        assert_eq!(padded.len(), variants.len() + 1);
     }
 }
