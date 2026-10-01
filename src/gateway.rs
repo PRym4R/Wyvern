@@ -31,12 +31,61 @@ pub(crate) async fn run_gateway(
                 break;
             }
             Err(e) => {
-                let _ = event_tx.send(ToApp::Debug(format!("Gateway error: {}", e)));
-                let _ = event_tx.send(ToApp::Status(format!("Reconnecting: {}", e)));
+                let fatal = e.downcast_ref::<GwClosed>().is_some_and(|c| c.fatal);
+                let msg = e.to_string();
+                let _ = event_tx.send(ToApp::Debug(format!("Gateway error: {}", msg)));
+                if fatal {
+                    // Discord отказал в самом токене. Следующая попытка даст
+                    // тот же отказ: раньше клиент так и долбился в Discord
+                    // каждые 3 секунды сутками, не говоря ни слова почему.
+                    // Вместо этого возвращаемся на экран входа с текстом.
+                    let _ = event_tx.send(ToApp::AuthFailed { reason: msg });
+                    break;
+                }
+                let _ = event_tx.send(ToApp::Status(format!("Reconnecting: {}", msg)));
                 time::sleep(Duration::from_secs(3)).await;
             }
         }
     }
+}
+
+/// Обрыв гейтвея, который повторять бессмысленно: Discord отклонил сам
+/// токен или набор подписок. Отдельный тип нужен, чтобы отличить его от
+/// обычного обрыва, на который надо просто зайти снова.
+#[derive(Debug)]
+struct GwClosed {
+    message: String,
+    fatal: bool,
+}
+
+impl std::fmt::Display for GwClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for GwClosed {}
+
+/// Что означает код закрытия вебсокета.
+///
+/// Discord присылает код, который прямо говорит, фатально это или нет.
+/// Раньше код уходил в отладочный вывод и терялся: любой обрыв выглядел как
+/// «websocket closed», и клиент по одному и тому же отказу по кругу
+/// переподключался каждые 3 секунды — сутками, и по этому же поводу ещё и
+/// ловил rate limit.
+fn close_fatal_reason(code: u16) -> Option<&'static str> {
+    match code {
+        4004 => Some("токен отклонён Discord: он недействителен"),
+        4007 => Some("токен отозван"),
+        4013 => Some("набор подписок (intents) неверный — Discord его не принимает"),
+        4014 => Some("эти подписки (intents) запрещены для этого аккаунта"),
+        _ => None,
+    }
+}
+
+/// Достать код закрытия из служебного сообщения задачи чтения.
+fn close_code_of(raw: &str) -> Option<u16> {
+    raw.strip_prefix("__CLOSE__")?.parse().ok()
 }
 
 #[derive(Default)]
@@ -512,7 +561,11 @@ async fn gw_inner(
                 Ok(WsMessage::Text(t)) => { let _ = raw_tx.send(t.to_string()); }
                 Ok(WsMessage::Ping(d)) => { let _ = ws_tx.send(WsMessage::Pong(d)); }
                 Ok(WsMessage::Close(c)) => {
-                    let _ = raw_tx.send(format!("__CLOSE__{:?}", c));
+                    // Тащим сам код закрытия, а не отладочный вывод всей
+                    // структуры: по коду решается, повторять подключение или
+                    // нет (см. `close_fatal_reason`).
+                    let code = c.map(|f| u16::from(f.code)).unwrap_or(0);
+                    let _ = raw_tx.send(format!("__CLOSE__{}", code));
                     break;
                 }
                 Ok(_) => {}
@@ -551,9 +604,25 @@ async fn gw_inner(
                 let _ = write.send(ws_msg).await;
             }
             Some(raw) = raw_rx.recv() => {
-                if raw.starts_with("__CLOSE__") {
-                    let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed: {}", &raw[8..])));
-                    return Err("websocket closed".into());
+                if let Some(code) = close_code_of(&raw) {
+                    match close_fatal_reason(code) {
+                        // Отказ в самом токене: повтор не поможет. Помечаем
+                        // ошибку как фатальную, и `run_gateway` вернёт клиент
+                        // на экран входа вместо бесконечного переподключения.
+                        Some(reason) => {
+                            let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed {}: {}", code, reason)));
+                            return Err(Box::new(GwClosed {
+                                message: format!("{} ({})", reason, code),
+                                fatal: true,
+                            }));
+                        }
+                        // Обычный обрыв: сеть, сон компьютера, реконнект со
+                        // стороны Discord — заходим снова.
+                        None => {
+                            let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed: {}", code)));
+                            return Err("websocket closed".into());
+                        }
+                    }
                 }
                 if raw.starts_with("__WS_ERROR__") {
                     let _ = event_tx.send(ToApp::Debug(format!("WebSocket error: {}", &raw[11..])));
@@ -985,6 +1054,49 @@ Err(e) => {
 
     Ok(())
 
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::{close_code_of, close_fatal_reason};
+
+    /// Коды, которыми Discord отказывает в самом токене или подписках,
+    /// означают, что повторное подключение ничего не изменит. Их надо
+    /// отличать от обычного обрыва: раньше все закрытия выглядели одинаково,
+    /// и клиент по кругу, каждые 3 секунды, долбился в Discord сутками, не
+    /// говоря пользователю ни слова.
+    #[test]
+    fn token_refusal_codes_are_fatal() {
+        for code in [4004u16, 4007, 4013, 4014] {
+            let reason = close_fatal_reason(code)
+                .unwrap_or_else(|| panic!("код {code} должен быть фатальным"));
+            assert!(!reason.is_empty(), "причина должна показываться пользователю");
+        }
+        // 4004 — самый частый случай: токен невалиден.
+        assert!(close_fatal_reason(4004).unwrap().contains("токен"));
+    }
+
+    /// Обычные обрывы (сеть, сон, реконнект со стороны Discord)
+    /// переподключаться должны, как раньше: иначе клиент не пережил бы
+    /// обычную потерю связи.
+    #[test]
+    fn ordinary_close_codes_are_not_fatal() {
+        for code in [0u16, 1000, 1001, 1006, 1011, 1012, 1013, 4000, 4008, 4011] {
+            assert_eq!(close_fatal_reason(code), None, "код {code} — обычный обрыв");
+        }
+    }
+
+    /// Задача чтения отдаёт код закрытия отдельной служебной строкой; если её
+    /// разобрать не удалось, обрыв считаем обычным, но не фатальным.
+    #[test]
+    fn close_code_is_taken_from_the_read_task() {
+        assert_eq!(close_code_of("__CLOSE__4004"), Some(4004));
+        assert_eq!(close_code_of("__CLOSE__1000"), Some(1000));
+        assert_eq!(close_code_of("__WS_ERROR__broken pipe"), None);
+        assert_eq!(close_code_of("{\"op\":0}"), None);
+        // Мусор вместо кода не должен превращаться в «фатально».
+        assert_eq!(close_code_of("__CLOSE__мусор"), None);
+    }
 }
 
 #[cfg(test)]

@@ -344,7 +344,29 @@ impl App {
                     self.friends = list;
                     self.push_debug(format!("Loaded {} friends", self.friends.len()));
                 }
-                ToApp::Status(s) => self.status = s,
+                ToApp::Status(s) => {
+                    // Статус соединения — это состояние, а не ошибка, но он
+                    // же должен означать, что мы сейчас не онлайн. Раньше
+                    // `connected` гасился только при выходе из аккаунта, и
+                    // после обрыва кнопка «я онлайн» продолжала гореть, а
+                    // экран входа не возвращался.
+                    if s.starts_with("Reconnecting") || s == "Disconnected" {
+                        self.connected = false;
+                    }
+                    self.status = s;
+                }
+                ToApp::AuthFailed { reason } => {
+                    // Discord отклонил токен. Возвращаемся на экран входа:
+                    // `connected` и `gw_started` больше не сбросят нигде, а
+                    // без этого неверный токен оставлял клиент в экране чата,
+                    // из которого нечем выйти (кнопки выхода нет ни в одном
+                    // меню). Токен в поле оставляем — его надо исправить.
+                    self.connected = false;
+                    self.gw_started = false;
+                    self.to_gw = None;
+                    self.push_debug(format!("Auth failed: {}", reason));
+                    self.status = reason;
+                }
                 ToApp::Debug(d) => self.push_debug(d),
             }
         }
@@ -685,6 +707,14 @@ impl App {
             .unwrap_or_default()
             .into()
     }
+/// Экран входа вместо чата?
+    ///
+    /// Отдельный метод, а не условие прямо в `update`: от того, сюда ли мы
+    /// попадём, зависит, сможет ли пользователь выйти из сломанного входа
+    /// обратно, и это стоит проверять тестом, а не глазами.
+    pub(crate) fn shows_login(&self) -> bool {
+        self.token_input.is_empty() || (!self.connected && !self.gw_started)
+    }
 }
 
 impl eframe::App for App {
@@ -697,7 +727,7 @@ impl eframe::App for App {
             _ => Theme::light(),
         };
 
-        if self.token_input.is_empty() || (!self.connected && !self.gw_started) {
+        if self.shows_login() {
             self.draw_login(ctx);
         } else {
             self.draw_chat(ctx);
@@ -1656,6 +1686,65 @@ mod layout_tests {
 
         assert_eq!(app.history_loading.as_deref(), Some("c2"), "чужой канал не должен снимать наш спиннер");
         assert!(app.history_error.is_none(), "и показывать чужую ошибку в нашем канале нельзя");
+    }
+
+    /// Discord отклонил токен — клиент должен вернуться на экран входа.
+    /// Раньше это был тупик: `connected` и `gw_started` гасились только при
+    /// выходе из аккаунта, гейтвей молча переподключался каждые 3 секунды, а
+    /// кнопки выхода нет ни в одном меню. Ввести неверный токен — значит
+    /// навсегда остаться в экране чата с пустым списком каналов.
+    #[test]
+    fn rejected_token_returns_to_login_screen() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.token_input = "неверныйтокен".into();
+        // Гейтвей уже запущен (сам тред в тесте не нужен — он бы подменил
+        // канал событий на свой).
+        app.gw_started = true;
+        app.connected = true;
+        assert!(!app.shows_login(), "после входа должен быть чат");
+
+        tx.send(ToApp::AuthFailed {
+            reason: "токен отклонён Discord: он недействителен (4004)".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert!(!app.connected, "показ «я онлайн» должен погаснуть");
+        assert!(!app.gw_started);
+        assert!(app.shows_login(), "вернуться на экран входа обязательно, иначе выйти нечем");
+        assert!(
+            app.status.contains("4004"),
+            "пользователь должен видеть, что именно отказало: {:?}",
+            app.status
+        );
+    }
+
+    /// Обрыв соединения — это не вход, но и не «мы онлайн». Флаг `connected`
+    /// раньше гасился только выходом из аккаунта, и после обрыва кнопка «👤»
+    /// продолжала гореть акцентным цветом.
+    #[test]
+    fn connection_lost_clears_online_flag() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.token_input = "токен".into();
+        app.connected = true;
+        app.gw_started = true;
+
+        tx.send(ToApp::Status("Reconnecting: websocket closed".into())).unwrap();
+        app.poll(&ctx);
+        assert!(!app.connected, "мы сейчас не онлайн, даже если экран чата открыт");
+
+        // И наоборот: обычный статус не должен выкидывать в экран входа —
+        // при переподключении пользователь должен остаться в чате.
+        app.connected = true;
+        tx.send(ToApp::Status("Connecting...".into())).unwrap();
+        app.poll(&ctx);
+        assert!(app.connected);
+        assert!(app.gw_started);
+        assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
     }
 
     /// Живое сообщение уже в истории — дубль пропускается.
