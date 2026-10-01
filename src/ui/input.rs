@@ -5,6 +5,17 @@ use crate::app::App;
 use crate::messages::ToGateway;
 use crate::models::{ChatChannel, ChatMessage, LOCAL_ID_PREFIX};
 
+/// Префикс отладочных команд. Всё, что не начинается с него, — обычный текст
+/// для канала, даже если похоже на команду.
+///
+/// Раньше отладочные команды висели прямо в поле сообщения: `/quit` закрывал
+/// клиент (то есть пользователь, который хотел написать в канал «/quit»,
+/// терял окно без предупреждения), а `/add <id>` молча создавал канал, которого
+/// нет ни в одном списке и который тем не менее открывался.
+const DEBUG_PREFIX: &str = "/debug ";
+/// Сколько ждёт подтверждения, прежде чем команда забудется.
+const DEBUG_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
         let has_channel = self.selected_channel.is_some();
@@ -57,25 +68,11 @@ impl App {
             });
     }
     pub(crate) fn handle_input(&mut self, text: &str) {
-        if text == "/quit" {
-            std::process::exit(0);
-        }
-        if let Some(id) = text.strip_prefix("/add ") {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                self.channels.push(ChatChannel {
-                    id: id.clone(),
-                    name: format!("#{}", &id),
-                    guild_id: None,
-                    channel_type: 0,
-                    topic: None,
-                    position: 999,
-                });
-                let idx = self.channels.len() - 1;
-                self.selected_channel = Some(idx);
-                self.scroll_to_bottom = true;
-                self.open_channel(&id);
-            }
+        // Отладочные команды — только под своим префиксом и только с
+        // подтверждением: добавлять канал, которого не видно в списках, одной
+        // опечаткой нельзя.
+        if let Some(rest) = text.strip_prefix(DEBUG_PREFIX) {
+            self.handle_debug_command(rest.trim());
             return;
         }
 
@@ -107,5 +104,52 @@ impl App {
             }));
             self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id });
         }
+    }
+
+    /// Отладочная команда из поля сообщения. Первое нажатие только спрашивает
+    /// подтверждение: команда добавляет канал, которого нет ни в одном списке,
+    /// и ошибиться в id легко.
+    fn handle_debug_command(&mut self, rest: &str) {
+        if let Some(id) = rest.strip_prefix("add ").map(str::trim) {
+            if id.is_empty() {
+                self.status = "нужен id канала: /debug add <id>".to_string();
+                return;
+            }
+            // Повтор той же команды в пределах окна — подтверждение.
+            let confirmed = match &self.pending_debug_add {
+                Some((prev, when)) => prev == id && when.elapsed() < DEBUG_CONFIRM_WINDOW,
+                None => false,
+            };
+            if confirmed {
+                self.pending_debug_add = None;
+                self.add_debug_channel(id);
+            } else {
+                self.pending_debug_add = Some((id.to_string(), std::time::Instant::now()));
+                self.status = format!("канал {id} будет добавлен после повторного /debug add {id}");
+                self.push_debug(format!("Debug add awaiting confirmation: {id}"));
+            }
+            return;
+        }
+        self.status = format!("неизвестная отладочная команда: {rest}");
+        self.push_debug(format!("Unknown debug command: {rest}"));
+    }
+
+    /// Добавить канал напрямую, мимо списков Discord. Такой канал виден только
+    /// если знать его id, поэтому и нужен лишь для отладки.
+    fn add_debug_channel(&mut self, id: &str) {
+        self.channels.push(ChatChannel {
+            id: id.to_string(),
+            name: format!("#{}", id),
+            guild_id: None,
+            channel_type: 0,
+            topic: None,
+            position: 999,
+        });
+        let idx = self.channels.len() - 1;
+        self.selected_channel = Some(idx);
+        self.scroll_to_bottom = true;
+        self.open_channel(id);
+        self.status = format!("канал {id} добавлен");
+        self.push_debug(format!("Debug channel added: {id}"));
     }
 }

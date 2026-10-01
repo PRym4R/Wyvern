@@ -126,6 +126,9 @@ pub(crate) struct App {
     /// иначе сообщения пропадают из вида молча, а верх истории выглядит так,
     /// будто он кончился.
     pub(crate) trimmed_newest: usize,
+    /// Отладочная команда, ждущая подтверждения: канал, который добавит
+    /// повторный ввод. `None` — ничего не ждём.
+    pub(crate) pending_debug_add: Option<(String, std::time::Instant)>,
     /// Последняя неудача при загрузке истории: для какого канала и почему.
     /// Пока строка стоит, канал не должен ни крутить бесконечный спиннер, ни
     /// молча выглядеть пустым — пользователь обязан видеть, что история не
@@ -219,6 +222,7 @@ impl App {
             history_loading_more: false,
             history_exhausted: false,
             trimmed_newest: 0,
+            pending_debug_add: None,
             history_error: None,
             chat_at_bottom: true,
             msg_heights: HashMap::new(),
@@ -1856,6 +1860,91 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// Строка в поле сообщения — это текст для канала, а не команда клиенту.
+///
+/// `/quit` в поле ввода закрывал окно без сохранения и без предупреждения:
+/// человек, который хотел написать в канал именно «/quit», просто терял
+/// клиент. Проверяем, что такой текст уходит в канал как обычное сообщение.
+#[test]
+    fn slash_looking_text_is_sent_not_executed() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = app_with_channel(cmd_tx);
+
+        app.handle_input("/quit");
+
+        assert_eq!(
+            app.messages.get("c1").map(|v| v.len()),
+            Some(1),
+            "/quit должен уйти в канал как сообщение, а не закрыть клиент"
+        );
+        assert_eq!(app.messages["c1"][0].content, "/quit");
+        let sent: Vec<ToGateway> = std::iter::from_fn(|| cmd_rx.try_recv().ok()).collect();
+        assert!(
+            sent.iter().any(|c| matches!(c, ToGateway::Send { content, .. } if content == "/quit")),
+            "текст должен уйти на отправку: {sent:?}"
+        );
+    }
+
+    /// Прежний `/add <id>` создавал канал, которого нет ни в одном списке
+    /// (channel_type 0, а боковая панель показывает только 1 и 3), и открывал
+    /// его сразу. Теперь отладовые команды живут под своим префиксом и требуют
+    /// подтверждения: одной опечатки мало.
+    #[test]
+    fn debug_channel_needs_confirmation() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = app_with_channel(cmd_tx);
+        let channels_before = app.channels.len();
+
+        app.handle_input("/add 123456789");
+        assert_eq!(
+            app.channels.len(),
+            channels_before,
+            "/add больше не команда — такой текст уходит в канал"
+        );
+        assert!(app.pending_debug_add.is_none());
+
+        // Под своим префиксом — команда, но только после повтора.
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+        app.handle_input("/debug add 123456789");
+        assert_eq!(app.channels.len(), channels_before, "первый ввод только спрашивает");
+        assert!(app.pending_debug_add.is_some(), "команда ждёт подтверждения");
+        assert!(
+            app.status.contains("123456789"),
+            "пользователь должен понимать, что нажать: {:?}",
+            app.status
+        );
+
+        app.handle_input("/debug add 123456789");
+        assert_eq!(app.channels.len(), channels_before + 1, "повтор добавляет канал");
+        assert!(app.pending_debug_add.is_none(), "после подтверждения ждать нечего");
+        assert_eq!(app.channels.last().unwrap().id, "123456789");
+
+        // Чужой id подтверждением не считается: ждём уже другой команды.
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+        app.handle_input("/debug add 111");
+        let before = app.channels.len();
+        app.handle_input("/debug add 222");
+        assert_eq!(app.channels.len(), before, "подтверждением может быть только та же команда");
+    }
+
+    /// Приложение с одним открытым каналом и готовым приёмником команд.
+    fn app_with_channel(cmd_tx: mpsc::UnboundedSender<ToGateway>) -> App {
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.user_id = "me".into();
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app
     }
 
     /// Догруженная вверх страница не должна тут же выбрасываться, когда список
