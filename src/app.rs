@@ -540,6 +540,23 @@ impl App {
         // вверх циклично показывала одно и то же.
         let mut incoming = incoming;
         incoming.reverse();
+        // Догрузка вверх, пришедшая в пустой список, — это страница из
+        // середины истории, а не содержимое канала. Сценарий: канал открыт,
+        // ушла догрузка вверх, пользователь ушёл и вернулся (`open_channel`
+        // чистит список), а поздний ответ ложится в пустое. Канал показывал бы
+        // 50 сообщений из середины без новых, и восстановиться можно было бы
+        // только перезаходом — молча.
+        if prepend && !self.messages.contains_key(channel_id) {
+            let cid_short: String = channel_id.chars().take(14).collect();
+            self.push_debug(format!(
+                "Dropping stale older page for {}: list was cleared, asking first page again",
+                cid_short
+            ));
+            // Просим первую страницу заново: с неё список и должен начинаться.
+            // Флаги не трогаем — спиннер первой страницы ещё должен гореть.
+            self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
+            return;
+        }
         let added = {
             let entry = self.messages.entry(channel_id.to_string()).or_default();
             if prepend {
@@ -1781,6 +1798,94 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// Догрузка вверх, пришедшая после ухода из канала, не должна выдавать
+/// середину истории за содержимое канала.
+///
+/// Сценарий: открыт A, ушла догрузка вверх, пользователь ушёл на B и вернулся
+/// на A (`open_channel` чистит список и просит первую страницу), после чего
+/// приходит поздняя `HistoryMore(A)`. Раньше она вставлялась в ПУСТОЙ список
+/// как есть: канал показывал 50 сообщений из середины, новых не было вовсе,
+/// и восстановиться можно было только перезаходом — молча.
+#[test]
+    fn stale_older_page_into_cleared_list_asks_first_page_again() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        for id in ["c1", "c2"] {
+            app.channels.push(ChatChannel {
+                id: id.into(),
+                name: "chan".into(),
+                guild_id: None,
+                channel_type: 1,
+                topic: None,
+                position: 0,
+            });
+        }
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+        // Первая страница пришла, потом ушла догрузка вверх.
+        let first: Vec<ChatMessage> = (1..=crate::gateway::HISTORY_PAGE)
+            .rev()
+            .map(|i| test_msg(&format!("m{i}"), "c1", "x"))
+            .collect();
+        tx.send(ToApp::History { channel_id: "c1".into(), messages: first, more: true }).unwrap();
+        app.poll(&ctx);
+        app.request_older_history();
+        assert!(app.history_loading_more);
+
+        // Пользователь ушёл на другой канал (список прежнего выбрасывается) и
+        // вернулся: теперь ждём первую страницу, а список пуст.
+        app.selected_channel = Some(1);
+        app.open_channel("c2");
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+        assert!(app.messages.get("c1").is_none(), "open_channel чистит список канала");
+
+        // Пришла поздняя догрузка вверх — со страницы, запрошенной до ухода.
+        let older: Vec<ChatMessage> = (200..200 + crate::gateway::HISTORY_PAGE)
+            .rev()
+            .map(|i| test_msg(&format!("m{i}"), "c1", "старое"))
+            .collect();
+        tx.send(ToApp::HistoryMore { channel_id: "c1".into(), messages: older, more: true }).unwrap();
+        app.poll(&ctx);
+
+        assert!(
+            app.messages.get("c1").is_none_or(|v| v.is_empty()),
+            "середина истории не должна показываться как содержимое канала: {:?}",
+            app.messages.get("c1").map(|v| v.len())
+        );
+        // Вместо этого запрошена первая страница — с неё список и начинается.
+        let asked: Vec<ToGateway> = std::iter::from_fn(|| cmd_rx.try_recv().ok()).collect();
+        assert!(
+            asked.iter().any(|c| matches!(c, ToGateway::FetchHistory { before: None, .. })),
+            "нужно попросить первую страницу заново, а не показывать середину: {asked:?}"
+        );
+        // Спиннер первой страницы не должен погаснуть: он ждёт этой самой страницы.
+        assert_eq!(app.history_loading.as_deref(), Some("c1"), "спиннер гасить рано");
+    }
+
+    /// Тот же случай для чужого канала: его страница тоже не должна попасть в
+    /// наш список, иначе в чате появились бы сообщения не из того канала.
+    #[test]
+    fn stale_older_page_of_other_channel_is_dropped() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.selected_channel = None;
+        let page: Vec<ChatMessage> = (1..=5).rev().map(|i| test_msg(&format!("m{i}"), "c9", "x")).collect();
+        tx.send(ToApp::HistoryMore { channel_id: "c9".into(), messages: page, more: true }).unwrap();
+        app.poll(&ctx);
+        assert!(
+            app.messages.get("c9").is_none_or(|v| v.is_empty()),
+            "поздняя догрузка в пустой список чужих сообщений класть нельзя"
+        );
     }
 
     /// Неудачная отправка: сообщение не должно остаться в чате навсегда.

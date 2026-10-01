@@ -784,7 +784,12 @@ async fn gw_inner(
     let http = api_client()?;
     let tkn = token.to_string();
     // Каналы, история которых уже грузится: защита от дублей при кликах.
-    let history_inflight = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    // Каналы и страницы, история которых уже грузится: защита от дублей при
+    // кликах. Ключ — (канал, запрошенная страница): повтор той же страницы
+    // действительно лишний, а вот первая страница и догрузка вверх — разные
+    // запросы, и раньше вторая отбрасывалась как дубль первой.
+    let history_inflight =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<(String, Option<String>)>::new()));
     let mut heartbeat = time::interval(Duration::from_millis(interval));
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
@@ -1187,19 +1192,27 @@ async fn gw_inner(
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
                         let cid = channel_id.clone();
+                        // Ключ защиты — пара (канал, страница), а не один
+                        // канал. Догрузка вверх и повторное открытие канала —
+                        // это РАЗНЫЕ страницы, и раньше вторая отбрасывалась
+                        // как дубль первой: запрос первой страницы уходил в
+                        // никуда, спиннер не гас, а пришедшая потом догрузка
+                        // ложилась в пустой список (Б-17).
+                        let key = (cid.clone(), before.clone());
+                        let cid_short: String = cid.chars().take(14).collect();
                         tokio::spawn(async move {
                             {
                                 let mut busy = inflight.lock().await;
-                                if !busy.insert(cid.clone()) {
+                                if !busy.insert(key.clone()) {
                                     let _ = ev.send(ToApp::Debug(format!(
                                         "History for {} already in flight, skipping",
-                                        &cid[..cid.len().min(14)]
+                                        cid_short
                                     )));
                                     return;
                                 }
                             }
                             fetch_history_page(httpc, tkc, ev.clone(), cid.clone(), before).await;
-                            inflight.lock().await.remove(&cid);
+                            inflight.lock().await.remove(&key);
                         });
                     }
                     ToGateway::OpenDM { user_id } => {
