@@ -133,6 +133,134 @@ struct SessionState {
 /// Discord — первые 50 сообщений сразу, дальше по мере прокрутки вверх.
 pub(crate) const HISTORY_PAGE: usize = 50;
 
+/// Отправить сообщение в канал.
+///
+/// Отдельная задача, а не тело цикла гейтвея: пока идёт POST, цикл должен
+/// крутиться — принимать события, heartbeat'ы и следующие команды. Раньше
+/// отправка стояла прямо в цикле, и на всё время запроса клиент не получал
+/// ни новых сообщений, ни кликов по каналам. Таймаут у клиента обязателен
+/// (он задаётся при сборке клиента в `gw_inner`): без него зависший POST
+/// останавливал гейтвей навсегда.
+async fn send_message(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: mpsc::UnboundedSender<ToApp>,
+    channel_id: String,
+    content: String,
+) {
+    let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
+    send_message_to(httpc, tkn, event_tx, url, content).await;
+}
+
+/// Клиент для запросов к Discord API.
+///
+/// Таймаут здесь обязателен, а не украшение: `Client::new()` ждёт бесконечно,
+/// и один зависший POST (сеть умерла на полпути, сервер не отвечает) держал
+/// гейтвей в состоянии «подключён» и не давал переподключиться. Раньше это
+/// случалось и без всяких зависаний — пока запрос шёл, цикл гейтвея не
+/// крутился вовсе.
+/// Сколько ждём ответа Discord API. Обрываться надо и с зависшей сетью:
+/// пока запрос не вернулся, гейтвей не может ни переподключиться, ни принять
+/// следующую команду. Проверяется тестом `stalled_post_gives_up_instead_of_
+/// hanging` на настоящем сокете, который не отвечает.
+const API_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn api_client() -> Result<reqwest::Client, String> {
+    client_with_timeout(API_TIMEOUT)
+}
+
+fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("не собрать HTTP-клиент: {}", e))
+}
+
+/// Отправить сообщение по готовому адресу. URL вынесен отдельным аргументом
+/// ради теста: зависший ответ должен обрываться по таймауту, и проверить это
+/// можно только на настоящем сокете, который не отвечает — а подставить
+/// localhost вместо discord.com иначе нечем.
+async fn send_message_to(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: mpsc::UnboundedSender<ToApp>,
+    url: String,
+    content: String,
+) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default();
+    let req = httpc
+        .post(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+        .json(&json!({ "content": content, "nonce": nonce }));
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let _ = event_tx.send(ToApp::Debug(format!("Send failed {}: {}", status, body)));
+            } else {
+                let _ = event_tx.send(ToApp::Debug("Message sent".into()));
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Send error: {}", e)));
+        }
+    }
+}
+
+/// Открыть личный чат с пользователем. Отдельная задача по той же причине,
+/// что и `send_message`: сетевой запрос не должен держать цикл гейтвея.
+async fn open_dm(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: mpsc::UnboundedSender<ToApp>,
+    user_id: String,
+) {
+    let url = format!("{}/users/@me/channels", API_BASE);
+    let req = httpc
+        .post(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+        .json(&json!({ "recipient_id": user_id }));
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let _ = event_tx.send(ToApp::Debug(format!("Open DM failed {}", status)));
+                return;
+            }
+            let Ok(body) = resp.text().await else { return };
+            let Ok(d) = serde_json::from_str::<Value>(&body) else { return };
+            let recipient = d["recipients"].as_array()
+                .and_then(|r| r.first())
+                .and_then(|r| r["username"].as_str())
+                .unwrap_or("DM")
+                .to_string();
+            let _ = event_tx.send(ToApp::DMChannel(ChatChannel {
+                id: d["id"].as_str().unwrap_or("").to_string(),
+                name: recipient,
+                guild_id: None,
+                channel_type: 1,
+                topic: None,
+                position: 0,
+            }));
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Open DM error: {}", e)));
+        }
+    }
+}
+
 /// Загрузить одну страницу истории и отдать её в UI.
 ///
 /// `before` — самый старый id, который уже есть на экране: Discord отдаёт
@@ -618,7 +746,9 @@ async fn gw_inner(
         let _ = raw_tx.send(EOF_MARK.to_string());
     });
 
-    let http = reqwest::Client::new();
+    // Клиент обязателен с таймаутом, иначе зависший POST останавливает гейтвей
+    // навсегда (см. `api_client`).
+    let http = api_client()?;
     let tkn = token.to_string();
     // Каналы, история которых уже грузится: защита от дублей при кликах.
     let history_inflight = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
@@ -1000,28 +1130,17 @@ async fn gw_inner(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ToGateway::Send { channel_id, content } => {
-                        let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-                        let req = http.post(&url)
-                            .header("Authorization", &*tkn)
-                            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                            .header("X-Super-Properties", &super_props())
-                            .header("X-Discord-Locale", "en-US")
-                            .header("X-Discord-Timezone", "Europe/Moscow")
-                            .json(&json!({ "content": content, "nonce": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string() }));
-                        match req.send().await {
-                            Ok(resp) => {
-                                let status = resp.status();
-                                if !status.is_success() {
-                                    let body = resp.text().await.unwrap_or_default();
-                                    let _ = event_tx.send(ToApp::Debug(format!("Send failed {}: {}", status, body)));
-                                } else {
-                                    let _ = event_tx.send(ToApp::Debug("Message sent".into()));
-                                }
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(ToApp::Debug(format!("Send error: {}", e)));
-                            }
-                        }
+                        // Отправку тоже уводим из цикла в отдельную задачу.
+                        // Пока идёт POST, гейтвей не читает события и не
+                        // берёт команды: сообщение, пришедшее в это время,
+                        // задерживалось на всё время запроса (а без
+                        // таймаута — навсегда).
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            send_message(httpc, tkc, ev, channel_id, content).await;
+                        });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {
                         // Историю тянем отдельной задачей. Раньше загрузка шла
@@ -1051,46 +1170,14 @@ async fn gw_inner(
                         });
                     }
                     ToGateway::OpenDM { user_id } => {
-                        let url = format!("{}/users/@me/channels", API_BASE);
-                        let req = http.post(&url)
-                            .header("Authorization", &*tkn)
-                            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                            .header("X-Super-Properties", &super_props())
-                            .header("X-Discord-Locale", "en-US")
-                            .header("X-Discord-Timezone", "Europe/Moscow")
-                            .json(&json!({ "recipient_id": user_id }));
-                        match req.send().await {
-                            Ok(resp) => {
-                                let status = resp.status();
-                                if status.is_success() {
-                                    match resp.text().await {
-                                        Ok(body) => {
-                                            if let Ok(d) = serde_json::from_str::<Value>(&body) {
-                                                let recipient = d["recipients"].as_array()
-                                                    .and_then(|r| r.first())
-                                                    .and_then(|r| r["username"].as_str())
-                                                    .unwrap_or("DM")
-                                                    .to_string();
-                                                let _ = event_tx.send(ToApp::DMChannel(ChatChannel {
-                                                    id: d["id"].as_str().unwrap_or("").to_string(),
-                                                    name: recipient,
-                                                    guild_id: None,
-                                                    channel_type: 1,
-                                                    topic: None,
-                                                    position: 0,
-                                                }));
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
-                                } else {
-                                    let _ = event_tx.send(ToApp::Debug(format!("Open DM failed {}", status)));
-                                }
-                            }
-Err(e) => {
-                                    let _ = event_tx.send(ToApp::Debug(format!("Open DM error: {}", e)));
-}
-                        }
+                        // Тот же случай, что и с отправкой: запрос в цикле
+                        // гейтвея замораживал его на всё время ожидания.
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            open_dm(httpc, tkc, ev, user_id).await;
+                        });
                     }
                     ToGateway::Shutdown => {
                         let _ = event_tx.send(ToApp::Debug("Shutdown requested".into()));
@@ -1104,6 +1191,68 @@ Err(e) => {
 
     Ok(())
 
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::{api_client, client_with_timeout, send_message_to, API_TIMEOUT};
+    use crate::messages::ToApp;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// У клиента гейтвея обязан быть разумный таймаут. `Client::new()` ждёт
+    /// бесконечно: один зависший запрос держал гейтвей в состоянии
+    /// «подключён» и не давал переподключиться.
+    #[test]
+    fn api_client_has_a_sane_timeout() {
+        assert!(API_TIMEOUT > Duration::from_secs(1), "слишком часто обрывать");
+        assert!(
+            API_TIMEOUT < Duration::from_secs(60),
+            "настоящий ответ Discord столько не ждёт, а гейтвей столько молчит"
+        );
+        assert!(api_client().is_ok(), "клиент должен собираться");
+    }
+
+    /// Отправка не должна висеть на сервере, который принял соединение и
+    /// замолчал. Проверяется на настоящем сокете: подменить его конусом
+    /// моков и убедиться, что запрос ушёл, нельзя — а именно тут всё и ломалось.
+    #[test]
+    fn stalled_post_gives_up_instead_of_hanging() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Сервер принимает соединение и не отвечает никогда. Сокет держим открытым
+        // всё это время: если его сразу бросить, клиент увидит обрыв и
+        // закончит запрос с ошибкой без всякого таймаута — тест прошёл бы на
+        // сломанном коде.
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Таймаут уменьшен, чтобы тест не ждал двадцать секунд; смысл тот же.
+        let client = client_with_timeout(Duration::from_millis(300)).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = std::time::Instant::now();
+        rt.block_on(send_message_to(
+            client,
+            "токен".into(),
+            tx,
+            format!("http://{}/channels/1/messages", addr),
+            "привет".into(),
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "зависший POST должен обрываться, а не ждать: {:?}",
+            started.elapsed()
+        );
+        // И пользователю об этом должна уйти строка, а не тишина.
+        match rx.try_recv() {
+            Ok(ToApp::Debug(d)) => assert!(d.starts_with("Send error"), "получено: {d:?}"),
+            other => panic!("ожидалась ошибка отправки, получено: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
