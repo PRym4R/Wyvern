@@ -402,6 +402,16 @@ impl App {
                         }
                     }
                 }
+                ToApp::MessageUpdated(msg) => self.update_message(msg),
+                ToApp::MessageDeleted { channel_id, message_id } => {
+                    self.delete_message(&channel_id, &message_id)
+                }
+                ToApp::MessageDeletedBulk { channel_id, message_ids } => {
+                    self.delete_messages(&channel_id, &message_ids)
+                }
+                ToApp::ChannelUpdated { channel_id, name, topic } => {
+                    self.update_channel(&channel_id, name, topic)
+                }
                 ToApp::History { channel_id, messages, more } => {
                     self.apply_history(&channel_id, messages, more, false);
                 }
@@ -906,6 +916,70 @@ impl App {
             &t[11..16]
         } else {
             iso
+        }
+    }
+    /// Правка сообщения: обновляем строку с тем же id. Discord шлёт не полный
+    /// объект, а только изменившиеся поля (у правки текста — `content`, у
+    /// обновления эмбеда — `embeds`), поэтому пустые значения не затирают
+    /// старые: иначе обновление эмбеда стёрло бы текст. Высота из кэша
+    /// сбрасывается: текст мог стать длиннее (Т-8).
+    pub(crate) fn update_message(&mut self, msg: ChatMessage) {
+        let id = msg.id.clone();
+        let mut changed = false;
+        if let Some(entry) = self.messages.get_mut(&msg.channel_id) {
+            if let Some(slot) = entry.iter_mut().find(|m| m.id == id) {
+                let old = Arc::make_mut(slot);
+                if !msg.content.is_empty() {
+                    old.content = msg.content;
+                }
+                if !msg.author_name.is_empty() {
+                    old.author_name = msg.author_name;
+                }
+                if !msg.attachments.is_empty() {
+                    old.attachments = msg.attachments;
+                }
+                if !msg.embeds.is_empty() {
+                    old.embeds = msg.embeds;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.msg_heights.remove(&id);
+        }
+    }
+    /// Удаление одного сообщения: убираем строку и её высоту из кэша, иначе
+    /// удалённое сообщение оставалось бы видимым до перезахода (Т-8).
+    pub(crate) fn delete_message(&mut self, channel_id: &str, message_id: &str) {
+        if let Some(entry) = self.messages.get_mut(channel_id) {
+            entry.retain(|m| m.id != message_id);
+        }
+        self.msg_heights.remove(message_id);
+    }
+    /// Пакетное удаление: одно событие на пачку id, а не N событий (Т-8).
+    pub(crate) fn delete_messages(&mut self, channel_id: &str, ids: &[String]) {
+        if let Some(entry) = self.messages.get_mut(channel_id) {
+            entry.retain(|m| !ids.iter().any(|id| id == &m.id));
+        }
+        for id in ids {
+            self.msg_heights.remove(id);
+        }
+    }
+    /// Смена имени или темы канала. Заголовок чата берёт их из `self.channels`,
+    /// поэтому без обработчика старое имя висело до перезахода (Т-8).
+    pub(crate) fn update_channel(
+        &mut self,
+        channel_id: &str,
+        name: Option<String>,
+        topic: Option<String>,
+    ) {
+        if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+            if let Some(n) = name {
+                ch.name = n;
+            }
+            if let Some(t) = topic {
+                ch.topic = Some(t);
+            }
         }
     }
     /// Забирает сообщения открытого канала на время кадра.
@@ -2737,5 +2811,139 @@ mod layout_tests {
         assert_eq!(log.len(), 100, "журнал не должен превышать сто строк");
         assert_eq!(log.front().map(String::as_str), Some("строка 50"));
         assert_eq!(log.back().map(String::as_str), Some("строка 149"));
+    }
+
+    /// Правка сообщения видна сразу, без перезахода в канал: раньше
+    /// MESSAGE_UPDATE не обрабатывался вовсе.
+    #[test]
+    fn edit_replaces_message_text() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.messages.insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "до правки"))]);
+        app.msg_heights.insert("m1".into(), 40.0);
+
+        let mut edited = test_msg("m1", "c1", "после правки");
+        edited.author_name = String::new();
+        tx.send(ToApp::MessageUpdated(edited)).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 1, "правка не должна добавлять вторую строку");
+        assert_eq!(msgs[0].content, "после правки");
+        assert!(
+            !app.msg_heights.contains_key("m1"),
+            "высота правленой строки должна быть сброшена"
+        );
+    }
+
+    /// Discord шлёт в MESSAGE_UPDATE только изменившиеся поля, поэтому
+    /// обновление эмбеда не должно стирать текст сообщения.
+    #[test]
+    fn partial_edit_keeps_old_text() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.messages.insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "текст остаётся"))]);
+
+        let mut update = test_msg("m1", "c1", "");
+        update.author_name = String::new();
+        update.embeds.push(crate::models::Embed {
+            description: Some("превью".into()),
+            ..Default::default()
+        });
+        tx.send(ToApp::MessageUpdated(update)).unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs[0].content, "текст остаётся", "частичная правка не должна стирать текст");
+        assert_eq!(msgs[0].embeds.len(), 1, "эмбед из правки должен примениться");
+    }
+
+    /// Удалённое сообщение уходит из списка сразу, а не после перезахода.
+    #[test]
+    fn delete_removes_message_and_height() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.messages.insert(
+            "c1".into(),
+            vec![
+                Arc::new(test_msg("m1", "c1", "первое")),
+                Arc::new(test_msg("m2", "c1", "второе")),
+            ],
+        );
+        app.msg_heights.insert("m1".into(), 30.0);
+
+        tx.send(ToApp::MessageDeleted {
+            channel_id: "c1".into(),
+            message_id: "m1".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m2");
+        assert!(!app.msg_heights.contains_key("m1"), "высота удалённой строки не нужна");
+    }
+
+    /// Пакетное удаление приходит одним событием, а не N событиями.
+    #[test]
+    fn bulk_delete_removes_all_listed() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.messages.insert(
+            "c1".into(),
+            vec![
+                Arc::new(test_msg("m1", "c1", "a")),
+                Arc::new(test_msg("m2", "c1", "b")),
+                Arc::new(test_msg("m3", "c1", "c")),
+            ],
+        );
+
+        tx.send(ToApp::MessageDeletedBulk {
+            channel_id: "c1".into(),
+            message_ids: vec!["m1".into(), "m3".into()],
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        let msgs = app.messages.get("c1").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m2");
+    }
+
+    /// Переименование канала видно в заголовке сразу, а отсутствующая в
+    /// событии тема не должна затирать прежнюю.
+    #[test]
+    fn channel_update_renames_channel() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "старое".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: Some("тема".into()),
+            position: 0,
+        });
+
+        tx.send(ToApp::ChannelUpdated {
+            channel_id: "c1".into(),
+            name: Some("новое".into()),
+            topic: None,
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert_eq!(app.channels[0].name, "новое");
+        assert_eq!(
+            app.channels[0].topic.as_deref(),
+            Some("тема"),
+            "отсутствующая тема не должна затираться"
+        );
     }
 }

@@ -1160,6 +1160,43 @@ async fn gw_inner(
                                     let _ = event_tx.send(ToApp::Message(msg));
                                 }
                             }
+                            "MESSAGE_UPDATE" => {
+                                // Правка приходит полным объектом сообщения —
+                                // тем же разбором, что и создание (Т-8).
+                                if let Some(msg) = parse_message_value(&v["d"], "") {
+                                    let _ = event_tx.send(ToApp::MessageUpdated(msg));
+                                }
+                            }
+                            "MESSAGE_DELETE" => {
+                                let d = &v["d"];
+                                let _ = event_tx.send(ToApp::MessageDeleted {
+                                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+                                    message_id: d["id"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
+                            "MESSAGE_DELETE_BULK" => {
+                                let d = &v["d"];
+                                let ids: Vec<String> = d["ids"]
+                                    .as_array()
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let _ = event_tx.send(ToApp::MessageDeletedBulk {
+                                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+                                    message_ids: ids,
+                                });
+                            }
+                            "CHANNEL_UPDATE" => {
+                                let d = &v["d"];
+                                let _ = event_tx.send(ToApp::ChannelUpdated {
+                                    channel_id: d["id"].as_str().unwrap_or("").to_string(),
+                                    name: d["name"].as_str().map(|s| s.to_string()),
+                                    topic: d["topic"].as_str().map(|s| s.to_string()),
+                                });
+                            }
                             "GUILD_CREATE" => {
                                 let d = &v["d"];
                                 let guild = Guild {

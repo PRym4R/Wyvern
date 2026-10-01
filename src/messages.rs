@@ -4,6 +4,18 @@ use crate::models::{ChatChannel, ChatMessage, Guild, UserProfile};
 pub(crate) enum ToApp {
     Ready { username: String, user_id: String, avatar: Option<String> },
     Message(ChatMessage),
+    /// Сообщение отредактировали. Discord шлёт полный объект, поэтому старую
+    /// строку с тем же id просто подменяем. Без обработчика правка была видна
+    /// только после перезахода в канал — выглядело как «клиент не обновился».
+    MessageUpdated(ChatMessage),
+    /// Сообщение удалили. Убираем строку по id; высота из кэша тоже уходит,
+    /// иначе она осталась бы висеть после удаления (Т-8).
+    MessageDeleted { channel_id: String, message_id: String },
+    /// Пакетное удаление: одно событие на несколько id, а не N событий.
+    MessageDeletedBulk { channel_id: String, message_ids: Vec<String> },
+    /// В канале сменили имя или тему. Показывается в заголовке чата; без
+    /// обработчика старое имя висело до перезахода.
+    ChannelUpdated { channel_id: String, name: Option<String>, topic: Option<String> },
     /// Первая страница истории канала: она заменяет то, что уже есть.
     /// `more` — есть ли что подгружать вверх при прокрутке.
     ///
