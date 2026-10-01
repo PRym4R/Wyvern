@@ -78,6 +78,13 @@ impl App {
                                 .hint_text("Type a message and press Enter, or click Send...")
                                 .margin(egui::Margin::symmetric(12, 8)),
                         );
+                        // Т-9: любая правка поля снимает защиту от повторной
+                        // отправки того же текста зажатым Enter. Ставим это до
+                        // проверки Enter, чтобы набор и Enter в одном кадре не
+                        // блокировали друг друга.
+                        if resp.changed() {
+                            self.input_dirty = true;
+                        }
                         let send_btn = ui.add_sized(
                             [84.0, 36.0],
                             egui::Button::new(RichText::new("Send").size(14.0).color(Color32::WHITE))
@@ -87,7 +94,10 @@ impl App {
                         let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let send_clicked = send_btn.clicked();
 
-                        if enter_pressed || send_clicked {
+                        if enter_pressed {
+                            self.submit_from_enter();
+                            resp.request_focus();
+                        } else if send_clicked {
                             self.submit_input();
                             resp.request_focus();
                         }
@@ -146,8 +156,31 @@ impl App {
         let text = trim_input(&self.input).to_string();
         if !text.is_empty() {
             self.handle_input(&text);
+            // Запоминаем, что ушло, и сбрасываем признак правки: повторная
+            // отправка того же текста без правок теперь блокируется (Т-9).
+            self.last_submitted = Some(text);
+            self.input_dirty = false;
         }
         self.input.clear();
+    }
+
+    /// Enter: то же, что `submit_input`, но зажатая клавиша (автоповтор) не
+    /// должна слать одно и то же повторно.
+    ///
+    /// Текст, вернувшийся в поле после неудачной отправки, при зажатом Enter
+    /// уходил бы снова и снова: каждая попытка заканчивалась отказом, текст
+    /// возвращался, и в лог Discord летела пачка одинаковых сообщений. Пока
+    /// поле не изменили, повтор не отправляем — и НЕ чистим поле, иначе
+    /// человек потерял бы восстановленный текст.
+    pub(crate) fn submit_from_enter(&mut self) {
+        let text = trim_input(&self.input).to_string();
+        if !text.is_empty()
+            && self.last_submitted.as_deref() == Some(text.as_str())
+            && !self.input_dirty
+        {
+            return;
+        }
+        self.submit_input();
     }
 
     /// Отладочная команда из поля сообщения. Первое нажатие только спрашивает
@@ -242,6 +275,36 @@ mod tests {
         let sent_before = app.messages["c1"].len();
         app.submit_input();
         assert_eq!(app.messages["c1"].len(), sent_before, "пустое поле не должно ничего слать");
+    }
+
+    /// Зажатый Enter не должен слать один и тот же текст пачками: после
+    /// неудачной отправки текст возвращается в поле, и автоповтор отправлял бы
+    /// его снова и снова. Пока поле не изменили, повтор игнорируется, а текст
+    /// из поля при этом не пропадает.
+    #[test]
+    fn held_enter_does_not_resend_restored_text() {
+        let (mut app, _ctx) = narrow_app();
+        app.input = "привет".to_string();
+        app.input_dirty = true; // пользователь набрал текст
+        app.submit_from_enter();
+        assert_eq!(app.messages["c1"].len(), 1, "первый Enter должен отправить");
+
+        // Неудачная отправка вернула тот же текст, клавиша всё ещё зажата.
+        app.input = "привет".to_string();
+        app.input_dirty = false;
+        app.submit_from_enter();
+        assert_eq!(
+            app.messages["c1"].len(),
+            1,
+            "повтор того же текста зажатым Enter не должен уйти второй раз"
+        );
+        assert_eq!(app.input, "привет", "заблокированный Enter не должен стирать поле");
+
+        // Пользователь поправил текст — отправка снова работает.
+        app.input = "привет!".to_string();
+        app.input_dirty = true;
+        app.submit_from_enter();
+        assert_eq!(app.messages["c1"].len(), 2);
     }
 
     /// Приложение с открытым каналом в самом узком поддерживаемом окне.
