@@ -4,6 +4,20 @@ use crate::app::App;
 use crate::messages::ToGateway;
 
 impl App {
+    /// Клик по кнопке «@»: только снимок выделения сервера и канала.
+    ///
+    /// Раньше здесь же переключался вид «Друзья / личные сообщения», то есть
+    /// подпись «домой» не соответствовала действию: нажал «домой», чтобы
+    /// вернуться к списку личных сообщений, а попал в «Друзей», и обратное
+    /// нажатие увело в третий экран.
+    pub(crate) fn go_home(&mut self) {
+        self.selected_guild = None;
+        self.selected_channel = None;
+    }
+    /// Переключение вида в боковой панели: отдельная кнопка «Friends / DMs».
+    pub(crate) fn set_friends_view(&mut self, show_friends: bool) {
+        self.show_friends = show_friends;
+    }
     pub(crate) fn draw_server_list(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("servers")
             .resizable(false)
@@ -20,10 +34,9 @@ impl App {
                             .corner_radius(24.0),
                     );
                     if home_btn.clicked() {
-                        self.selected_guild = None;
-                        self.selected_channel = None;
-                        self.show_friends = !self.show_friends;
+                        self.go_home();
                     }
+                    home_btn.on_hover_text("Direct messages");
                 });
                 ui.add_space(4.0);
                 ui.separator();
@@ -177,6 +190,27 @@ impl App {
                         });
                     }
                     None => {
+                        // Переключатель «Друзья / Личные сообщения». Раньше он
+                        // был спрятан в кнопке «@»: тот по клику сбрасывал
+                        // выделение сервера И переключал вид, так что два
+                        // нажатия «домой» уводили не туда, куда человек шёл.
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for (label, want_friends) in [("Friends", true), ("DMs", false)] {
+                                let active = self.show_friends == want_friends;
+                                let color = if active { Color32::WHITE } else { self.theme.text_secondary };
+                                let fill = if active { self.theme.accent } else { Color32::TRANSPARENT };
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width() / 2.0 - 4.0, 28.0],
+                                        egui::Button::new(RichText::new(label).size(13.0).color(color)).fill(fill),
+                                    )
+                                    .clicked()
+                                {
+                                    self.set_friends_view(want_friends);
+                                }
+                            }
+                        });
                         if self.show_friends {
                             ui.add_space(12.0);
                             ui.label(RichText::new("Friends").strong().size(15.0).color(self.theme.text));
@@ -254,5 +288,45 @@ impl App {
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Кнопка «@» подписана «домой»: клик должен только снимать выделение
+    /// сервера. Раньше она заодно переключала вид «Друзья / личные
+    /// сообщения», и человек, нажавший «домой» дважды подряд, оказывался
+    /// в другом экране, чем собирался.
+    #[test]
+    fn home_button_only_drops_the_server_selection() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.selected_guild = Some(2);
+        app.selected_channel = Some(5);
+        app.show_friends = false;
+
+        app.go_home();
+
+        assert!(app.selected_guild.is_none(), "выделение сервера должно сброситься");
+        assert!(app.selected_channel.is_none(), "выделение канала должно сброситься");
+        assert!(!app.show_friends, "«@» не должен переключать вид «Друзья / личные сообщения»");
+    }
+
+    /// Вид переключается отдельной кнопкой — и только им.
+    #[test]
+    fn friends_view_has_its_own_switch() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.selected_guild = Some(0);
+        app.selected_channel = Some(1);
+
+        app.set_friends_view(true);
+        assert!(app.show_friends);
+        app.set_friends_view(false);
+        assert!(!app.show_friends);
+        // Переключение вида не выкидывает пользователя из открытого канала.
+        assert_eq!(app.selected_channel, Some(1), "переключатель вида не должен сбрасывать выбор");
     }
 }
