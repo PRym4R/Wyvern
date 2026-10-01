@@ -85,7 +85,40 @@ fn close_fatal_reason(code: u16) -> Option<&'static str> {
 
 /// Достать код закрытия из служебного сообщения задачи чтения.
 fn close_code_of(raw: &str) -> Option<u16> {
-    raw.strip_prefix("__CLOSE__")?.parse().ok()
+    raw.strip_prefix(CLOSE_MARK)?.parse().ok()
+}
+
+/// Служебные метки от задачи чтения вебсокета. Читаем мы в отдельной задаче:
+/// закрытие и конец потока видит она, а цикл гейтвея — нет, и без меток тот
+/// узнавал бы об этом только по неудачным heartbeat'ам.
+const CLOSE_MARK: &str = "__CLOSE__";
+const WS_ERROR_MARK: &str = "__WS_ERROR__";
+/// Сервер закрыл соединение молча, без close-фрейма.
+const EOF_MARK: &str = "__EOF__";
+
+/// Что прислала задача чтения: событие Discord или одна из служебных меток.
+enum RawFrame {
+    /// Событие Discord — разбираем как JSON.
+    Event,
+    /// Закрытие с кодом (0 — код не прислали).
+    Closed(u16),
+    /// Поток кончился без close-фрейма: обычный обрыв, заходим заново.
+    Eof,
+    /// Ошибка чтения.
+    WsError(String),
+}
+
+fn classify_raw(raw: &str) -> RawFrame {
+    if raw == EOF_MARK {
+        return RawFrame::Eof;
+    }
+    if let Some(code) = close_code_of(raw) {
+        return RawFrame::Closed(code);
+    }
+    if let Some(e) = raw.strip_prefix(WS_ERROR_MARK) {
+        return RawFrame::WsError(e.to_string());
+    }
+    RawFrame::Event
 }
 
 #[derive(Default)]
@@ -570,11 +603,19 @@ async fn gw_inner(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    let _ = raw_tx.send(format!("__WS_ERROR__{}", e));
+                    let _ = raw_tx.send(format!("{}{}", WS_ERROR_MARK, e));
                     break;
                 }
             }
         }
+        // Поток от сервера кончился. Если это был close-фрейм, цикл гейтвея
+        // уже ушёл по нему; а вот молчаливый конец (сервер закрыл соединение
+        // без кода) раньше просто обрывал чтение и оставлял гейтвей жить: тот
+        // продолжал слать heartbeat'ы в мёртвый сокет, пока не набирал пять
+        // неудач подряд — это минуты вместо трёх секунд, и всё это время
+        // клиент молчал, ничем не показывая, что связи нет. Метка нужна, чтобы
+        // цикл узнал об этом сразу.
+        let _ = raw_tx.send(EOF_MARK.to_string());
     });
 
     let http = reqwest::Client::new();
@@ -604,8 +645,8 @@ async fn gw_inner(
                 let _ = write.send(ws_msg).await;
             }
             Some(raw) = raw_rx.recv() => {
-                if let Some(code) = close_code_of(&raw) {
-                    match close_fatal_reason(code) {
+                match classify_raw(&raw) {
+                    RawFrame::Closed(code) => match close_fatal_reason(code) {
                         // Отказ в самом токене: повтор не поможет. Помечаем
                         // ошибку как фатальную, и `run_gateway` вернёт клиент
                         // на экран входа вместо бесконечного переподключения.
@@ -622,11 +663,20 @@ async fn gw_inner(
                             let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed: {}", code)));
                             return Err("websocket closed".into());
                         }
+                    },
+                    // Поток кончился молча. Раньше чтение просто обрывалось,
+                    // гейтвей оставался в живых и слал heartbeat'ы в мёртвый
+                    // сокет, пока не набирал пять неудач подряд, — минуты
+                    // молчания вместо трёх секунд переподключения.
+                    RawFrame::Eof => {
+                        let _ = event_tx.send(ToApp::Debug("WebSocket stream ended".into()));
+                        return Err("websocket closed".into());
                     }
-                }
-                if raw.starts_with("__WS_ERROR__") {
-                    let _ = event_tx.send(ToApp::Debug(format!("WebSocket error: {}", &raw[11..])));
-                    return Err("websocket error".into());
+                    RawFrame::WsError(e) => {
+                        let _ = event_tx.send(ToApp::Debug(format!("WebSocket error: {}", e)));
+                        return Err("websocket error".into());
+                    }
+                    RawFrame::Event => {}
                 }
 
                 let v: Value = match serde_json::from_str(&raw) {
@@ -1058,7 +1108,7 @@ Err(e) => {
 
 #[cfg(test)]
 mod close_tests {
-    use super::{close_code_of, close_fatal_reason};
+    use super::{close_code_of, close_fatal_reason, classify_raw, RawFrame, EOF_MARK, WS_ERROR_MARK};
 
     /// Коды, которыми Discord отказывает в самом токене или подписках,
     /// означают, что повторное подключение ничего не изменит. Их надо
@@ -1096,6 +1146,31 @@ mod close_tests {
         assert_eq!(close_code_of("{\"op\":0}"), None);
         // Мусор вместо кода не должен превращаться в «фатально».
         assert_eq!(close_code_of("__CLOSE__мусор"), None);
+    }
+
+    /// Молчаливый конец потока (сервер закрыл соединение без close-фрейма)
+    /// обязан отличаться от обычного события. Раньше чтение просто обрывалось,
+    /// гейтвей оставался в живых и слал heartbeat'ы в мёртвый сокет, пока не
+    /// набирал пять неудач подряд, — минуты молчания вместо трёх секунд
+    /// переподключения.
+    #[test]
+    fn silent_end_of_stream_is_recognised() {
+        assert!(matches!(classify_raw(EOF_MARK), RawFrame::Eof));
+        // Метка обязана быть ровно такой, какую шлёт задача чтения: опечатка
+        // здесь тихо отключила бы переподключение.
+        assert!(matches!(classify_raw(super::EOF_MARK), RawFrame::Eof));
+    }
+
+    /// Остальные служебные метки не должны путаться с событиями Discord.
+    #[test]
+    fn other_frames_stay_distinct() {
+        assert!(matches!(classify_raw("__CLOSE__4004"), RawFrame::Closed(4004)));
+        assert!(matches!(classify_raw("__CLOSE__1000"), RawFrame::Closed(1000)));
+        assert!(matches!(classify_raw(&format!("{}broken pipe", WS_ERROR_MARK)), RawFrame::WsError(_)));
+        // Настоящее событие остаётся событием, даже если в нём есть "__CLOSE__"
+        // в поле данных.
+        assert!(matches!(classify_raw("{\"op\":0,\"t\":\"__CLOSE__4004\"}"), RawFrame::Event));
+        assert!(matches!(classify_raw("{\"op\":11,\"d\":null}"), RawFrame::Event));
     }
 }
 
