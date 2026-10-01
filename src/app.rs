@@ -32,6 +32,19 @@ const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 /// Сколько неудачных URL'ов запоминаем, чтобы не качать их снова.
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
 
+/// Нужно ли писать отладочный лог в файл и stderr.
+///
+/// По умолчанию — нет. Отладочные строки идут по нескольку раз на кадр, и
+/// без флага журнал превращался в поток дискового I/O на 20 Гц, который вдобавок
+/// сам себя переписывал каждые ~100 секунд, — то есть не мог дожить до конца
+/// разбора бага, ради которого его писали. Включается `WYVERN_DEBUG=1`.
+fn debug_to_disk_from_env() -> bool {
+    matches!(
+        std::env::var("WYVERN_DEBUG").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Оставляем не больше N сообщений: иначе активный канал в шумном чате
 /// раздувает память бесконечно. Список идёт от старых к новым, и какой конец
 /// резать — зависит от того, куда смотрит пользователь.
@@ -96,6 +109,8 @@ pub(crate) struct App {
     /// не говорилось вообще ничего, и сообщение просто исчезало.
     pub(crate) send_error: Option<String>,
     pub(crate) debug_log: Vec<String>,
+    /// Писать ли отладочный лог на диск и в stderr. См. `debug_to_disk_from_env`.
+    pub(crate) debug_to_disk: bool,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
@@ -212,6 +227,7 @@ impl App {
             status: String::new(),
             send_error: None,
             debug_log: Vec::new(),
+            debug_to_disk: debug_to_disk_from_env(),
             to_gw: None,
             from_gw,
             gw_started: false,
@@ -253,18 +269,26 @@ impl App {
         }
     }
     pub(crate) fn push_debug(&mut self, msg: String) {
-        let line = format!("[GW] {}", msg);
-        eprintln!("{}", line);
-        use std::io::Write;
-        // Лог не должен расти вечно: каждые 15 кадров в него падает строка,
-        // за сутки это десятки мегабайт. Переезжаем на .1 и начинаем заново.
-        let path = "/tmp/wyvern_layout.log";
-        let too_big = std::fs::metadata(path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false);
-        if too_big {
-            let _ = std::fs::rename(path, format!("{}.1", path));
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
+        // На диск и в stderr — только по WYVERN_DEBUG. Без флага отладочный
+        // лог не должен стоить ничего: строки идут по нескольку раз на кадр,
+        // и это был поток I/O на 20 Гц, из-за которого файл не доживал до
+        // конца разбора (см. `debug_to_disk_from_env`).
+        //
+        // В памяти держим всегда: на него смотрят тесты и экран отладки.
+        if self.debug_to_disk {
+            let line = format!("[GW] {}", msg);
+            eprintln!("{}", line);
+            use std::io::Write;
+            // Лог не должен расти вечно: каждые 15 кадров в него падает строка,
+            // за сутки это десятки мегабайт. Переезжаем на .1 и начинаем заново.
+            let path = "/tmp/wyvern_layout.log";
+            let too_big = std::fs::metadata(path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false);
+            if too_big {
+                let _ = std::fs::rename(path, format!("{}.1", path));
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{}", line);
+            }
         }
         self.debug_log.push(msg);
         if self.debug_log.len() > 100 {
@@ -2497,5 +2521,28 @@ mod layout_tests {
         tx.send(ToApp::Message(test_msg("mine", "c1", "своё"))).unwrap();
         app.poll(&ctx);
         assert!(app.scroll_to_bottom, "сообщение открытого канала должно прокрутить вниз");
+    }
+
+    /// Отладочный лог идёт в файл и stderr только по WYVERN_DEBUG.
+    ///
+    /// Раньше каждая строка без разбора писалась на диск, а строки падают по
+    /// нескольку раз на кадр: это поток I/O на 20 Гц, из-за которого файл
+    /// переписывался каждые ~100 секунд и до конца разбора бага не доживал.
+    #[test]
+    fn debug_log_writes_only_when_enabled() {
+        let path = std::path::Path::new("/tmp/wyvern_layout.log");
+        let _ = std::fs::remove_file(path);
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+
+        app.debug_to_disk = false;
+        app.push_debug("тихая строка".into());
+        assert!(!path.exists(), "без WYVERN_DEBUG журнал не должен писать в файл");
+
+        app.debug_to_disk = true;
+        app.push_debug("громкая строка".into());
+        assert!(path.exists(), "с включённым флагом строка должна попасть в файл");
+
+        let _ = std::fs::remove_file(path);
     }
 }
