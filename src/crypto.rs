@@ -135,18 +135,27 @@ impl App {
         if token.is_empty() {
             return;
         }
+        let mut changed = false;
         if let Some(a) = self.saved_accounts.iter_mut().find(|a| a.token == token) {
-            if !username.is_empty() {
+            if !username.is_empty() && a.username != username {
                 a.username = username.to_string();
+                changed = true;
             }
         } else {
             self.saved_accounts.push(StoredAccount {
                 token,
                 username: username.to_string(),
             });
+            changed = true;
         }
         self.refresh_active_index();
-        self.save_accounts(&self.master_password);
+        // Т-10: если список не изменился, сохранять нечего. Раньше файл
+        // перешифровывался безусловно, и вход в уже сохранённый аккаунт стоил
+        // второго полного прогона PBKDF2 (100 000 итераций) впустую — только
+        // чтобы записать то же самое.
+        if changed {
+            self.save_accounts(&self.master_password);
+        }
     }
     pub(crate) fn refresh_active_index(&mut self) {
         self.active_index = self.saved_accounts.iter().position(|a| a.token == self.token_input);
@@ -543,6 +552,35 @@ mod vault_cost_tests {
             super::last_search_width(),
             0,
             "первый вариант подошёл — потоки не нужны"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Повторное добавление уже сохранённого аккаунта не должно
+    /// перешифровывать хранилище: это лишние 100 000 итераций PBKDF2 на вход.
+    ///
+    /// Раньше `add_saved_account` звал `save_accounts` безусловно, поэтому вход
+    /// в уже сохранённый аккаунт стоил второго полного прогона PBKDF2 (после
+    /// `unlock_vault`) — только чтобы записать в файл то же самое.
+    #[test]
+    fn adding_an_existing_account_does_not_rewrite_the_vault() {
+        let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut app, tmp) = vaulted();
+        app.master_password = "правильный".into();
+        app.saved_accounts = vec![StoredAccount {
+            token: "токен".into(),
+            username: "вася".into(),
+        }];
+        app.save_accounts("правильный");
+        let before = std::fs::read_to_string(&tmp).expect("файл хранилища не записался");
+
+        // Вход в уже сохранённый аккаунт: имя пустое, менять нечего.
+        app.add_saved_account("токен", "");
+
+        let after = std::fs::read_to_string(&tmp).unwrap();
+        assert_eq!(
+            after, before,
+            "хранилище перешифровано без изменений — лишний PBKDF2 на входе"
         );
         let _ = std::fs::remove_file(&tmp);
     }
