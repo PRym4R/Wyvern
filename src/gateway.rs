@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,14 +17,74 @@ use crate::util::super_props;
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE: &str = "https://discord.com/api/v10";
 
+/// Счётчик подключений: у каждого запуска гейтвея — своё поколение.
+///
+/// Нужен из-за переключения аккаунта. `Shutdown` кладётся в очередь, а старый
+/// поток может сейчас спать между попытками переподключения или висеть на
+/// сетевом запросе — тогда он успевает ещё раз подключиться и ОПОЗНАТЬСЯ со
+/// старым токеном, и на Discord секунду живут две сессии. События от
+/// устаревшего поколения приложение теперь просто не слушает.
+#[derive(Default)]
+pub(crate) struct Generation(AtomicU64);
+
+impl Generation {
+    /// Поколение нового подключения.
+    pub(crate) fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    /// Какое поколение сейчас считается текущим.
+    pub(crate) fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+    /// Живо ли ещё это поколение.
+    pub(crate) fn is_current(&self, mine: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == mine
+    }
+}
+
+/// Отправитель событий, который умеет замолчать, когда приложение ушло на
+/// другой аккаунт.
+#[derive(Clone)]
+pub(crate) struct EventTx {
+    tx: mpsc::UnboundedSender<ToApp>,
+    /// Поколение, которому принадлежит этот гейтвей.
+    mine: u64,
+    current: Arc<Generation>,
+}
+
+impl EventTx {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<ToApp>, mine: u64, current: Arc<Generation>) -> Self {
+        Self { tx, mine, current }
+    }
+    /// Событие уходит в приложение, только если гейтвей ещё тот, за кем
+    /// приложение следит. Иначе события устаревшего потока перетирали бы
+    /// состояние нового: имя пользователя А выскакивало бы сразу после
+    /// переключения на Б.
+    pub(crate) fn send(&self, ev: ToApp) {
+        if !self.current.is_current(self.mine) {
+            return;
+        }
+        let _ = self.tx.send(ev);
+    }
+    /// Этому гейтвею ещё можно работать.
+    pub(crate) fn alive(&self) -> bool {
+        self.current.is_current(self.mine)
+    }
+}
+
 pub(crate) async fn run_gateway(
     mut cmd_rx: mpsc::UnboundedReceiver<ToGateway>,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     token: String,
 ) {
     let _ = event_tx.send(ToApp::Debug("Gateway thread started".into()));
     let mut session = SessionState::default();
     loop {
+        // Приложение успело переключить аккаунт, пока мы спали между попытками.
+        if !event_tx.alive() {
+            let _ = event_tx.send(ToApp::Debug("Gateway superseded, stopping".into()));
+            return;
+        }
         let use_resume = session.session_id.is_some();
         match gw_inner(&mut cmd_rx, event_tx.clone(), &token, &mut session, use_resume).await {
             Ok(()) => {
@@ -43,7 +105,17 @@ pub(crate) async fn run_gateway(
                     break;
                 }
                 let _ = event_tx.send(ToApp::Status(format!("Reconnecting: {}", msg)));
-                time::sleep(Duration::from_secs(3)).await;
+                // Паузу дробим и проверяем поколение: если за эти три секунды
+                // пользователь переключил аккаунт, старый гейтвей обязан
+                // остановиться сразу, а не доспать до конца и снова
+                // подключиться со старым токеном.
+                for _ in 0..30 {
+                    if !event_tx.alive() {
+                        let _ = event_tx.send(ToApp::Debug("Gateway superseded while waiting, stopping".into()));
+                        return;
+                    }
+                    time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }
@@ -144,7 +216,7 @@ pub(crate) const HISTORY_PAGE: usize = 50;
 async fn send_message(
     httpc: reqwest::Client,
     tkn: String,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     channel_id: String,
     content: String,
     local_id: String,
@@ -200,7 +272,7 @@ fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, String> {
 async fn send_message_to(
     httpc: reqwest::Client,
     tkn: String,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     url: String,
     content: String,
     local_id: String,
@@ -253,7 +325,7 @@ async fn send_message_to(
 async fn open_dm(
     httpc: reqwest::Client,
     tkn: String,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     user_id: String,
 ) {
     let url = format!("{}/users/@me/channels", API_BASE);
@@ -304,7 +376,7 @@ async fn open_dm(
 async fn fetch_history_page(
     httpc: reqwest::Client,
     tkn: String,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     channel_id: String,
     before: Option<String>,
 ) {
@@ -678,7 +750,7 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
 
 async fn gw_inner(
     cmd_rx: &mut mpsc::UnboundedReceiver<ToGateway>,
-    event_tx: mpsc::UnboundedSender<ToApp>,
+    event_tx: EventTx,
     token: &str,
     session: &mut SessionState,
     use_resume: bool,
@@ -896,7 +968,7 @@ async fn gw_inner(
                                         async fn fetch_one(
                                             httpc: reqwest::Client,
                                             tkc: String,
-                                            egoods: mpsc::UnboundedSender<ToApp>,
+                                            egoods: EventTx,
                                             gid: String,
                                             gname: String,
                                         ) {
@@ -1242,9 +1314,11 @@ async fn gw_inner(
 #[cfg(test)]
 mod http_tests {
     use super::{
-    api_client, client_with_timeout, send_failure_reason, send_message_to, API_TIMEOUT,
+    api_client, client_with_timeout, send_failure_reason, send_message_to, EventTx, Generation,
+    API_TIMEOUT,
 };
     use crate::messages::ToApp;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1279,6 +1353,10 @@ mod http_tests {
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+        // Приёмник оборачиваем в EventTx с единственным поколением: события
+        // оттуда идут прямо в приложение.
+        let gen = Arc::new(Generation::default());
+        let event_tx = EventTx::new(tx, gen.next(), gen.clone());
         // Таймаут уменьшен, чтобы тест не ждал двадцать секунд; смысл тот же.
         let client = client_with_timeout(Duration::from_millis(300)).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1286,7 +1364,7 @@ mod http_tests {
         rt.block_on(send_message_to(
             client,
             "токен".into(),
-            tx,
+            event_tx,
             format!("http://{}/channels/1/messages", addr),
             "привет".into(),
             "local:7".into(),
@@ -1329,6 +1407,51 @@ mod http_tests {
             );
             assert!(!reason.contains(&status.to_string()), "код не должен попадать в текст: {reason:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::{EventTx, Generation};
+    use crate::messages::ToApp;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Переключение аккаунта не должно оставлять прежний гейтвей живым.
+    /// `Shutdown` кладётся в очередь, а поток может спать между попытками
+    /// переподключения или висеть на запросе — тогда он успевает ещё раз
+    /// подключиться со старым токеном, и Discord видит две сессии. События
+    /// устаревшего поколения приложение слушать не должно.
+    #[test]
+    fn superseded_gateway_goes_silent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let gen = Arc::new(Generation::default());
+        let old = EventTx::new(tx.clone(), gen.next(), gen.clone());
+        // Переключили аккаунт.
+        let new = EventTx::new(tx, gen.next(), gen.clone());
+
+        assert!(!old.alive(), "прежний гейтвей должен понять, что он больше не нужен");
+        assert!(new.alive());
+        old.send(ToApp::Debug("старое имя пользователя".into()));
+        assert!(
+            rx.try_recv().is_err(),
+            "событие устаревшего гейтвея перетирало бы состояние нового"
+        );
+
+        new.send(ToApp::Debug("новое".into()));
+        assert!(matches!(rx.try_recv(), Ok(ToApp::Debug(_))), "новый гейтвей должен говорить");
+    }
+
+    /// Поколения должны идти по порядку, иначе «новый» гейтвей решит, что он
+    /// устарел, и замолчит сам.
+    #[test]
+    fn generations_increase_monotonically() {
+        let gen = Generation::default();
+        let first = gen.next();
+        let second = gen.next();
+        assert!(second > first, "поколения должны расти: {first} → {second}");
+        assert!(gen.is_current(second));
+        assert!(!gen.is_current(first), "прежнее поколение больше не актуально");
     }
 }
 

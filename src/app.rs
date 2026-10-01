@@ -5,7 +5,7 @@ use std::time::Duration;
 use eframe::egui::{self, TextureHandle};
 use tokio::sync::mpsc;
 
-use crate::gateway::run_gateway;
+use crate::gateway::{run_gateway, EventTx, Generation};
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{
     BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, StoredAccount,
@@ -74,6 +74,10 @@ pub(crate) struct App {
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
+    /// Поколение гейтвея: см. `Generation` в gateway.rs. Переключение
+    /// аккаунта поднимает его на единицу, и поток прежнего аккаунта
+    /// умолкает, а не перетирает состояние нового.
+    pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
     pub(crate) pending_avatars: HashMap<String, std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
     pub(crate) image_cache: BoundedCache<LoadedImage>,
@@ -169,6 +173,7 @@ impl App {
             to_gw: None,
             from_gw,
             gw_started: false,
+            gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
             pending_avatars: HashMap::new(),
@@ -414,13 +419,21 @@ impl App {
         self.to_gw = Some(to_gw_tx);
         self.from_gw = from_gw_rx;
         self.gw_started = true;
+        // Каждый запуск гейтвея получает своё поколение. Прежний поток ещё
+        // какое-то время жив (Shutdown кладётся в очередь, а он может спать
+        // между попытками), и без поколения его события перетирали бы
+        // состояние нового: сразу после переключения аккаунта в шапке на
+        // секунду всплывало бы имя прежнего пользователя, а на Discord висели
+        // бы две сессии.
+        let generation = self.gateway_generation.next();
+        let event_tx = EventTx::new(from_gw_tx, generation, self.gateway_generation.clone());
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(run_gateway(to_gw_rx, from_gw_tx, token));
+            rt.block_on(run_gateway(to_gw_rx, event_tx, token));
         });
     }
     pub(crate) fn send_cmd(&self, cmd: ToGateway) {
@@ -1798,6 +1811,33 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// Переключение аккаунта должно поднимать поколение гейтвея: события
+/// прежнего потока, который ещё какое-то время жив, обязаны перестать приходить
+/// в приложение. Раньше прежний гейтвей успевал прислать `Ready` со старым
+/// именем пользователя, и сразу после переключения в шапке мелькало имя
+/// прежнего аккаунта.
+#[test]
+    fn switching_account_supersedes_the_old_gateway() {
+        let mut app = App::new(mpsc::unbounded_channel().1);
+        app.user_id = "старая".into();
+        app.username = "Старый".into();
+
+        let first = app.gateway_generation.next();
+        app.connected = true;
+
+        // Переключение: поколение должно вырасти.
+        let before = app.gateway_generation.current();
+        app.switch_account("новыйтокен".into());
+        let after = app.gateway_generation.current();
+        assert!(after > before, "переключение аккаунта обязано поднять поколение");
+        assert!(
+            !app.gateway_generation.is_current(first),
+            "прежнее поколение не должно считаться текущим"
+        );
+        assert!(!app.connected, "новый аккаунт ещё не подключился");
+        assert!(app.gw_started);
     }
 
     /// Догрузка вверх, пришедшая после ухода из канала, не должна выдавать
