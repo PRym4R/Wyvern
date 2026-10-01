@@ -296,6 +296,17 @@ impl App {
                     }
                     self.push_debug("READY received!".into());
                 }
+                // Живое сообщение из канала, который сейчас не открыт, брать
+                // некуда. Discord шлёт MESSAGE_CREATE по всем каналам сразу, а
+                // список на экране только один, и раньше строка ложилась в
+                // список любого канала: их никто не читал, они копились до
+                // потолка на каждый активный канал (на шумном сервере — десятки
+                // мегабайт), а сообщение из соседнего канала ещё и выставляло
+                // `scroll_to_bottom` — открытый чат дёргался вниз, хотя в нём
+                // ничего не появилось. Терять нечего: `open_channel` при
+                // переключении всё равно перечитывает историю заново.
+                ToApp::Message(_msg) if self.current_channel_id() != Some(_msg.channel_id.as_str()) => {
+                }
                 ToApp::Message(msg) => {
                     let cid = msg.channel_id.clone();
                     // Сообщение может прийти дважды: гейтвей шлёт живую копию
@@ -2433,5 +2444,58 @@ mod layout_tests {
         cache.insert("k".into(), Weighted(500));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.bytes(), 500);
+    }
+
+    /// Живые сообщения из закрытых каналов не должны копиться в памяти.
+    ///
+    /// Discord шлёт MESSAGE_CREATE по всем каналам сразу, а список на экране
+    /// один. Раньше строка ложилась в список любого канала, и пока человек
+    /// сидел в одном канале, чужие копились до потолка на каждый активный
+    /// канал — на шумном сервере это десятки мегабайт впустую.
+    #[test]
+    fn live_messages_for_closed_channels_are_not_stored() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = app_with_channel(cmd_tx);
+        app.from_gw = rx;
+
+        // Открыт c1, а пишут двести раз в c2 и один раз в c1.
+        for i in 0..200 {
+            tx.send(ToApp::Message(test_msg(&format!("b{i}"), "c2", "чужое"))).unwrap();
+        }
+        tx.send(ToApp::Message(test_msg("mine", "c1", "своё"))).unwrap();
+        app.poll(&ctx);
+
+        assert!(
+            app.messages.get("c2").is_none_or(|e| e.is_empty()),
+            "сообщения закрытого канала некому показывать, копить их незачем"
+        );
+        assert_eq!(app.messages.get("c1").map(|e| e.len()), Some(1), "открытый канал работает как раньше");
+    }
+
+    /// Сообщение из закрытого канала не должно прокручивать открытый чат вниз.
+    ///
+    /// `scroll_to_bottom` выставлялся без проверки канала, и чат дёргался вниз,
+    /// хотя в нём ничего не появилось: человек читал историю, а его сбрасывало
+    /// в конец из-за соседнего канала.
+    #[test]
+    fn live_message_from_another_channel_does_not_scroll_the_chat() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = app_with_channel(cmd_tx);
+        app.from_gw = rx;
+        app.chat_at_bottom = true;
+        app.scroll_to_bottom = false;
+
+        tx.send(ToApp::Message(test_msg("b1", "c2", "чужое"))).unwrap();
+        app.poll(&ctx);
+        assert!(!app.scroll_to_bottom, "сообщение чужого канала не должно прокручивать открытый чат");
+
+        // Своё сообщение по-прежнему прокручивает.
+        tx.send(ToApp::Message(test_msg("mine", "c1", "своё"))).unwrap();
+        app.poll(&ctx);
+        assert!(app.scroll_to_bottom, "сообщение открытого канала должно прокрутить вниз");
     }
 }
