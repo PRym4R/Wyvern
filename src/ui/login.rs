@@ -28,6 +28,27 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Годится ли отладочная строка на подпись экрана входа.
+///
+/// `push_debug` несёт две очень разные вещи: человеческие сообщения
+/// («Auth failed: …», «Switched account…») и поток геометрии, который пишется
+/// каждый кадр (FRAME:, RENDER:, SCROLL:, PANEL:, INPUT_BAR: …). Второе —
+/// внутреннее измерение, пользователю оно ни о чём не говорит, но именно оно
+/// почти всегда и оказывается последним. Раньше подпись показывала
+/// «Last: SCROLL: inner_h=…» — то есть отладку в лицо.
+fn is_human_debug(line: &str) -> bool {
+    const GEOMETRY_PREFIXES: [&str; 7] = [
+        "FRAME:",
+        "RENDER:",
+        "SCROLL:",
+        "PANEL:",
+        "INPUT_BAR:",
+        "INPUT_FIELD:",
+        "CHANNELS_PANEL:",
+    ];
+    !GEOMETRY_PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
 impl App {
     pub(crate) fn draw_login(&mut self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
@@ -409,7 +430,7 @@ impl App {
             ui.label(RichText::new(&self.status).size(13.0).color(ERROR_RED));
         } else if !self.login_notice.is_empty() {
             ui.label(RichText::new(&self.login_notice).size(13.0).color(self.theme.accent));
-        } else if let Some(last) = self.debug_log.back() {
+        } else if let Some(last) = self.debug_log.iter().rev().find(|l| is_human_debug(l)) {
             ui.label(RichText::new(format!("Last: {}", last))
                 .size(11.0)
                 .color(self.theme.text_secondary));
@@ -496,6 +517,32 @@ mod tests {
         let mut app = App::new(rx);
         app.status = "статус".into();
         app
+    }
+
+    /// В подписи входа не должно быть строк геометрии: они пишутся каждый кадр
+    /// и вытесняют человеческие сообщения. Раньше можно было увидеть
+    /// «Last: SCROLL: inner_h=…» — внутреннее измерение в лицо пользователю.
+    #[test]
+    fn login_footer_hides_geometry_debug_lines() {
+        let mut app = make_app();
+        app.status.clear();
+        app.login_notice.clear();
+        app.debug_log.clear();
+        app.debug_log.push_back("Auth failed: 401".into());
+        app.debug_log
+            .push_back("SCROLL: inner_h=100 content_h=200 offset_y=0 ask=0 stick=true".into());
+
+        let list = texts(&mut app);
+
+        assert_eq!(
+            at(&list, "Auth failed: 401").len(),
+            1,
+            "человеческое сообщение должно быть видно: {list:?}"
+        );
+        assert!(
+            at(&list, "SCROLL:").is_empty(),
+            "строка геометрии не должна попадать на экран входа: {list:?}"
+        );
     }
 
     /// Токен и пароль хранилища — в одну строку, галка «запомнить» под ними.
