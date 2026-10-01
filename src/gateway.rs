@@ -32,10 +32,6 @@ impl Generation {
     pub(crate) fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
     }
-    /// Какое поколение сейчас считается текущим.
-    pub(crate) fn current(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
-    }
     /// Живо ли ещё это поколение.
     pub(crate) fn is_current(&self, mine: u64) -> bool {
         self.0.load(Ordering::SeqCst) == mine

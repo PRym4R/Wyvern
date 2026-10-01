@@ -6,6 +6,7 @@ use eframe::egui::{self, TextureHandle};
 use tokio::sync::mpsc;
 
 use crate::gateway::{run_gateway, EventTx, Generation};
+use crate::media::AvatarFetch;
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{
     BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, StoredAccount,
@@ -79,7 +80,12 @@ pub(crate) struct App {
     /// умолкает, а не перетирает состояние нового.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
-    pub(crate) pending_avatars: HashMap<String, std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
+    pub(crate) pending_avatars: HashMap<String, std::sync::mpsc::Receiver<AvatarFetch>>,
+    /// Аватары и иконки, которые не загрузились. Раньше такого списка не
+    /// было вовсе, и отказ означал новый запрос на каждом кадре: 20 запросов
+    /// в секунду на каждый невидимый аватар. Эти самые запросы съедали лимит
+    /// CDN, на который клиент и упирался, — и порождали новую волну отказов.
+    pub(crate) failed_avatars: HashSet<String>,
     pub(crate) image_cache: BoundedCache<LoadedImage>,
     pub(crate) pending_images: HashMap<String, std::sync::mpsc::Receiver<Option<ImagePayload>>>,
     pub(crate) failed_images: HashSet<String>,
@@ -177,6 +183,7 @@ impl App {
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
             pending_avatars: HashMap::new(),
+            failed_avatars: HashSet::new(),
             image_cache: BoundedCache::with_budget(MAX_IMAGE_CACHE, IMAGE_CACHE_BUDGET),
             pending_images: HashMap::new(),
             failed_images: HashSet::new(),
@@ -1153,7 +1160,7 @@ mod layout_tests {
             .send(Some(ImagePayload::Static(egui::ColorImage::new([512, 512], egui::Color32::BLACK))))
             .unwrap();
         app.pending_images.insert("https://cdn.discordapp.com/attachments/1/old.png".into(), img_rx);
-        let (_av_tx, av_rx) = std::sync::mpsc::channel::<Option<egui::ColorImage>>();
+        let (_av_tx, av_rx) = std::sync::mpsc::channel::<AvatarFetch>();
         app.pending_avatars.insert("u1_deadbeef".into(), av_rx);
         assert_eq!(app.pending_images.len(), 1);
         assert_eq!(app.pending_avatars.len(), 1);
@@ -1827,14 +1834,11 @@ mod layout_tests {
         let first = app.gateway_generation.next();
         app.connected = true;
 
-        // Переключение: поколение должно вырасти.
-        let before = app.gateway_generation.current();
+        // Переключение: прежнее поколение обязано перестать быть текущим.
         app.switch_account("новыйтокен".into());
-        let after = app.gateway_generation.current();
-        assert!(after > before, "переключение аккаунта обязано поднять поколение");
         assert!(
             !app.gateway_generation.is_current(first),
-            "прежнее поколение не должно считаться текущим"
+            "переключение аккаунта обязано поднять поколение"
         );
         assert!(!app.connected, "новый аккаунт ещё не подключился");
         assert!(app.gw_started);

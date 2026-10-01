@@ -102,14 +102,44 @@ impl Drop for ImageSlot {
     }
 }
 
+/// Ответ потока загрузки аватара. Различать надо: отказ CDN стоит запомнить,
+/// а занятость загрузочного слота — нет (слот освободится через мгновение, и
+/// запомнив «битый аватар», мы не показали бы его никогда).
+#[derive(Debug, PartialEq)]
+pub(crate) enum AvatarFetch {
+    Ready(egui::ColorImage),
+    /// Не вышло: сеть, битый хеш, 404. Пробовать больше не надо.
+    Failed,
+    /// Мест в очереди загрузки не было. Повторить можно сразу же.
+    Busy,
+}
+
 impl App {
     pub(crate) fn download_avatar(&mut self, ctx: &egui::Context, user_id: &str, avatar_hash: &str) -> Option<TextureHandle> {
-        let cache_key = format!("{}_{}", user_id, avatar_hash);
+        let url = format!("{}/avatars/{}/{}.png?size=64", CDN_BASE, user_id, avatar_hash);
+        self.fetch_avatar(ctx, format!("{}_{}", user_id, avatar_hash), url)
+    }
+    /// Забрать аватар или иконку сервера.
+    ///
+    /// Отказ запоминается: раньше его нигде не хранили, и список `pending`
+    /// очищался по ответу потока, поэтому на следующем же кадре ключ снова
+    /// не находился в кэше, не находился в списке загрузок — и порождался
+    /// новый поток с новым HTTP-запросом. Двадцать раз в секунду на каждый
+    /// невидимый аватар (удалённый аккаунт, битый хеш, 429 от CDN), а эти
+    /// запросы сами съедали лимит CDN, на который клиент упирался, и
+    /// порождали следующую волну.
+    ///
+    /// Отличать «не вышло» от «ещё не готово» нельзя было и раньше — оба
+    /// ответа это `None`. Теперь запоминаем ключ и больше не пробуем, пока
+    /// канал не откроется заново.
+    fn fetch_avatar(&mut self, ctx: &egui::Context, cache_key: String, url: String) -> Option<TextureHandle> {
         if let Some(tex) = self.avatar_cache.get(&cache_key) {
             return Some(tex.clone());
         }
+        if self.failed_avatars.contains(&cache_key) {
+            return None;
+        }
 
-        let url = format!("{}/avatars/{}/{}.png?size=64", CDN_BASE, user_id, avatar_hash);
         let ctx2 = ctx.clone();
         let key = cache_key.clone();
 
@@ -119,95 +149,72 @@ impl App {
             std::thread::spawn(move || {
                 if AVATAR_DOWNLOADS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_AVATAR_DOWNLOADS {
                     AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    let _ = result_tx.send(None);
+                    // Слоты заняты — это не «аватар битый», и запоминать такой
+                    // отказ нельзя: иначе аватар не появился бы никогда, хотя
+                    // слоты освободились бы уже на следующем кадре.
+                    let _ = result_tx.send(AvatarFetch::Busy);
                     return;
                 }
-                if let Ok(resp) = http().get(&url_moved).send() {
-                    if let Ok(bytes) = resp.bytes() {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let (w, h) = rgba.dimensions();
-                            let pixels = rgba.into_raw();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                [w as usize, h as usize],
-                                &pixels,
-                            );
-                            let _ = result_tx.send(Some(color_image));
-                            AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                            return;
-                        }
+                let outcome = match http().get(&url_moved).send().ok()
+                    .and_then(|resp| resp.bytes().ok())
+                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                {
+                    Some(img) => {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        AvatarFetch::Ready(egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba.into_raw(),
+                        ))
                     }
-                }
+                    None => AvatarFetch::Failed,
+                };
                 AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                let _ = result_tx.send(None);
+                let _ = result_tx.send(outcome);
             });
             result_rx
         });
 
         if let Ok(result) = pending.try_recv() {
+            // Запись убираем всегда: поток отработал, и держать мёртвый
+            // приёмник в таблице незачем. Дальше всё решает память об отказе.
             self.pending_avatars.remove(&key);
-            if let Some(color_image) = result {
-                let handle = ctx2.load_texture(&key, color_image, egui::TextureOptions::default());
-                self.avatar_cache.insert(key.clone(), handle.clone());
-                ctx2.request_repaint();
-                return Some(handle);
-            }
+            return self.store_avatar(ctx2, key, result);
         }
-
         None
     }
-    pub(crate) fn download_guild_icon(&mut self, ctx: &egui::Context, guild_id: &str, icon_hash: &str) -> Option<TextureHandle> {
-        let cache_key = format!("guild_icon_{}_{}", guild_id, icon_hash);
-        if let Some(tex) = self.avatar_cache.get(&cache_key) {
-            return Some(tex.clone());
-        }
 
-        let url = format!("{}/icons/{}/{}.png?size=64", CDN_BASE, guild_id, icon_hash);
-        let ctx2 = ctx.clone();
-        let key = cache_key.clone();
-
-        let pending = self.pending_avatars.entry(cache_key.clone()).or_insert_with(|| {
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let url_moved = url.clone();
-            std::thread::spawn(move || {
-                if AVATAR_DOWNLOADS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_AVATAR_DOWNLOADS {
-                    AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    let _ = result_tx.send(None);
-                    return;
-                }
-                if let Ok(resp) = http().get(&url_moved).send() {
-                    if let Ok(bytes) = resp.bytes() {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let (w, h) = rgba.dimensions();
-                            let pixels = rgba.into_raw();
-                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                [w as usize, h as usize],
-                                &pixels,
-                            );
-                            let _ = result_tx.send(Some(color_image));
-                            AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                }
-                AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                let _ = result_tx.send(None);
-            });
-            result_rx
-        });
-
-        if let Ok(result) = pending.try_recv() {
-            self.pending_avatars.remove(&key);
-            if let Some(color_image) = result {
-                let handle = ctx2.load_texture(&key, color_image, egui::TextureOptions::default());
+    /// Принять ответ загрузки аватара. Отдельная функция, а не часть
+    /// `fetch_avatar`, потому что именно тут решается судьба отказа, и
+    /// проверять это правило нужно без похода в сеть.
+    fn store_avatar(
+        &mut self,
+        ctx: egui::Context,
+        key: String,
+        answer: AvatarFetch,
+    ) -> Option<TextureHandle> {
+        match answer {
+            AvatarFetch::Ready(color_image) => {
+                let handle = ctx.load_texture(&key, color_image, egui::TextureOptions::default());
                 self.avatar_cache.insert(key.clone(), handle.clone());
-                ctx2.request_repaint();
-                return Some(handle);
+                ctx.request_repaint();
+                Some(handle)
             }
+            AvatarFetch::Failed => {
+                // Отказ по-настоящему: запоминаем ключ, иначе следующий кадр
+                // снова не найдёт его ни в кэше, ни в загрузках и породит новый
+                // поток с новым запросом (Б-18).
+                remember_failed(&mut self.failed_avatars, key);
+                None
+            }
+            // Занятость слота отказом не считается: слот освободится через
+            // мгновение, а запомнив ключ, мы не показали бы аватар никогда.
+            AvatarFetch::Busy => None,
         }
-
-        None
+    }
+    pub(crate) fn download_guild_icon(&mut self, ctx: &egui::Context, guild_id: &str, icon_hash: &str) -> Option<TextureHandle> {
+        let url = format!("{}/icons/{}/{}.png?size=64", CDN_BASE, guild_id, icon_hash);
+        self.fetch_avatar(ctx, format!("guild_icon_{}_{}", guild_id, icon_hash), url)
     }
     /// Распаковать статичную картинку с ограничением по размеру. `Limits`
     /// проверяется до выделения буфера пикселей, поэтому недопустимо
@@ -404,6 +411,109 @@ mod tests {
     /// Тесты, которые трогают счётчик загрузок, идут по очереди: он общий
     /// на процесс, и параллельный прогон сломал бы проверки.
     static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn plain_app() -> App {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(rx)
+    }
+
+    /// Отказ по аватару не должен приводить к новому запросу на каждом кадре.
+    ///
+    /// Сценарий: аккаунт удалён, хеш битый или CDN отдал 429. Прежде ответ
+    /// потока означал только «не вышло», запись убиралась из списка загрузок —
+    /// и на следующем кадре ключ снова не находился ни в кэше, ни в загрузках,
+    /// поэтому порождался новый поток с новым HTTP-запросом. Двадцать раз в
+    /// секунду на каждый невидимый аватар, а эти запросы сами съедали лимит
+    /// CDN, на который клиент упирался, и порождали следующую волну отказов.
+    #[test]
+    fn failed_avatar_is_not_requested_again_on_every_frame() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        let (tx, rx) = std::sync::mpsc::channel::<AvatarFetch>();
+        tx.send(AvatarFetch::Failed).unwrap();
+        app.pending_avatars.insert("u1_deadbeef".into(), rx);
+
+        // Кадр, на котором поток отработал отказом: запись из загрузок ушла...
+        let answer = app.pending_avatars["u1_deadbeef"].try_recv();
+        assert_eq!(answer, Ok(AvatarFetch::Failed));
+        app.pending_avatars.remove("u1_deadbeef");
+        assert!(app.store_avatar(ctx.clone(), "u1_deadbeef".into(), AvatarFetch::Failed).is_none());
+
+        // ...и больше нигде key не лежит: не в кэше, не в загрузках. Единственное,
+        // что остановит новый поток на следующем кадре, — память об отказе.
+        assert!(app.avatar_cache.get("u1_deadbeef").is_none());
+        assert!(!app.pending_avatars.contains_key("u1_deadbeef"));
+        assert!(
+            app.failed_avatars.contains("u1_deadbeef"),
+            "отказ не запомнен — следующий кадр снова спросит аватар: {:?}",
+            app.failed_avatars
+        );
+    }
+
+    /// Занятость загрузочного слота отказом считаться не должна. Если
+    /// запомнить и её, то аватар, не поместившийся в лимит однажды, не
+    /// появился бы уже никогда — а слот освобождается через мгновение.
+    #[test]
+    fn busy_avatar_slot_is_not_remembered_as_failure() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        assert!(app.store_avatar(ctx, "u1_cafe".into(), AvatarFetch::Busy).is_none());
+        assert!(
+            !app.failed_avatars.contains("u1_cafe"),
+            "занятость слота — не отказ, ключ нельзя запоминать: {:?}",
+            app.failed_avatars
+        );
+        assert!(!app.pending_avatars.contains_key("u1_cafe"));
+    }
+
+    /// Успех должен класть текстуру в кэш: иначе следующий кадр запросил бы
+    /// тот же аватар заново, уже скачав его.
+    #[test]
+    fn ready_avatar_goes_to_cache_and_is_forgotten_as_pending() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        let img = egui::ColorImage::new([8, 8], egui::Color32::RED);
+        assert!(app.store_avatar(ctx.clone(), "u1_ok".into(), AvatarFetch::Ready(img)).is_some());
+        assert!(app.avatar_cache.get("u1_ok").is_some());
+        assert!(!app.failed_avatars.contains("u1_ok"), "удавшийся аватар не в списке отказов");
+    }
+
+    /// Иконки серверов берутся по тому же пути, значит и отказ у них должен
+    /// запоминаться. Раньше у аватарок и иконок не было ничего общего: две
+    /// копии одной и той же функции, и починка одной другой не касалась бы.
+    #[test]
+    fn guild_icon_failure_is_remembered_too() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        assert!(app
+            .store_avatar(ctx, "guild_icon_g1_abc".into(), AvatarFetch::Failed)
+            .is_none());
+        assert!(
+            app.failed_avatars.contains("guild_icon_g1_abc"),
+            "иконка сервера должна запоминаться так же, как аватар"
+        );
+    }
+
+    /// Память об отказах не должна расти без предела: аватары приходят с
+    /// новыми хешами, и ключи никогда не повторяются. При достижении предела
+    /// список сбрасывается целиком — это лучше, чем расти до падения.
+    #[test]
+    fn failed_avatars_are_bounded() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        for i in 0..(crate::app::MAX_FAILED_IMAGES + 10) {
+            assert!(app
+                .store_avatar(ctx.clone(), format!("u{i}_hash"), AvatarFetch::Failed)
+                .is_none());
+        }
+        assert!(
+            app.failed_avatars.len() <= crate::app::MAX_FAILED_IMAGES,
+            "память об отказах выросла без предела: {}",
+            app.failed_avatars.len()
+        );
+        // Первые ключи после сброса забыты — но новые-то запомнены.
+        assert!(app.failed_avatars.len() > 0, "сброс должен был начаться не с пустого места");
+    }
 
     /// Отказ занять слот не должен увеличивать счётчик: иначе он уезжает
     /// вверх на единицу за каждый отказ, за пару кадров уходит за любой
