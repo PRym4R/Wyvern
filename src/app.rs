@@ -2482,6 +2482,25 @@ mod layout_tests {
         assert_eq!(cache.get("k9").map(|v| v.0), Some(9));
     }
 
+    /// Вытесняется давнее по использованию, а не по вставке.
+    ///
+    /// Очередь пополнялась только на вставке, а `get` её не трогал: получался
+    /// FIFO. Человек листал канал вниз и обратно вверх — картинка, которую он
+    /// только что смотрел, вытеснялась раньше давно не виденной снизу.
+    #[test]
+    fn bounded_cache_evicts_least_recently_used() {
+        let mut cache = BoundedCache::with_budget(2, usize::MAX);
+        cache.insert("a".into(), Weighted(1));
+        cache.insert("b".into(), Weighted(2));
+        // Обращение к «a» в FIFO ничего не меняло, в LRU делает «b» старше.
+        assert_eq!(cache.get("a").map(|v| v.0), Some(1));
+        cache.insert("c".into(), Weighted(3));
+
+        assert!(cache.contains_key("a"), "к чему обращались, должно остаться");
+        assert!(!cache.contains_key("b"), "вытесниться должно давнее по использованию");
+        assert!(cache.contains_key("c"));
+    }
+
     /// Ограничение по памяти важнее ограничения по числу: восемь мелких
     /// аватарок и три большие фотки должны уживаться в одном бюджете.
     #[test]

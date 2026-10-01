@@ -38,8 +38,21 @@ impl<V: CacheCost> BoundedCache<V> {
     pub(crate) fn with_budget(cap: usize, budget: usize) -> Self {
         Self { map: HashMap::new(), order: VecDeque::new(), cap, budget, bytes: 0 }
     }
-    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+    /// Взять значение из кэша. Обращение считается использованием: ключ
+    /// уезжает в хвост очереди, поэтому вытесняется то, к чему давно не
+    /// обращались (LRU), а не то, что давно положили (FIFO, как было).
+    pub(crate) fn get(&mut self, key: &str) -> Option<&V> {
+        self.touch(key);
         self.map.get(key)
+    }
+    /// Отметить ключ как использованный: перенести его в хвост очереди.
+    /// Очередь короткая (десятки элементов), поэтому O(n) здесь не страшен.
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            if let Some(k) = self.order.remove(pos) {
+                self.order.push_back(k);
+            }
+        }
     }
     /// Сколько памяти кэш держит прямо сейчас.
     pub(crate) fn bytes(&self) -> usize {
