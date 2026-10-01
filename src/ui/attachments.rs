@@ -99,6 +99,11 @@ impl App {
         // кадре, и копии URL'ов в куче не нужны.
         for_each_image(msg, |url, known| {
             if let Some(tex) = self.download_image(ui.ctx(), url) {
+                // Анимированную нужно перерисовывать непрерывно, пока она на
+                // экране: в покое кадров больше нет (Т-7).
+                if tex.is_animated() {
+                    self.animating = true;
+                }
                 let disp = display_size(tex.size_vec2());
                 if disp.x <= 0.0 || disp.y <= 0.0 {
                     return;

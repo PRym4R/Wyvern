@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,11 +47,20 @@ pub(crate) struct EventTx {
     /// Поколение, которому принадлежит этот гейтвей.
     mine: u64,
     current: Arc<Generation>,
+    /// Окно приложения: событие приходит на UI-поток, а egui перерисовывает
+    /// кадр только по требованию. Без этого пробуждения новое сообщение
+    /// ждало бы случайного кадра — а кадров в покое теперь нет вовсе (Т-7).
+    wake: Option<egui::Context>,
 }
 
 impl EventTx {
     pub(crate) fn new(tx: mpsc::UnboundedSender<ToApp>, mine: u64, current: Arc<Generation>) -> Self {
-        Self { tx, mine, current }
+        Self { tx, mine, current, wake: None }
+    }
+    /// Привязать окно, которое нужно будить на каждое событие.
+    pub(crate) fn with_wake(mut self, ctx: egui::Context) -> Self {
+        self.wake = Some(ctx);
+        self
     }
     /// Событие уходит в приложение, только если гейтвей ещё тот, за кем
     /// приложение следит. Иначе события устаревшего потока перетирали бы
@@ -61,6 +71,10 @@ impl EventTx {
             return;
         }
         let _ = self.tx.send(ev);
+        // Будим окно: событие из другого потока само кадра не вызовет.
+        if let Some(ctx) = &self.wake {
+            ctx.request_repaint();
+        }
     }
     /// Этому гейтвею ещё можно работать.
     pub(crate) fn alive(&self) -> bool {

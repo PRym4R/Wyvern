@@ -257,6 +257,17 @@ impl LoadedImage {
         self.display_texture().id()
     }
 
+    /// Двигается ли картинка сама по себе. Статичную достаточно нарисовать
+    /// один раз, а анимированной нужны кадры, пока она на экране (Т-7).
+    pub(crate) fn is_animated(&self) -> bool {
+        match self {
+            LoadedImage::Static(_) => false,
+            LoadedImage::Animated { frames, delays, .. } => {
+                frames.len() > 1 && delays.iter().any(|d| *d > 0.0)
+            }
+        }
+    }
+
     pub(crate) fn display_texture(&self) -> TextureHandle {
         match self {
             LoadedImage::Static(t) => t.clone(),

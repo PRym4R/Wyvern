@@ -128,6 +128,13 @@ pub(crate) struct App {
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
+    /// Окно текущего кадра. Хранится, чтобы гейтвей мог будить его на каждое
+    /// событие (Т-7): в покое кадров больше нет, и событие из другого потока
+    /// иначе ждало бы случайной перерисовки.
+    pub(crate) egui_ctx: Option<egui::Context>,
+    /// Рисовалась ли в этом кадре анимированная картинка. Такую нужно
+    /// перерисовывать непрерывно, пока она на экране; в покое кадров нет.
+    pub(crate) animating: bool,
     /// Поколение гейтвея: см. `Generation` в gateway.rs. Переключение
     /// аккаунта поднимает его на единицу, и поток прежнего аккаунта
     /// умолкает, а не перетирает состояние нового.
@@ -249,6 +256,8 @@ impl App {
             to_gw: None,
             from_gw,
             gw_started: false,
+            egui_ctx: None,
+            animating: false,
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -313,8 +322,16 @@ impl App {
             self.debug_log.pop_front();
         }
     }
-    pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+    /// Разобрать пришедшие события гейтвея. Возвращает `true`, если хоть одно
+    /// было: тогда нужно дорисовать ещё кадр, чтобы раскладка после него
+    /// устоялась, и только потом засыпать (Т-7).
+    pub(crate) fn poll(&mut self, ctx: &egui::Context) -> bool {
+        // Запоминаем окно: гейтвей будет будить его на каждое событие, иначе в
+        // покое новое сообщение ждало бы случайной перерисовки.
+        self.egui_ctx = Some(ctx.clone());
+        let mut any = false;
         while let Ok(ev) = self.from_gw.try_recv() {
+            any = true;
             match ev {
                 ToApp::Ready { username, user_id, avatar } => {
                     self.username = username.clone();
@@ -512,7 +529,7 @@ impl App {
                 ToApp::Debug(d) => self.push_debug(d),
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(50));
+        any
     }
     pub(crate) fn start_gateway(&mut self, token: String) {
         let (to_gw_tx, to_gw_rx) = mpsc::unbounded_channel();
@@ -528,6 +545,12 @@ impl App {
         // бы две сессии.
         let generation = self.gateway_generation.next();
         let event_tx = EventTx::new(from_gw_tx, generation, self.gateway_generation.clone());
+        // Привязываем окно, чтобы гейтвей будил его на каждое событие: в покое
+        // кадров больше нет, и без пробуждения сообщение ждало бы ввода.
+        let event_tx = match &self.egui_ctx {
+            Some(ctx) => event_tx.with_wake(ctx.clone()),
+            None => event_tx,
+        };
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -924,7 +947,7 @@ impl App {
             }
         }
     }
-/// Экран входа вместо чата?
+    /// Экран входа вместо чата?
     ///
     /// Отдельный метод, а не условие прямо в `update`: от того, сюда ли мы
     /// попадём, зависит, сможет ли пользователь выйти из сломанного входа
@@ -932,11 +955,12 @@ impl App {
     pub(crate) fn shows_login(&self) -> bool {
         self.token_input.is_empty() || (!self.connected && !self.gw_started)
     }
-}
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll(ctx);
+    /// Один кадр приложения: разбор событий, отрисовка и решение о следующем
+    /// кадре. Отдельно от `eframe::App::update`, чтобы тесты могли прогнать
+    /// кадр без `eframe::Frame`.
+    pub(crate) fn run_frame(&mut self, ctx: &egui::Context) {
+        let had_events = self.poll(ctx);
 
         self.theme = match self.theme_index {
             0 => Theme::dark(),
@@ -944,11 +968,43 @@ impl eframe::App for App {
             _ => Theme::light(),
         };
 
+        // Флаг анимации собирается заново каждый кадр: его выставит отрисовка,
+        // если на экране анимированная картинка.
+        self.animating = false;
         if self.shows_login() {
             self.draw_login(ctx);
         } else {
             self.draw_chat(ctx);
         }
+
+        self.schedule_repaint(ctx, had_events);
+    }
+
+    /// Просить ли следующий кадр. В покое — нет: старый код просил кадр каждые
+    /// 50 мс всегда, то есть клиент круглые сутки держал 20 кадров в секунду и
+    /// не давал ноутбуку спать (Т-7).
+    fn schedule_repaint(&self, ctx: &egui::Context, had_events: bool) {
+        // Идёт работа: результаты фоновых загрузок забираются в отрисовке, а
+        // анимированные картинки двигаются по времени. Пока это так, кадры
+        // нужны, даже когда событий нет.
+        let busy = !self.pending_avatars.is_empty()
+            || !self.pending_images.is_empty()
+            || self.history_loading.is_some()
+            || self.history_loading_more
+            || self.animating;
+        if busy {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if had_events {
+            // Событие только что изменило состояние — дорисуем ещё кадр, чтобы
+            // раскладка устоялась, и дальше спим.
+            ctx.request_repaint();
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.run_frame(ctx);
     }
 }
 
@@ -1027,6 +1083,57 @@ mod layout_tests {
         if let Some(h) = input_panel_height(&ctx) {
             eprintln!("[TEST] input panel height after frame 1: {:.1}", h);
         }
+    }
+
+    /// В покое клиент не должен просить кадры.
+    ///
+    /// Раньше `poll` безусловно звал `request_repaint_after(50 мс)` каждый
+    /// кадр: окно крутило 20 кадров в секунду круглосуточно, даже когда на
+    /// экране ничего не менялось, и не давало ноутбуку спать (Т-7).
+    #[test]
+    fn idle_frame_does_not_ask_for_repaint() {
+        std::env::set_var("NO_COLOR", "1");
+        let mut app = make_app();
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1052.0, 1054.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+
+        // Несколько кадров, чтобы улеглась анимация прокрутки egui: важен
+        // последний, спокойный кадр.
+        let mut output = None;
+        for _ in 0..10 {
+            output = Some(ctx.run(raw.clone(), |ctx| app.run_frame(ctx)));
+        }
+        let delay = output.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert_eq!(
+            delay,
+            Duration::MAX,
+            "в покое клиент всё ещё просит кадр через {delay:?}"
+        );
+    }
+
+    /// Пока идёт загрузка, кадры нужны: её результат забирается в отрисовке.
+    #[test]
+    fn pending_work_still_asks_for_repaint() {
+        std::env::set_var("NO_COLOR", "1");
+        let mut app = make_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.pending_avatars.insert("u1_deadbeef".into(), rx);
+        let ctx = egui::Context::default();
+        let size = egui::vec2(1052.0, 1054.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let output = ctx.run(raw, |ctx| app.run_frame(ctx));
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(
+            delay <= Duration::from_millis(50),
+            "висящая загрузка должна держать кадры, а delay = {delay:?}"
+        );
     }
 
     #[test]
