@@ -538,7 +538,8 @@ impl App {
                 self.msg_heights.clear();
             }
         }
-        let cid_short = if channel_id.len() > 14 { channel_id[..14].to_string() } else { channel_id.to_string() };
+        // Обрезка по символам: по байтам не-ASCII id упал бы (см. Б-6).
+        let cid_short: String = channel_id.chars().take(14).collect();
         self.push_debug(format!("Stored {} msgs ({} new) for channel {}{}", stored, added, cid_short,
             if for_current { "" } else { " (не текущий канал)" }));
     }
@@ -569,7 +570,11 @@ impl App {
             self.history_error = Some((channel_id.to_string(), reason.to_string()));
             self.scroll_to_bottom = true;
         }
-        self.push_debug(format!("History failed for {} ({}): {}", &channel_id[..channel_id.len().min(14)], before.is_some(), reason));
+        // Имя канала в отладочной строке обрезаем по символам, а не по
+        // байтам: срез по байтам у не-ASCII id упал бы с той же ошибкой, что
+        // и маска токена (Б-6).
+        let cid_short: String = channel_id.chars().take(14).collect();
+        self.push_debug(format!("History failed for {} ({}): {}", cid_short, before.is_some(), reason));
     }
     /// Догрузить более старые сообщения: просим страницу от самой старой
     /// строки, что уже есть в канале. Это именно первая строка списка — список

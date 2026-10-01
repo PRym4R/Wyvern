@@ -94,12 +94,20 @@ impl App {
     pub(crate) fn vault_path(&self) -> std::path::PathBuf {
         self.vault_path_override.clone().unwrap_or_else(Self::accounts_path)
     }
+    /// Показать токен частично: первые и последние четыре символа.
+    ///
+    /// Режем по символам, а не по байтам. Раньше бралось `&token[..4]` и
+    /// `&token[token.len() - 4..]`: токен берётся из поля ввода, и одна
+    /// русская буква (2 байта) сдвигала границу — клиент падал с «byte index
+    /// is not a char boundary». Маску показывают по клику на аккаунт, то есть
+    /// достаточно было вставить токен с опечаткой и нажать на него.
     pub(crate) fn mask_token(&self, token: &str) -> String {
-        if token.len() <= 8 {
+        let chars: Vec<char> = token.chars().collect();
+        if chars.len() <= 8 {
             return "••••••••".to_string();
         }
-        let first = &token[..4];
-        let last = &token[token.len() - 4..];
+        let first: String = chars[..4].iter().collect();
+        let last: String = chars[chars.len() - 4..].iter().collect();
         format!("{}…{}", first, last)
     }
     pub(crate) fn add_saved_account(&mut self, token: &str, username: &str) {
@@ -244,5 +252,74 @@ impl App {
         self.login_selected = None;
         self.login_password.clear();
         self.switch_account(token.to_string());
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn app() -> App {
+        let (_, rx) = mpsc::unbounded_channel();
+        App::new(rx)
+    }
+
+    /// Токен берётся из поля ввода, а маска резала строку по БАЙТАМ:
+    /// `&token[..4]` и `&token[token.len() - 4..]`. Одна русская буква (2
+    /// байта) сдвигает границу, и клиент падал с «byte index is not a char
+    /// boundary». Падение происходило при клике на аккаунт, то есть
+    /// достаточно было вставить токен с опечаткой и не заметить.
+    #[test]
+    fn mask_survives_non_ascii_token() {
+        let a = app();
+        let tokens = [
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4",       // обычный ASCII
+            "ёаbсдеёфгhijклм",                   // кириллица в начале и в середине
+            "abcdefghijКЛМНОП",                  // кириллица в конце
+            "ЁЖЗИЙКЛМНОПРСТ",                    // только кириллица
+            "токен-с-русскими-буквами-1234",
+            // Три байта в начале: граница 4 байта попадает внутрь символа.
+            "abc☺defghij",
+            // Трёхбайтовые символы в конце: граница len-4 тоже попадает внутрь.
+            "abcdefghабв",
+        ];
+        for t in tokens {
+            let chars: Vec<char> = t.chars().collect();
+            let expected = if chars.len() <= 8 {
+                "••••••••".to_string()
+            } else {
+                format!(
+                    "{}…{}",
+                    chars[..4].iter().collect::<String>(),
+                    chars[chars.len() - 4..].iter().collect::<String>()
+                )
+            };
+            assert_eq!(a.mask_token(t), expected, "токен {t:?}");
+        }
+        // Короткий токен не показываем ни в каком виде, даже с русскими
+        // буквами: маскировать нечего, а длина в символах, не в байтах.
+        assert_eq!(a.mask_token("ёжик"), "••••••••");
+        assert_eq!(a.mask_token(""), "••••••••");
+    }
+
+    /// То же через подпись аккаунта — это то место, где паника случалась на
+    /// настоящем клике пользователя.
+    #[test]
+    fn account_label_survives_non_ascii_token() {
+        let a = app();
+        let acc = StoredAccount {
+            token: "ёаbсдеёфгhijклм".to_string(),
+            username: String::new(),
+        };
+        let label = a.account_label(&acc);
+        assert!(label.contains('…'), "подпись должна быть замаскирована: {label:?}");
+        // С известным именем токен не показывается вовсе — и это тоже должно
+        // быть безопасно.
+        let named = StoredAccount {
+            token: "ёаbсдеёфгhijклм".to_string(),
+            username: "Вася".to_string(),
+        };
+        assert_eq!(a.account_label(&named), "Вася");
     }
 }
