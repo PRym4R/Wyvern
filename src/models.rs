@@ -21,6 +21,11 @@ impl CacheCost for TextureHandle {
 /// элемент. Ограничение сразу по двум параметрам — по количеству и по
 /// памяти, — поэтому кэш не раздуется ни от числа элементов, ни от одной
 /// большой картинки.
+///
+/// Для текстур это ещё и настоящий расход: `TextureHandle` освобождает
+/// текстуру в egui, как только уничтожается последняя ссылка на неё, а
+/// вытеснение из кэша ссылку и уничтожает. Отдельной копии, которую кэш не
+/// считает, в egui не остаётся — см. тест `evicting_a_texture_frees_it_in_egui_too`.
 pub(crate) struct BoundedCache<V> {
     map: HashMap<String, V>,
     order: VecDeque<String>,
@@ -420,5 +425,42 @@ mod tests {
         );
         // Дерево serde_json::Value при этом ещё дороже самого текста: каждая
         // строка и каждый ключ в нём — отдельная аллокация.
+    }
+
+    /// Вытеснение текстуры из кэша освобождает её и в egui.
+    ///
+    /// `TextureHandle` освобождает текстуру, когда уничтожается последняя
+    /// ссылка на неё. Значит «48 МБ» клиентского кэша — это и есть память
+    /// текстур, а не только собственная прикидка: неучтённой копии в egui не
+    /// остаётся. Тест держит это поведение — если кэш начнёт хранить лишнюю
+    /// ссылку, вытесненные текстуры перестанут освобождаться.
+    #[test]
+    fn evicting_a_texture_frees_it_in_egui_too() {
+        let ctx = egui::Context::default();
+        let mut cache: BoundedCache<TextureHandle> = BoundedCache::with_budget(1, usize::MAX);
+
+        let first = ctx.load_texture(
+            "первая",
+            egui::ColorImage::new([2, 2], Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let first_id = first.id();
+        cache.insert("first".into(), first);
+        assert!(
+            ctx.tex_manager().read().meta(first_id).is_some(),
+            "только что загруженная текстура должна быть в egui"
+        );
+
+        let second = ctx.load_texture(
+            "вторая",
+            egui::ColorImage::new([2, 2], Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        cache.insert("second".into(), second);
+        assert!(!cache.contains_key("first"), "старая запись должна вытесниться");
+        assert!(
+            ctx.tex_manager().read().meta(first_id).is_none(),
+            "вытесненная текстура должна освободиться и в egui"
+        );
     }
 }
