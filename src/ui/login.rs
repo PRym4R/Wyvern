@@ -9,6 +9,17 @@ fn initial_of(name: &str) -> String {
     name.chars().next().unwrap_or('?').to_ascii_uppercase().to_string()
 }
 
+/// Ширина строки в 13-м шрифте. Нужна, чтобы разложить чипы аккаунтов по
+/// строкам самим: `horizontal_wrapped` внутри нижней панели ширину получает
+/// неверную и уносит содержимое за её пределы.
+fn text_width(ctx: &egui::Context, text: &str) -> f32 {
+    ctx.fonts(|f| {
+        f.layout_no_wrap(text.to_string(), egui::FontId::proportional(13.0), Color32::WHITE)
+            .size()
+            .x
+    })
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -70,105 +81,171 @@ impl App {
         let mut pick: Option<String> = None;
         let mut remove: Option<usize> = None;
 
+        // Сетка с переносом вместо горизонтальной прокрутки: при десятке
+        // аккаунтов полоса уезжала за край, и до дальних можно было
+        // добраться только прокруткой, о которой ничего не говорило.
+        //
+        // Строки раскладываем сами и по ширине окна, а не внутри панели:
+        // `available_width()` там на первом проходе ещё не определён, строки
+        // выходят другие, и панель получает неверную высоту — содержимое
+        // уезжает за нижний край экрана. По той же причине не годится и
+        // `horizontal_wrapped`.
+        let names: Vec<String> = self
+            .saved_accounts
+            .iter()
+            .map(|acc| truncate(&self.account_label(acc), 18))
+            .collect();
+        let gap = 6.0;
+        let avail = ctx.available_rect().width() - 28.0;
+        let widths: Vec<f32> = names
+            .iter()
+            .map(|n| 74.0 + text_width(ctx, n) + gap)
+            .collect();
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut row: Vec<usize> = Vec::new();
+        let mut used = 0.0;
+        for (i, w) in widths.iter().enumerate() {
+            if !row.is_empty() && used + w > avail {
+                rows.push(std::mem::take(&mut row));
+                used = 0.0;
+            }
+            row.push(i);
+            used += w;
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+
         egui::TopBottomPanel::bottom("login_accounts")
             .resizable(false)
             .show_separator_line(false)
-            .exact_height(56.0)
-            .frame(egui::Frame::new()
-                .fill(theme.panel_bg)
-                .inner_margin(egui::Margin::symmetric(14, 10))
-                .corner_radius(12.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.panel_bg)
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .corner_radius(12.0),
+            )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("АККАУНТЫ").size(10.0).color(theme.text_secondary));
-                    egui::ScrollArea::horizontal()
-                        .id_salt("login_accounts_scroll")
-                        .auto_shrink([false, false])
-                        .max_height(34.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, acc) in self.saved_accounts.iter().enumerate() {
-                                    let name = truncate(&self.account_label(acc), 18);
-                                    let selected = self.login_selected.as_deref() == Some(acc.token.as_str());
-                                    let is_active = self.active_index == Some(i);
-                                    let highlighted = selected || is_active;
-                                    let fill = if selected {
-                                        theme.accent.gamma_multiply(0.22)
-                                    } else {
-                                        theme.input_bg
-                                    };
-                                    let border = if selected {
-                                        theme.accent
-                                    } else if is_active {
-                                        theme.accent.gamma_multiply(0.45)
-                                    } else {
-                                        theme.divider
-                                    };
+                ui.label(
+                    RichText::new("АККАУНТЫ")
+                        .size(10.0)
+                        .color(theme.text_secondary),
+                );
+                ui.add_space(6.0);
+                for row in &rows {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        for &i in row {
+                            let acc = &self.saved_accounts[i];
+                            let name = &names[i];
+                            let selected =
+                                self.login_selected.as_deref() == Some(acc.token.as_str());
+                            let is_active = self.active_index == Some(i);
+                            let highlighted = selected || is_active;
+                            let fill = if selected {
+                                theme.accent.gamma_multiply(0.22)
+                            } else {
+                                theme.input_bg
+                            };
+                            let border = if selected {
+                                theme.accent
+                            } else if is_active {
+                                theme.accent.gamma_multiply(0.45)
+                            } else {
+                                theme.divider
+                            };
 
-                                    let chip = egui::Frame::new()
-                                        .fill(fill)
-                                        .corner_radius(10.0)
-                                        .inner_margin(egui::Margin::symmetric(8, 4))
-                                        .stroke(egui::Stroke::new(1.0_f32, border))
-                                        .show(ui, |ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-                                            let (ar, ar_resp) = ui.allocate_exact_size(
-                                                egui::vec2(22.0, 22.0),
-                                                egui::Sense::click(),
-                                            );
-                                            ui.painter().circle_filled(
-                                                ar.center(),
-                                                11.0,
-                                                if highlighted { theme.accent } else { theme.divider },
-                                            );
-                                            ui.painter().text(
-                                                ar.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                initial_of(&name),
-                                                egui::FontId::proportional(12.0),
-                                                if highlighted { Color32::BLACK } else { theme.text },
-                                            );
-                                            let name_resp = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(&name).size(13.0).color(theme.text),
-                                                )
-                                                .fill(Color32::TRANSPARENT)
-                                                .stroke(egui::Stroke::NONE)
-                                                .min_size(egui::vec2(0.0, 22.0)),
-                                            );
-                                            (ar_resp, name_resp)
-                                        });
-
-                                    let (ar_resp, name_resp) = chip.inner;
-                                    if ar_resp.hovered() || name_resp.hovered() {
-                                        ui.painter().rect_stroke(
-                                            chip.response.rect,
-                                            10.0,
-                                            egui::Stroke::new(1.0_f32, theme.accent),
-                                            egui::StrokeKind::Inside,
-                                        );                                    }
-                                    if ar_resp.clicked() || name_resp.clicked() {
-                                        pick = Some(acc.token.clone());
-                                    }
-                                    name_resp.on_hover_text(self.mask_token(&acc.token));
-
-                                    let x = ui.add_sized(
-                                        [20.0, 22.0],
+                            let chip = egui::Frame::new()
+                                .fill(fill)
+                                .corner_radius(10.0)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .stroke(egui::Stroke::new(1.0_f32, border))
+                                .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                                    let (ar, ar_resp) = ui.allocate_exact_size(
+                                        egui::vec2(22.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    ui.painter().circle_filled(
+                                        ar.center(),
+                                        11.0,
+                                        if highlighted {
+                                            theme.accent
+                                        } else {
+                                            theme.divider
+                                        },
+                                    );
+                                    ui.painter().text(
+                                        ar.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        initial_of(name),
+                                        egui::FontId::proportional(12.0),
+                                        if highlighted {
+                                            Color32::BLACK
+                                        } else {
+                                            theme.text
+                                        },
+                                    );
+                                    let name_resp = ui.add(
                                         egui::Button::new(
-                                            RichText::new("✕").size(11.0).color(theme.text_secondary),
+                                            RichText::new(name).size(13.0).color(theme.text),
                                         )
                                         .fill(Color32::TRANSPARENT)
                                         .stroke(egui::Stroke::NONE)
-                                        .corner_radius(6.0),
+                                        .min_size(egui::vec2(0.0, 22.0)),
                                     );
-                                    if x.clicked() {
-                                        remove = Some(i);
+                                    // Крестик — только у выбранного или под
+                                    // наведением: десять крестиков подряд
+                                    // перекрывали сами аккаунты. Место под
+                                    // него держим всегда, иначе чип прыгал
+                                    // бы, стоило навести мышь.
+                                    let x_at = ui.next_widget_position();
+                                    let x_rect =
+                                        egui::Rect::from_min_size(x_at, egui::vec2(20.0, 22.0));
+                                    let show_x = highlighted
+                                        || ar_resp.hovered()
+                                        || name_resp.hovered()
+                                        || ui.rect_contains_pointer(x_rect);
+                                    if show_x {
+                                        let x = ui.add_sized(
+                                            [20.0, 22.0],
+                                            egui::Button::new(
+                                                RichText::new("✕")
+                                                    .size(11.0)
+                                                    .color(theme.text_secondary),
+                                            )
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::NONE)
+                                            .corner_radius(6.0),
+                                        );
+                                        if x.clicked() {
+                                            remove = Some(i);
+                                        }
+                                    } else {
+                                        ui.allocate_exact_size(
+                                            egui::vec2(20.0, 22.0),
+                                            egui::Sense::hover(),
+                                        );
                                     }
-                                    ui.add_space(4.0);
-                                }
-                            });
-                        });
-                });
+                                    (ar_resp, name_resp)
+                                });
+
+                            let (ar_resp, name_resp) = chip.inner;
+                            if ar_resp.hovered() || name_resp.hovered() {
+                                ui.painter().rect_stroke(
+                                    chip.response.rect,
+                                    10.0,
+                                    egui::Stroke::new(1.0_f32, theme.accent),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if ar_resp.clicked() || name_resp.clicked() {
+                                pick = Some(acc.token.clone());
+                            }
+                            name_resp.on_hover_text(self.mask_token(&acc.token));
+                        }
+                    });
+                }
             });
 
         if let Some(token) = pick {
@@ -384,6 +461,9 @@ mod tests {
     use crate::models::StoredAccount;
 
     /// Позиции всех нарисованных строк текста: (текст, x, y).
+    ///
+    /// Кадров два: высоту нижней панели egui узнаёт по содержимому первого
+    /// прохода, и только со второго панель стоит на своём месте.
     fn texts(app: &mut App) -> Vec<(String, f32, f32)> {
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
@@ -393,6 +473,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let _ = ctx.run(raw.clone(), |ctx| app.draw_login(ctx));
         let out = ctx.run(raw, |ctx| app.draw_login(ctx));
         let mut found = Vec::new();
         for cs in out.shapes {
@@ -480,5 +561,55 @@ mod tests {
         assert_eq!(at(&list, "alice").len(), 1);
         // Без имени показывается маска токена.
         assert_eq!(at(&list, "••••").len(), 1, "аккаунт без имени не показан: {:?}", list);
+    }
+
+    /// Аккаунты в ленте выстраиваются сеткой с переносом, а не одной длинной
+    /// строкой с горизонтальной прокруткой.
+    ///
+    /// Раньше список жил в `ScrollArea::horizontal`: при десятке аккаунтов они
+    /// уезжали за край окна, и добраться до дальних можно было только
+    /// прокруткой, о которой ничего не говорило.
+    #[test]
+    fn many_accounts_wrap_into_a_grid() {
+        let mut app = make_app();
+        app.saved_accounts = (1..=20)
+            .map(|i| StoredAccount { token: format!("tok-{i}"), username: format!("acc{i}") })
+            .collect();
+        let list = texts(&mut app);
+        let rows: std::collections::BTreeSet<i32> = (1..=20)
+            .flat_map(|i| {
+                list.iter()
+                    .filter(|(t, _, _)| *t == format!("acc{i}"))
+                    .map(|(_, _, y)| y.round() as i32)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            rows.len() > 1,
+            "двадцать аккаунтов должны переноситься на новые строки, а строка одна: {rows:?}"
+        );
+    }
+
+    /// Крестик удаления показывается только у выбранного аккаунта, а по
+    /// умолчанию не мозолит глаза: десять крестиков подряд перекрывали сами
+    /// аккаунты, из-за которых лента и нужна.
+    #[test]
+    fn remove_button_hides_until_selected() {
+        let mut app = make_app();
+        app.saved_accounts = vec![
+            StoredAccount { token: "tok-one".into(), username: "alice".into() },
+            StoredAccount { token: "tok-two".into(), username: "bob".into() },
+        ];
+        let list = texts(&mut app);
+        assert_eq!(
+            at(&list, "✕").len(),
+            0,
+            "крестиков без наведения быть не должно: {:?}",
+            at(&list, "✕")
+        );
+
+        app.login_selected = Some("tok-two".into());
+        let list = texts(&mut app);
+        assert_eq!(at(&list, "✕").len(), 1, "у выбранного аккаунта крестик должен быть");
     }
 }
