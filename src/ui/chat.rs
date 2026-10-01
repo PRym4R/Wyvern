@@ -174,7 +174,10 @@ impl App {
         self.scroll_to_bottom || self.chat_at_bottom
     }
     pub(crate) fn draw_main_chat(&mut self, ctx: &egui::Context) {
-        let msgs = self.current_channel_messages();
+        // Список канала уезжает из карты на время кадра, чтобы рисовать по
+        // владеющему `Vec`: копия всех `Arc` канала делалась на каждом кадре
+        // (Т-3). Возвращается на место в конце кадра.
+        let (taken_channel, msgs) = self.take_channel_messages();
 
         // Аватары отдельно prefetch'ить не нужно: каждая строка сообщения и
         // так достаёт свой аватар (и качает, если его нет). Отдельный проход
@@ -200,7 +203,9 @@ impl App {
             self.last_render_key = key;
             let n_channels = self.channels.len();
             let srect = ctx.screen_rect();
-            let stored = self.messages.get(&sel_cid).map_or(0, |v| v.len());
+            // Список уже забран, поэтому его длину берём у себя: для открытого
+            // канала это и есть число сообщений в карте.
+            let stored = msgs.len();
             self.push_debug(format!("RENDER: sel='{}' sel_cid='{}' msgs={} stored={} total_channels={} screen={}x{}", channel_label.clone().unwrap_or_else(|| "none".into()), sel_cid, msgs.len(), stored, n_channels, srect.width().round() as i32, srect.height().round() as i32));
         }
 
@@ -372,10 +377,10 @@ impl App {
                                     // видимую часть, и полоса прокрутки будет
                                     // врать про длину истории.
                                     let (first, end) = visible_window(&offsets, offset, ui.available_height());
-                                    let window: Vec<Arc<ChatMessage>> = msgs_for_render
-                                        .get(first..end)
-                                        .map(|s| s.to_vec())
-                                        .unwrap_or_default();
+                                    // Срез, а не копия: `msgs` и так наш на время
+                                    // кадра, отдельный Vec окна — лишняя
+                                    // аллокация на каждый кадр (Т-3).
+                                    let window = msgs_for_render.get(first..end).unwrap_or(&[]);
                                     // Где сейчас отрисован низ последнего
                                     // сообщения — от этого считаем зазоры.
                                     let mut drawn = 0.0_f32;
@@ -384,6 +389,16 @@ impl App {
                                     // выделялась своя строка.
                                     let mut avatar_key = String::new();
                                     for (k, msg) in window.iter().enumerate() {
+                                        // Только для тестов: сколько сильных
+                                        // ссылок на сообщение в момент
+                                        // отрисовки. Копия списка на кадр
+                                        // удваивала бы счётчик (Т-3).
+                                        #[cfg(test)]
+                                        {
+                                            self.probe_msg_refs = self
+                                                .probe_msg_refs
+                                                .max(Arc::strong_count(msg));
+                                        }
                                         let i = first + k;
                                         let top = offsets[i];
                                         let gap = top - drawn;
@@ -501,6 +516,9 @@ impl App {
                         };
                         scroll_out
                     });
+                // Список нужен снова: `request_older_history` берёт из него
+                // самый старый id. До этого шага кадр рисовал по своему Vec.
+                self.restore_channel_messages(taken_channel, msgs);
                 self.msg_offsets = offsets;
                 if self.want_older {
                     self.want_older = false;
@@ -755,6 +773,26 @@ mod geometry_tests {
         tx: mpsc::UnboundedSender<ToApp>,
         /// Команды приложения в гейтвей.
         cmds: mpsc::UnboundedReceiver<ToGateway>,
+    }
+
+    /// Кадр не должен копировать список сообщений канала.
+    ///
+    /// Раньше `current_channel_messages` возвращал `.cloned()` — копию всех
+    /// `Arc` канала на каждом кадре, а сверху ещё копировалось окно
+    /// (`to_vec`). Пробник считает сильные ссылки на сообщение прямо в момент
+    /// отрисовки: при копии их было бы больше одной, а у взятого из карты
+    /// списка ссылка ровно одна.
+    #[test]
+    fn drawing_the_chat_does_not_clone_the_message_list() {
+        let mut h = app_with_messages(50);
+        let ctx = egui::Context::default();
+        h.app.probe_msg_refs = 0;
+        frame(&mut h.app, &ctx);
+        assert_eq!(
+            h.app.probe_msg_refs, 1,
+            "кадр копирует список сообщений канала: сильных ссылок было {}",
+            h.app.probe_msg_refs
+        );
     }
 
     /// Колесо должно листать чат в обе стороны. Проверяем именно то, что

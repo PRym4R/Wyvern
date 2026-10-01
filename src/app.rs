@@ -115,6 +115,11 @@ pub(crate) struct App {
     pub(crate) debug_log: VecDeque<String>,
     /// Писать ли отладочный лог на диск и в stderr. См. `debug_to_disk_from_env`.
     pub(crate) debug_to_disk: bool,
+    /// Сколько сильных ссылок на сообщение видел последний нарисованный кадр.
+    /// Пробник для теста: копия списка на кадр удваивала бы счётчик, а «взять
+    /// список из карты на время кадра» — нет. Только для тестов.
+    #[cfg(test)]
+    pub(crate) probe_msg_refs: usize,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
@@ -232,6 +237,8 @@ impl App {
             send_error: None,
             debug_log: VecDeque::new(),
             debug_to_disk: debug_to_disk_from_env(),
+            #[cfg(test)]
+            probe_msg_refs: 0,
             to_gw: None,
             from_gw,
             gw_started: false,
@@ -871,16 +878,44 @@ impl App {
             iso
         }
     }
-    /// Сообщения текущего канала. Отдаём `Arc`, поэтому вызывающий код
-    /// копирует только указатели, а не все сообщения целиком.
-    pub(crate) fn current_channel_messages(&self) -> Vec<Arc<ChatMessage>> {
-        self.selected_channel
+    /// Забирает сообщения открытого канала на время кадра.
+    ///
+    /// Рисовать кадр нужно по владеющему `Vec`: иначе `self` занят на всё
+    /// время отрисовки, и `&mut`-методы (`draw_message`, кэш высот) из цикла не
+    /// позвать. Раньше ради этого делали `.cloned()` всего списка — на каждом
+    /// кадре, то есть копия всех `Arc` канала двадцать раз в секунду. Вместо
+    /// копии список *уезжает* из карты: на месте ключа остаётся пустой `Vec`,
+    /// поэтому `contains_key` не меняется, а сам список возвращает
+    /// `restore_channel_messages` в конце кадра.
+    ///
+    /// Возвращаем и id канала: по нему список кладётся обратно.
+    pub(crate) fn take_channel_messages(
+        &mut self,
+    ) -> (Option<String>, Vec<Arc<ChatMessage>>) {
+        let Some(id) = self
+            .selected_channel
             .and_then(|i| self.channels.get(i))
             .map(|ch| ch.id.clone())
-            .and_then(|id| self.messages.get(&id))
-            .cloned()
-            .unwrap_or_default()
-            .into()
+        else {
+            return (None, Vec::new());
+        };
+        match self.messages.get_mut(&id) {
+            Some(entry) => (Some(id), std::mem::take(entry)),
+            None => (None, Vec::new()),
+        }
+    }
+
+    /// Кладёт на место список, забранный `take_channel_messages`.
+    pub(crate) fn restore_channel_messages(
+        &mut self,
+        id: Option<String>,
+        msgs: Vec<Arc<ChatMessage>>,
+    ) {
+        if let Some(id) = id {
+            if let Some(entry) = self.messages.get_mut(&id) {
+                *entry = msgs;
+            }
+        }
     }
 /// Экран входа вместо чата?
     ///
