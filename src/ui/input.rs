@@ -89,8 +89,11 @@ impl App {
             // сообщение показывалось дважды.
             let local_id = format!("{}{}", LOCAL_ID_PREFIX, self.next_local_id);
             self.next_local_id += 1;
+            // Прежняя неудача погасла: пользователь пишет заново, значит
+            // сообщение о старом отказе уже не в тему.
+            self.send_error = None;
             self.messages.entry(cid.clone()).or_default().push(std::sync::Arc::new(ChatMessage {
-                id: local_id,
+                id: local_id.clone(),
                 channel_id: cid.clone(),
                 author_id: self.user_id.clone(),
                 author_name: self.username.clone(),
@@ -102,7 +105,7 @@ impl App {
                 embeds: Vec::new(),
                 is_own: true,
             }));
-            self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string() });
+            self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id });
         }
     }
 }

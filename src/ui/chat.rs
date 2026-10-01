@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::app::App;
 use crate::models::ChatMessage;
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
+use crate::ui::ERROR_RED;
 
 /// Насколько за границу окна рисуем сообщения. Запас нужен, чтобы при быстром
 /// скролле не появлялись пустые полосы: между колёсами мыши egui успевает
@@ -258,6 +259,17 @@ impl App {
                     .frame(egui::Frame::new().fill(self.theme.channel_bg))
                     .show(ctx, |ui| {
                         ui.set_min_width(0.0);
+
+                        // Отказ отправки виден здесь, а не в поле статуса: тот
+                        // рисуется только на экране входа, и в чате о неудаче
+                        // не говорилось ничего — сообщение просто пропадало.
+                        if let Some(reason) = self.send_error.as_ref() {
+                            ui.horizontal_centered(|ui| {
+                                ui.label(RichText::new(format!("Не отправлено: {reason}"))
+                                    .size(12.0)
+                                    .color(ERROR_RED));
+                            });
+                        }
 
                         if self.history_loading.is_some() {
                             ui.horizontal_centered(|ui| {

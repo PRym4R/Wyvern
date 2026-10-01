@@ -147,9 +147,26 @@ async fn send_message(
     event_tx: mpsc::UnboundedSender<ToApp>,
     channel_id: String,
     content: String,
+    local_id: String,
 ) {
     let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-    send_message_to(httpc, tkn, event_tx, url, content).await;
+    send_message_to(httpc, tkn, event_tx, url, content, local_id, channel_id).await;
+}
+
+/// Почему Discord отказал в отправке — словами для пользователя.
+///
+/// Коды и тело ответа показывать нельзя: там HTML-страница на сотни строк, и
+/// она либо не влезает в строку статуса, либо молча обрезается. Пользователю
+/// нужно знать главное — писать сюда нельзя или можно повторить.
+fn send_failure_reason(status: u16) -> &'static str {
+    match status {
+        403 => "в этот канал писать нельзя",
+        404 => "канал не найден — возможно, прав на него нет",
+        429 => "слишком много сообщений подряд, Discord просит подождать",
+        // 413 — текст не влез, 400 — например, больше 2000 символов.
+        400 | 413 => "Discord отклонил текст (скорее всего, длиннее 2000 символов)",
+        _ => "Discord отклонил сообщение",
+    }
 }
 
 /// Клиент для запросов к Discord API.
@@ -186,6 +203,8 @@ async fn send_message_to(
     event_tx: mpsc::UnboundedSender<ToApp>,
     url: String,
     content: String,
+    local_id: String,
+    channel_id: String,
 ) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -205,12 +224,26 @@ async fn send_message_to(
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
                 let _ = event_tx.send(ToApp::Debug(format!("Send failed {}: {}", status, body)));
+                // Неудачу показываем пользователю и убираем эхо из чата. Раньше
+                // об этом знал только отладочный лог: сообщение оставалось в
+                // списке навсегда, выглядело как отправленное, а текст из поля
+                // ввода уже очистился — вернуть его было нечем.
+                let _ = event_tx.send(ToApp::SendFailed {
+                    channel_id,
+                    local_id,
+                    reason: send_failure_reason(status.as_u16()).to_string(),
+                });
             } else {
                 let _ = event_tx.send(ToApp::Debug("Message sent".into()));
             }
         }
         Err(e) => {
             let _ = event_tx.send(ToApp::Debug(format!("Send error: {}", e)));
+            let _ = event_tx.send(ToApp::SendFailed {
+                channel_id,
+                local_id,
+                reason: "не удалось отправить: нет связи с Discord".to_string(),
+            });
         }
     }
 }
@@ -1129,7 +1162,7 @@ async fn gw_inner(
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    ToGateway::Send { channel_id, content } => {
+                    ToGateway::Send { channel_id, content, local_id } => {
                         // Отправку тоже уводим из цикла в отдельную задачу.
                         // Пока идёт POST, гейтвей не читает события и не
                         // берёт команды: сообщение, пришедшее в это время,
@@ -1139,7 +1172,7 @@ async fn gw_inner(
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
                         tokio::spawn(async move {
-                            send_message(httpc, tkc, ev, channel_id, content).await;
+                            send_message(httpc, tkc, ev, channel_id, content, local_id).await;
                         });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {
@@ -1195,7 +1228,9 @@ async fn gw_inner(
 
 #[cfg(test)]
 mod http_tests {
-    use super::{api_client, client_with_timeout, send_message_to, API_TIMEOUT};
+    use super::{
+    api_client, client_with_timeout, send_failure_reason, send_message_to, API_TIMEOUT,
+};
     use crate::messages::ToApp;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1241,16 +1276,45 @@ mod http_tests {
             tx,
             format!("http://{}/channels/1/messages", addr),
             "привет".into(),
+            "local:7".into(),
+            "c1".into(),
         ));
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "зависший POST должен обрываться, а не ждать: {:?}",
             started.elapsed()
         );
-        // И пользователю об этом должна уйти строка, а не тишина.
-        match rx.try_recv() {
-            Ok(ToApp::Debug(d)) => assert!(d.starts_with("Send error"), "получено: {d:?}"),
-            other => panic!("ожидалась ошибка отправки, получено: {other:?}"),
+        // Обрыв связи обязан быть виден пользователю: раньше уходила строка
+        // только в отладочный лог, а эхо оставалось в чате навсегда.
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            seen.push(ev);
+        }
+        assert!(
+            seen.iter().any(|e| matches!(e, ToApp::SendFailed { reason, .. } if reason.contains("нет связи"))),
+            "пользователь должен узнать об отказе, получено: {seen:?}"
+        );
+    }
+
+    /// Отказ Discord должен объясняться словами, а не кодом. Пользователю
+    /// важно одно: писать сюда нельзя или можно повторить. Код 403 в строке
+    /// статуса не помогает ничего.
+    #[test]
+    fn send_failure_reasons_are_readable() {
+        for (status, must_contain) in [
+            (403u16, "писать нельзя"),
+            (404, "прав"),
+            (429, "подождать"),
+            (400, "2000"),
+            (413, "2000"),
+            (500, "отклонил"),
+        ] {
+            let reason = send_failure_reason(status);
+            assert!(
+                reason.contains(must_contain),
+                "код {status}: должно быть про {must_contain:?}, а написано {reason:?}"
+            );
+            assert!(!reason.contains(&status.to_string()), "код не должен попадать в текст: {reason:?}");
         }
     }
 }

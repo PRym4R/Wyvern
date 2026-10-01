@@ -66,6 +66,10 @@ pub(crate) struct App {
     pub(crate) saved_accounts: Vec<StoredAccount>,
     pub(crate) active_index: Option<usize>,
     pub(crate) status: String,
+    /// Не отправилось последнее сообщение: почему. Раньше отказ жил только в
+    /// `status`, а тот рисуется на экране входа — то есть в чате о неудаче
+    /// не говорилось вообще ничего, и сообщение просто исчезало.
+    pub(crate) send_error: Option<String>,
     pub(crate) debug_log: Vec<String>,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
@@ -160,6 +164,7 @@ impl App {
             saved_accounts: Vec::new(),
             active_index: None,
             status: String::new(),
+            send_error: None,
             debug_log: Vec::new(),
             to_gw: None,
             from_gw,
@@ -354,6 +359,37 @@ impl App {
                         self.connected = false;
                     }
                     self.status = s;
+                }
+                ToApp::SendFailed { channel_id, local_id, reason } => {
+                    // Отправка не вышла: эхо убираем, иначе оно навсегда
+                    // осталось бы в списке и выглядело как отправленное
+                    // сообщение (Б-9), а текст вернуть в поле человек уже не
+                    // мог: Enter очистил его до того, как пришёл ответ.
+                    let mut taken_back: Option<String> = None;
+                    if let Some(entry) = self.messages.get_mut(&channel_id) {
+                        if let Some(pos) = entry.iter().rposition(|m| m.id == local_id) {
+                            taken_back = Some(entry.remove(pos).content.clone());
+                            // Список уменьшился — измеренные высоты и якорь к
+                            // нему больше не относятся. Если не сбросить, высота
+                            // продолжит считаться от удалённого сообщения и
+                            // чат дёрнется.
+                            self.msg_heights.clear();
+                            self.msg_offsets.clear();
+                            self.chat_anchor = None;
+                            self.scroll_to_bottom = true;
+                        }
+                    }
+                    // Возвращаем текст в поле, если пользователь в этом канале и
+                    // ещё не начал писать новое: иначе наш старый текст затёр бы
+                    // то, что он набирает прямо сейчас.
+                    if self.current_channel_id() == Some(channel_id.as_str()) && self.input.trim().is_empty() {
+                        self.input = taken_back.unwrap_or_default();
+                    }
+                    self.send_error = Some(reason);
+                    // Обрезка по символам: id служебный, но вставляют его мы
+                    // сами, а не Discord (см. маску токена).
+                    let short: String = local_id.chars().take(14).collect();
+                    self.push_debug(format!("Send failed for {}", short));
                 }
                 ToApp::AuthFailed { reason } => {
                     // Discord отклонил токен. Возвращаемся на экран входа:
@@ -1745,6 +1781,120 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// Неудачная отправка: сообщение не должно остаться в чате навсегда.
+/// Раньше эхо добавлялось и больше никуда не девалось — при отказе Discord
+/// (403, лимит, длинный текст, обрыв связи) человек видел своё сообщение в
+/// чате, как будто оно дошло, а текст из поля уже очистился.
+#[test]
+    fn failed_send_removes_echo_and_returns_text() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.user_id = "me".into();
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        let _ = std::iter::from_fn(|| cmd_rx.try_recv().ok()).count();
+
+        app.handle_input("не отправится");
+        // Enter очищает поле сразу, не дожидаясь Discord.
+        app.input.clear();
+        let local_id = app.messages.get("c1").unwrap()[0].id.clone();
+        assert!(local_id.starts_with(crate::models::LOCAL_ID_PREFIX));
+
+        tx.send(ToApp::SendFailed {
+            channel_id: "c1".into(),
+            local_id: local_id.clone(),
+            reason: "в этот канал писать нельзя".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+
+        assert!(
+            app.messages.get("c1").unwrap().is_empty(),
+            "неотправленное сообщение не должно висеть в чате: {:?}",
+            app.messages.get("c1")
+        );
+        assert_eq!(app.input, "не отправится", "текст надо вернуть, чтобы можно было повторить");
+        assert!(
+            app.send_error.as_deref().is_some_and(|r| r.contains("писать нельзя")),
+            "пользователь должен видеть причину: {:?}",
+            app.send_error
+        );
+    }
+
+    /// Если человек уже начал писать новое, возвращать старый текст нельзя —
+    /// он затёр бы то, что набирается прямо сейчас.
+    #[test]
+    fn failed_send_does_not_overwrite_new_draft() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        app.user_id = "me".into();
+
+        app.handle_input("старое");
+        let local_id = app.messages.get("c1").unwrap()[0].id.clone();
+        app.input = "новый черновик".into();
+        tx.send(ToApp::SendFailed {
+            channel_id: "c1".into(),
+            local_id,
+            reason: "нет связи с Discord".into(),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.input, "новый черновик", "черновик пользователя не должен затираться");
+    }
+
+    /// Начал отправлять — прежняя неудача погасла: она уже не в тему.
+    #[test]
+    fn sending_clears_the_previous_failure_notice() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.to_gw = Some(cmd_tx);
+        app.user_id = "me".into();
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "chan".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+        app.open_channel("c1");
+        tx.send(ToApp::SendFailed {
+            channel_id: "c1".into(),
+            local_id: "local:0".into(),
+            reason: "нет связи с Discord".into(),
+        })
+        .unwrap();
+        app.poll(&egui::Context::default());
+        assert!(app.send_error.is_some());
+
+        app.handle_input("ещё раз");
+        assert!(app.send_error.is_none(), "старая неудача не должна висеть над новым сообщением");
     }
 
     /// Живое сообщение уже в истории — дубль пропускается.

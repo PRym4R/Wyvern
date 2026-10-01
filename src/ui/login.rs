@@ -1,9 +1,9 @@
 use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
+use crate::ui::ERROR_RED;
 
 const CARD_WIDTH: f32 = 400.0;
-const ERROR_RED: Color32 = Color32::from_rgb(250, 77, 77);
 
 fn initial_of(name: &str) -> String {
     name.chars().next().unwrap_or('?').to_ascii_uppercase().to_string()
