@@ -34,6 +34,19 @@ pub(crate) fn input_width(available: f32) -> f32 {
     (available - INPUT_CHROME).max(MIN_INPUT_WIDTH)
 }
 
+/// Обрезать пробелы и невидимые символы.
+///
+/// Обычный `trim()` не трогает неразрывный пробел, zero-width space и
+/// byte-order mark: они не относятся к `White_Space` по Unicode. А человек,
+/// у которого прилип невидимый символ с конца сообщения (буфер обмена,
+/// расширение браузера, автозамена), отправляет «пустое» сообщение и потом
+/// удивляется, откуда взялось сообщение из одного пробела.
+pub(crate) fn trim_input(text: &str) -> &str {
+    text.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{2060}')
+    })
+}
+
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
         let has_channel = self.selected_channel.is_some();
@@ -75,11 +88,7 @@ impl App {
                         let send_clicked = send_btn.clicked();
 
                         if enter_pressed || send_clicked {
-                            let text = self.input.trim().to_string();
-                            if !text.is_empty() {
-                                self.handle_input(&text);
-                                self.input.clear();
-                            }
+                            self.submit_input();
                             resp.request_focus();
                         }
                     }
@@ -124,6 +133,21 @@ impl App {
             }));
             self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id });
         }
+    }
+
+    /// Enter или кнопка «Send»: отправляем, если есть что, и очищаем поле.
+    ///
+    /// Очистка стоит вне проверки «есть ли что отправить» намеренно. Раньше
+    /// она была внутри, и пробелы (или невидимые символы) оставались в поле
+    /// навсегда: следующий настоящий Enter выглядел как «ничего не
+    /// отправилось», хотя предыдущее сообщение ушло. Сбивает ровно в тот
+    /// момент, когда человек проверяет, дошло ли сообщение.
+    pub(crate) fn submit_input(&mut self) {
+        let text = trim_input(&self.input).to_string();
+        if !text.is_empty() {
+            self.handle_input(&text);
+        }
+        self.input.clear();
     }
 
     /// Отладочная команда из поля сообщения. Первое нажатие только спрашивает
@@ -179,6 +203,46 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::models::ChatChannel;
+
+    /// Пробелы в поле не должны переживать отправку. Раньше очистка стояла
+    /// внутри «есть ли что отправить», поэтому `trim()` давал пустую строку,
+    /// очистки не происходило, и в поле навсегда оставалось «   ». Следующий
+    /// настоящий Enter после этого выглядит как «ничего не отправилось» —
+    /// а сообщение-то ушло.
+    #[test]
+    fn whitespace_only_input_is_cleared_on_submit() {
+        let (mut app, _ctx) = narrow_app();
+        app.input = "   \u{200b}\n".to_string();
+
+        app.submit_input();
+
+        assert!(
+            app.input.is_empty(),
+            "в поле осталось {:?}, хотя отправлять было нечего",
+            app.input
+        );
+        assert!(
+            app.messages.get("c1").is_none_or(|v| v.is_empty()),
+            "пробелы не должны становиться сообщением"
+        );
+    }
+
+    /// Обычный текст отправляется без краевых пробелов, а поле после этого
+    /// пустое — иначе следующий Enter отправит пробелы вместо сообщения.
+    #[test]
+    fn submit_sends_trimmed_text_and_clears_the_field() {
+        let (mut app, _ctx) = narrow_app();
+        app.input = "  привет  ".to_string();
+
+        app.submit_input();
+
+        assert_eq!(app.input, "");
+        assert_eq!(app.messages["c1"][0].content, "привет");
+        // Сразу после отправки поле чистое: второй Enter ничего не отправит.
+        let sent_before = app.messages["c1"].len();
+        app.submit_input();
+        assert_eq!(app.messages["c1"].len(), sent_before, "пустое поле не должно ничего слать");
+    }
 
     /// Приложение с открытым каналом в самом узком поддерживаемом окне.
     fn narrow_app() -> (App, egui::Context) {
