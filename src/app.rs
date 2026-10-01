@@ -120,6 +120,11 @@ pub(crate) struct App {
     /// список из карты на время кадра» — нет. Только для тестов.
     #[cfg(test)]
     pub(crate) probe_msg_refs: usize,
+    /// Сколько серверов оставалось в `self.guilds` в момент отрисовки панели.
+    /// Пробник для теста: при копии списка он полный, а при взятии — ноль.
+    /// Только для тестов.
+    #[cfg(test)]
+    pub(crate) probe_guilds_in_render: usize,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
@@ -239,6 +244,8 @@ impl App {
             debug_to_disk: debug_to_disk_from_env(),
             #[cfg(test)]
             probe_msg_refs: 0,
+            #[cfg(test)]
+            probe_guilds_in_render: 0,
             to_gw: None,
             from_gw,
             gw_started: false,

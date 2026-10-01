@@ -42,8 +42,18 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
 
+                // Список серверов уезжает из self на время отрисовки, чтобы не
+                // копировать его целиком каждый кадр (Т-4): на двухстах серверах
+                // это четыре тысячи копий `Guild` в секунду, в каждой по три
+                // `String`. Обратно список кладём сразу после прокрутки.
+                let guilds = std::mem::take(&mut self.guilds);
+                // Только для тестов: сколько серверов осталось в self в момент
+                // отрисовки. Копия списка оставила бы его нетронутым (Т-4).
+                #[cfg(test)]
+                {
+                    self.probe_guilds_in_render = self.guilds.len();
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let guilds = self.guilds.clone();
                     for (i, guild) in guilds.iter().enumerate() {
                         ui.vertical_centered(|ui| {
                             let is_sel = self.selected_guild == Some(i);
@@ -75,6 +85,9 @@ impl App {
                         ui.add_space(6.0);
                     }
                 });
+                // Возвращаем список серверов на место: на время кадра он был
+                // у нас.
+                self.guilds = guilds;
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     let ubtn = ui.add_sized(
@@ -343,5 +356,41 @@ mod tests {
         assert!(!app.show_friends);
         // Переключение вида не выкидывает пользователя из открытого канала.
         assert_eq!(app.selected_channel, Some(1), "переключатель вида не должен сбрасывать выбор");
+    }
+
+    /// Панель серверов не должна копировать список `guilds` на каждом кадре.
+    ///
+    /// Раньше отрисовка начиналась с `self.guilds.clone()` — на двухстах
+    /// серверах это тысячи копий `Guild` в секунду. Теперь список уезжает из
+    /// `self` на время кадра, и пробник фиксирует, что в момент отрисовки в
+    /// `self.guilds` пусто.
+    #[test]
+    fn drawing_the_server_list_does_not_clone_the_guilds() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        for i in 0..200 {
+            app.guilds.push(crate::models::Guild {
+                id: format!("g{i}"),
+                name: format!("Сервер {i}"),
+                icon: None,
+            });
+        }
+        app.probe_guilds_in_render = usize::MAX;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input, |ctx| app.draw_server_list(ctx));
+
+        assert_eq!(
+            app.probe_guilds_in_render, 0,
+            "панель серверов копирует список серверов: в self осталось {}",
+            app.probe_guilds_in_render
+        );
+        assert_eq!(app.guilds.len(), 200, "список серверов должен вернуться на место");
     }
 }
