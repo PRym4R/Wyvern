@@ -535,13 +535,25 @@ impl App {
             };
             if pw.is_empty() {
                 // Запомнить без пароля нельзя: файл надо чем-то шифровать.
-                self.status = "Чтобы запомнить аккаунт, введи пароль хранилища".to_string();
-            } else {
-                match self.unlock_vault(&pw) {
-                    Ok(Some(hint)) => self.login_notice = hint,
-                    Ok(None) => {}
-                    // Вход всё равно продолжаем — просто аккаунт не сохранится.
-                    Err(e) => self.status = format!("{} — аккаунт не сохранён", e),
+                // Раньше вход всё равно продолжался, а это сообщение жило
+                // один кадр: гейтвей тут же слал «Connecting…» и затирал его.
+                // Пользователь видел мелькнувшую надпись и больше ничего — ни
+                // входа, ни объяснения, почему аккаунт не сохранился. Лучше
+                // остановиться и сказать, что делать.
+                self.status =
+                    "Чтобы запомнить аккаунт, введи пароль хранилища (или сними галочку «Запомнить»)"
+                        .to_string();
+                return;
+            }
+            match self.unlock_vault(&pw) {
+                Ok(Some(hint)) => self.login_notice = hint,
+                Ok(None) => {}
+                // Хранилище не открылось. Продолжить вход молча значило бы
+                // потерять аккаунт, не сказав об этом ни слова: сообщение
+                // пережил бы тот же один кадр.
+                Err(e) => {
+                    self.status = format!("{} — введи пароль хранилища или сними галочку «Запомнить»", e);
+                    return;
                 }
             }
         }
@@ -1860,6 +1872,75 @@ mod layout_tests {
         assert!(app.connected);
         assert!(app.gw_started);
         assert!(!app.shows_login(), "переподключение не должно выкидывать на экран входа");
+    }
+
+    /// «Запомнить» без пароля хранилища не может молча обойтись: раньше вход
+/// продолжался, а сообщение «введи пароль хранилища» жило один кадр — его
+/// тут же затирал статус гейтвея «Connecting…». Пользователь видел
+/// мелькнувшую надпись и ничего: ни входа, ни объяснения, почему аккаунт не
+/// сохранился.
+#[test]
+    fn remember_without_vault_password_stops_the_login() {
+        let (mut app, tmp) = vaulted_app("b21-empty");
+        app.token_input = "токен".into();
+        app.remember_account = true;
+        app.login_password.clear();
+        app.master_password.clear();
+
+        app.login_with_token();
+
+        assert!(
+            !app.gw_started,
+            "вход не должен продолжаться: подключаться с обещанием сохранить аккаунт нельзя"
+        );
+        assert!(
+            app.status.contains("пароль хранилища"),
+            "пользователь должен видеть, что делать: {:?}",
+            app.status
+        );
+        // И пароль в подсказке не пропадает после первого кадра: вход не
+        // начался, значит и статус гейтвея не придёт и не затрёт его.
+        assert!(app.to_gw.is_none(), "гейтвей запускаться не должен");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Не открылось хранилище — вход молчать не должен по той же причине:
+    /// аккаунт не сохранится, а объяснение исчезнет через кадр.
+    #[test]
+    fn failed_vault_unlock_stops_the_login() {
+        let (mut app, tmp) = vaulted_app("b21-wrong");
+        app.saved_accounts = vec![StoredAccount { token: "старый".into(), username: "u".into() }];
+        app.save_accounts("правильный");
+        app.token_input = "токен".into();
+        app.remember_account = true;
+        app.login_password = "неправильный".into();
+        app.master_password.clear();
+
+        app.login_with_token();
+
+        assert!(!app.gw_started, "вход с неверным паролем хранилища продолжаться не должен");
+        assert!(
+            app.status.contains("пароль хранилища"),
+            "пользователь должен видеть, что делать: {:?}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Галочка снята — вход идёт как обычно, иначе перебор побочных эффектов
+    /// превратит «запомнить» в «обязательно».
+    #[test]
+    fn login_without_remember_is_unaffected() {
+        let (mut app, tmp) = vaulted_app("b21-plain");
+        app.token_input = "токен".into();
+        app.remember_account = false;
+        app.login_password.clear();
+
+        app.login_with_token();
+
+        assert!(app.gw_started, "без «Запомнить» вход должен продолжаться");
+        assert!(app.status.is_empty(), "вход без ошибок не должен ничего ругать: {:?}", app.status);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// Строка в поле сообщения — это текст для канала, а не команда клиенту.
