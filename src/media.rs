@@ -22,7 +22,17 @@ const MAX_IMAGE_DIM: u32 = 768;
 /// Гифка — это сразу много кадров, поэтому кадры мельче. 16 кадров по 448
 /// пикселей — это 9 МБ на анимацию вместо 28.
 const MAX_GIF_DIM: u32 = 448;
-const MAX_GIF_FRAMES: usize = 16;
+/// До какого размера ужимаем кадр, если кадров очень много: лучше мыльная
+/// гифка целиком, чем красивая, обрывающаяся на середине.
+const MIN_GIF_DIM: u32 = 64;
+/// Сколько памяти готовы отдать под кадры ОДНОЙ гифки. Раньше здесь стоял
+/// потолок в 16 кадров, и любая гифка длиннее шестнадцати «заканчивалась» на
+/// одном и том же месте. Считаем по памяти, а не по штукам: у гифок разное
+/// число кадров, а бюджет у клиента один.
+const MAX_GIF_BYTES: usize = 32 * 1024 * 1024;
+/// Страховка от абсурдной гифки: по памяти такая может и пройти, но тысячи
+/// текстур — это уже перебор.
+const MAX_GIF_FRAMES: usize = 2000;
 /// Сколько пикселей в исходной картинке мы готовы распаковать. В чате она
 /// всё равно ужимается до 768 px, но распаковка идёт по исходнику: Discord
 /// принимает картинки до 10000×10000, а это 400 МБ в один момент, и на
@@ -88,6 +98,88 @@ fn shrink(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
 /// исходным пикселям, а не по тем, что останутся на экране.
 pub(crate) fn source_size_allowed(w: u32, h: u32) -> bool {
     u64::from(w) * u64::from(h) <= MAX_SOURCE_PIXELS
+}
+
+/// Пропустить цепочку под-блоков GIF (длина + данные, пока не ноль) и вернуть
+/// позицию сразу за терминатором.
+fn skip_gif_sub_blocks(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *bytes.get(pos)? as usize;
+        pos = pos.checked_add(1)?;
+        if len == 0 {
+            return Some(pos);
+        }
+        pos = pos.checked_add(len)?;
+        if pos > bytes.len() {
+            return None;
+        }
+    }
+}
+
+/// Сколько кадров в GIF — по структуре файла, без распаковки пикселей.
+///
+/// Нужно заранее: по числу кадров выбирается их размер, чтобы все кадры
+/// влезли в `MAX_GIF_BYTES` и гифка играла целиком, а не обрывалась. Разбор
+/// идёт по блокам и стоит копейки: заголовок, глобальная таблица цветов,
+/// затем расширения (`0x21`), кадры (`0x2C`) и конец (`0x3B`).
+pub(crate) fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 13 || (&bytes[..6] != b"GIF89a" && &bytes[..6] != b"GIF87a") {
+        return None;
+    }
+    // Биты 0–2 упакованного поля — размер глобальной таблицы цветов (2^(n+1)).
+    let packed = bytes[10];
+    let mut pos = 13usize;
+    if packed & 0x80 != 0 {
+        pos = pos.checked_add(3usize * (1usize << ((packed & 0x07) + 1)))?;
+    }
+    let mut count = 0usize;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            // Конец файла.
+            0x3B => break,
+            // Расширение: 0x21 + метка + под-блоки.
+            0x21 => {
+                pos = skip_gif_sub_blocks(bytes, pos.checked_add(2)?)?;
+            }
+            // Кадр: 0x2C + 9 байт дескриптора; за ним, возможно, локальная
+            // таблица цветов, размер кода LZW и сжатые данные.
+            0x2C => {
+                count += 1;
+                if pos + 10 > bytes.len() {
+                    return None;
+                }
+                let ipacked = bytes[pos + 9];
+                pos += 10;
+                if ipacked & 0x80 != 0 {
+                    pos = pos.checked_add(3usize * (1usize << ((ipacked & 0x07) + 1)))?;
+                }
+                pos = pos.checked_add(1)?; // размер минимального кода LZW
+                pos = skip_gif_sub_blocks(bytes, pos)?;
+            }
+            // Нулевой байт-заполнитель между блоками.
+            0x00 => pos += 1,
+            // Что-то незнакомое — считаем, что структуру не поняли.
+            _ => return None,
+        }
+    }
+    Some(count)
+}
+
+/// Размер кадра, при котором все кадры гифки влезают в `MAX_GIF_BYTES`.
+///
+/// Типичная гифка на 30–60 кадров остаётся на `MAX_GIF_DIM`; очень длинную
+/// ужимаем сильнее, но она играет целиком.
+fn gif_frame_dim(frames: usize) -> u32 {
+    let frames = frames.clamp(1, MAX_GIF_FRAMES);
+    let per_frame = (MAX_GIF_BYTES / 4) / frames;
+    let mut dim = (per_frame as f64).sqrt().floor() as u32;
+    // sqrt на целых может дать на пиксель больше, чем влезает; подстрахуемся.
+    while dim > MIN_GIF_DIM
+        && (dim as usize) * (dim as usize) * 4 * frames > MAX_GIF_BYTES
+    {
+        dim -= 1;
+    }
+    dim.clamp(MIN_GIF_DIM, MAX_GIF_DIM)
 }
 
 /// Запомнить неудачу, не раздувая список.
@@ -288,9 +380,15 @@ impl App {
                 return None;
             }
             let mut frames = decoder.into_frames();
-            // Кадры читаем по одному и берём только первые
-            // MAX_GIF_FRAMES: остальные всё равно не показываем.
+            // Размер кадра выбираем по числу кадров: длинную гифку ужимаем
+            // сильнее, но показываем целиком. Раньше потолок был по штукам,
+            // и любая гифка длиннее 16 кадров обрывалась на одном и том же
+            // месте — при живом оригинале в обычном Discord.
+            let frame_dim = gif_frame_count(bytes)
+                .map(gif_frame_dim)
+                .unwrap_or(MAX_GIF_DIM);
             let mut out = Vec::new();
+            let mut bytes_used = 0usize;
             while out.len() < MAX_GIF_FRAMES {
                 let Some(Ok(fr)) = frames.next() else { break };
                 let (num, den) = fr.delay().numer_denom_ms();
@@ -305,11 +403,18 @@ impl App {
                     break;
                 }
                 let frame = image::DynamicImage::ImageRgba8(buf);
-                let rgba = shrink(frame, MAX_GIF_DIM).into_rgba8();
+                let rgba = shrink(frame, frame_dim).into_rgba8();
                 let (fw, fh) = rgba.dimensions();
                 if fw == 0 || fh == 0 {
                     break;
                 }
+                // Подстраховка на случай, если число кадров по какой-то
+                // причине определено неверно: дальше бюджета не пускаем.
+                let frame_bytes = fw as usize * fh as usize * 4;
+                if out.len() > 1 && bytes_used + frame_bytes > MAX_GIF_BYTES {
+                    break;
+                }
+                bytes_used += frame_bytes;
                 let pixels = rgba.into_raw();
                 let ci = egui::ColorImage::from_rgba_unmultiplied(
                     [fw as usize, fh as usize],
@@ -456,6 +561,26 @@ mod tests {
     fn plain_app() -> App {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(rx)
+    }
+
+    /// Собрать настоящий GIF заданного размера и числа кадров — так же, как
+    /// его собрал бы Discord, чтобы проверять распаковку на живых данных.
+    fn encode_test_gif(w: u32, h: u32, n: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+            for f in 0..n {
+                let frame = RgbaImage::from_pixel(w, h, Rgba([(f * 7) as u8, 40, 90, 255]));
+                enc.encode_frame(image::Frame::from_parts(
+                    frame,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(50, 1),
+                ))
+                .unwrap();
+            }
+        }
+        out
     }
 
     /// Отказ по аватару не должен приводить к новому запросу на каждом кадре.
@@ -741,36 +866,93 @@ mod tests {
         }
     }
 
-    /// Гифка: кадров не больше лимита, каждый кадр ужат.
+    /// Гифка играет все свои кадры, а не обрывается на середине.
+    ///
+    /// Раньше был жёсткий потолок в 16 кадров, и любая гифка длиннее
+    /// шестнадцати обрывалась на одном и том же месте, хотя оригинал в
+    /// Discord доигрывал до конца. Границей должна быть память, а не число
+    /// кадров: 30 кадров 240x160 — это меньше 5 МБ.
     #[test]
-    fn gif_frames_are_capped() {
+    fn gif_plays_all_its_frames() {
         let (w, h, n) = (240u32, 160u32, 30usize);
-        let mut out = Vec::new();
-        {
-            let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
-            for f in 0..n {
-                let frame = RgbaImage::from_pixel(w, h, Rgba([(f * 7) as u8, 40, 90, 255]));
-                enc.encode_frame(image::Frame::from_parts(
-                    frame,
-                    0,
-                    0,
-                    image::Delay::from_numer_denom_ms(50, 1),
-                )).unwrap();
-            }
-        }
+        let out = encode_test_gif(w, h, n);
         eprintln!("[TEST] GIF {}x{} {} кадров = {} КБ", w, h, n, out.len() / 1024);
+
+        assert_eq!(gif_frame_count(&out), Some(n), "разбор структуры GIF врёт");
 
         match App::decode_image_payload(&out) {
             Some(ImagePayload::Animated { frames }) => {
-                assert!(frames.len() <= MAX_GIF_FRAMES, "кадров слишком много: {}", frames.len());
+                assert_eq!(frames.len(), n, "гифка обрезана: {} из {}", frames.len(), n);
                 for (ci, _) in &frames {
-                    assert!(ci.size[0] <= MAX_GIF_DIM as usize && ci.size[1] <= MAX_GIF_DIM as usize,
-                        "кадр не ужат: {:?}", ci.size);
+                    assert!(
+                        ci.size[0] <= MAX_GIF_DIM as usize && ci.size[1] <= MAX_GIF_DIM as usize,
+                        "кадр не ужат: {:?}",
+                        ci.size
+                    );
                 }
-                eprintln!("[TEST] осталось кадров: {}, размер {:?}", frames.len(), frames[0].0.size);
+                eprintln!("[TEST] кадров: {}, размер {:?}", frames.len(), frames[0].0.size);
             }
             other => panic!("ожидалась анимация, получено {:?}", other.is_some()),
         }
+    }
+
+    /// Длинная гифка ужимается, но доигрывает до последнего кадра и остаётся
+    /// в бюджете памяти.
+    #[test]
+    fn long_gif_is_downscaled_but_complete() {
+        let (w, h, n) = (400u32, 400u32, 120usize);
+        let out = encode_test_gif(w, h, n);
+        let total: usize = match App::decode_image_payload(&out) {
+            Some(ImagePayload::Animated { frames }) => {
+                assert_eq!(frames.len(), n, "гифка обрезана: {} из {}", frames.len(), n);
+                frames.iter().map(|(ci, _)| ci.size[0] * ci.size[1] * 4).sum()
+            }
+            other => panic!("ожидалась анимация, получено {:?}", other.is_some()),
+        };
+        assert!(
+            total <= MAX_GIF_BYTES,
+            "кадры гифки не влезли в бюджет: {} байт",
+            total
+        );
+        eprintln!(
+            "[TEST] 120 кадров 400x400: {} МБ, размер кадра {:?}",
+            total as f64 / (1024.0 * 1024.0),
+            gif_frame_dim(n)
+        );
+    }
+
+    /// Размер кадра из формулы всегда держит все кадры в бюджете и не
+    /// выходит за границы разумного.
+    #[test]
+    fn gif_frame_dim_stays_within_budget() {
+        for n in [1usize, 10, 30, 60, 120, 300, 512, 1000, 2000, 100_000] {
+            let dim = gif_frame_dim(n);
+            assert!(
+                (MIN_GIF_DIM..=MAX_GIF_DIM).contains(&dim),
+                "размер {} вне границ при {} кадрах",
+                dim,
+                n
+            );
+            // Пока не упёрлись в минимум, в бюджет обязаны влезать.
+            if dim > MIN_GIF_DIM {
+                let effective = n.clamp(1, MAX_GIF_FRAMES);
+                assert!(
+                    effective * (dim as usize) * (dim as usize) * 4 <= MAX_GIF_BYTES,
+                    "{} кадров по {} пикселей не влезают",
+                    effective,
+                    dim
+                );
+            }
+        }
+        // Обычные гифки не трогаем: полное разрешение.
+        assert_eq!(gif_frame_dim(30), MAX_GIF_DIM);
+    }
+
+    /// Разбор структуры GIF не должен ломаться на не-GIF данных.
+    #[test]
+    fn gif_frame_count_rejects_garbage() {
+        assert_eq!(gif_frame_count(b""), None);
+        assert_eq!(gif_frame_count(b"not a gif at all"), None);
     }
 
     /// Гифка с одним кадром — это просто картинка, анимацией она не
