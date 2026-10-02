@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{image_size_of, size_from, Attachment, ChatChannel, ChatMessage, Embed, Guild, UserProfile};
-use crate::util::super_props;
+use crate::util::{client_properties, super_props};
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -848,6 +848,28 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
     })
 }
 
+/// Тело IDENTIFY (op 2) для рукопожатия.
+///
+/// Свойства клиента берём из общего `client_properties`, а не из копии:
+/// раньше здесь лежал свой объект с зашитым «Linux», и отпечаток в
+/// WebSocket расходился с `X-Super-Properties` у REST.
+fn identify_payload(token: &str) -> serde_json::Value {
+    json!({
+        "op": 2,
+        "d": {
+            "token": token,
+            "properties": client_properties(),
+            "intents": 327679,
+            "presence": {
+                "status": "online",
+                "since": null,
+                "activities": [],
+                "afk": false
+            }
+        }
+    })
+}
+
 async fn gw_inner(
     cmd_rx: &mut mpsc::UnboundedReceiver<ToGateway>,
     event_tx: EventTx,
@@ -877,27 +899,7 @@ async fn gw_inner(
     let interval = hello["d"]["heartbeat_interval"].as_u64().ok_or("no heartbeat_interval")?;
     let _ = event_tx.send(ToApp::Debug(format!("Hello received, interval={}ms", interval)));
 
-    let identify = json!({
-        "op": 2,
-        "d": {
-            "token": token,
-            "properties": {
-                "os": "Linux",
-                "browser": "Discord Client",
-                "device": "",
-                "release_channel": "stable",
-                "client_build_number": 361909,
-                "client_event_source": null
-            },
-            "intents": 327679,
-            "presence": {
-                "status": "online",
-                "since": null,
-                "activities": [],
-                "afk": false
-            }
-        }
-    });
+    let identify = identify_payload(token);
     let first_payload = if use_resume {
         Some(json!({
             "op": 6,
@@ -1637,6 +1639,32 @@ mod session_tests {
         assert!(
             claim_history(&session.history_inflight, key).await,
             "после завершения запроса канал снова должен открываться"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_tests {
+    use super::identify_payload;
+
+    /// IDENTIFY обязан нести настоящий отпечаток клиента.
+    ///
+    /// Раньше здесь лежал свой объект свойств с зашитым «Linux»: заголовок
+    /// `X-Super-Properties` чинили, а рукопожатие по WebSocket — нет, и
+    /// Discord видел две разные системы. Теперь оба места берут один объект.
+    #[test]
+    fn identify_carries_the_real_client_fingerprint() {
+        let p = identify_payload("tok");
+        assert_eq!(p["op"].as_i64(), Some(2), "это должен быть IDENTIFY");
+        assert_eq!(
+            p["d"]["properties"]["os"],
+            std::env::consts::OS,
+            "в IDENTIFY ушла чужая система"
+        );
+        assert_eq!(
+            p["d"]["properties"],
+            crate::util::client_properties(),
+            "IDENTIFY и X-Super-Properties должны нести один отпечаток"
         );
     }
 }
