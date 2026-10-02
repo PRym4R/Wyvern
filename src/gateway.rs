@@ -376,6 +376,74 @@ async fn open_dm(
     }
 }
 
+/// Забрать список друзей.
+///
+/// Запрос уходит одновременно с пачкой запросов каналов гильдий, и Discord
+/// отвечает 429 (превышен общий лимит). У каналов повтор был, а у друзей —
+/// нет: каналы доезжали, а вкладка «Friends» оставалась с нулём. Повторяем
+/// по `retry-after`, как в `fetch_one`.
+///
+/// URL — параметр, а не константа: так запрос проверяется на локальном
+/// сервере, который сначала отдаёт 429, а потом список.
+async fn fetch_relationships(
+    httpc: reqwest::Client,
+    tkn: String,
+    url: String,
+) -> Result<Vec<UserProfile>, String> {
+    for _attempt in 0..3 {
+        let req = httpc
+            .get(&url)
+            .header("Authorization", &*tkn)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+            .header("X-Super-Properties", &super_props())
+            .header("X-Discord-Locale", "en-US")
+            .header("X-Discord-Timezone", "Europe/Moscow");
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == 429 {
+                    let retry = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(2);
+                    tokio::time::sleep(Duration::from_secs(retry)).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    return Err(format!("status {}", status));
+                }
+                let body = resp.text().await.map_err(|e| format!("body: {}", e))?;
+                return parse_relationships(&body);
+            }
+            Err(e) => return Err(format!("request: {}", e)),
+        }
+    }
+    Err("rate limited after 3 attempts".into())
+}
+
+/// Оставить из ответа `/users/@me/relationships` только принятых друзей.
+///
+/// Discord кладёт в один массив и друзей (`type` 1), и заявки, и блокировки;
+/// на экран должны попадать только друзья.
+fn parse_relationships(body: &str) -> Result<Vec<UserProfile>, String> {
+    let arr: Vec<Value> = serde_json::from_str(body).map_err(|e| format!("parse: {}", e))?;
+    Ok(arr
+        .into_iter()
+        .filter_map(|r| {
+            if r["type"].as_i64()? != 1 {
+                return None;
+            }
+            let u = &r["user"];
+            Some(UserProfile {
+                id: u["id"].as_str().unwrap_or("").to_string(),
+                username: u["username"].as_str().unwrap_or("?").to_string(),
+            })
+        })
+        .collect())
+}
+
 /// Загрузить одну страницу истории и отдать её в UI.
 ///
 /// `before` — самый старый id, который уже есть на экране: Discord отдаёт
@@ -1082,36 +1150,12 @@ async fn gw_inner(
                                     let tkc = tkn.clone();
                                     tokio::spawn(async move {
                                         let url = format!("{}/users/@me/relationships", API_BASE);
-                                        let req = httpc.get(&url)
-                                            .header("Authorization", &*tkc)
-                                            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-                                            .header("X-Super-Properties", &super_props())
-                                            .header("X-Discord-Locale", "en-US")
-                                            .header("X-Discord-Timezone", "Europe/Moscow");
-                                        match req.send().await {
-                                            Ok(resp) => {
-                                                let status = resp.status();
-                                                if status.is_success() {
-                                                    if let Ok(body) = resp.text().await {
-                                                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&body) {
-                                                            let mut friends: Vec<UserProfile> = Vec::new();
-                                                            for r in arr {
-                                                                if r["type"].as_i64().unwrap_or(0) != 1 { continue; }
-                                                                let u = &r["user"];
-                                                                friends.push(UserProfile {
-                                                                    id: u["id"].as_str().unwrap_or("").to_string(),
-                                                                    username: u["username"].as_str().unwrap_or("?").to_string(),
-                                                                });
-                                                            }
-                                                            let _ = egoods.send(ToApp::Friends(friends));
-                                                        }
-                                                    }
-                                                } else {
-                                                    let _ = egoods.send(ToApp::Debug(format!("Friends fetch status {}", status)));
-                                                }
+                                        match fetch_relationships(httpc, tkc, url).await {
+                                            Ok(friends) => {
+                                                let _ = egoods.send(ToApp::Friends(friends));
                                             }
                                             Err(e) => {
-                                                let _ = egoods.send(ToApp::Debug(format!("Friends fetch error: {}", e)));
+                                                let _ = egoods.send(ToApp::Debug(format!("Friends fetch failed: {}", e)));
                                             }
                                         }
                                     });
@@ -1361,9 +1405,9 @@ async fn gw_inner(
 #[cfg(test)]
 mod http_tests {
     use super::{
-    api_client, client_with_timeout, send_failure_reason, send_message_to, EventTx, Generation,
-    API_TIMEOUT,
-};
+        api_client, client_with_timeout, fetch_relationships, send_failure_reason, send_message_to,
+        EventTx, Generation, API_TIMEOUT,
+    };
     use crate::messages::ToApp;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1380,6 +1424,54 @@ mod http_tests {
             "настоящий ответ Discord столько не ждёт, а гейтвей столько молчит"
         );
         assert!(api_client().is_ok(), "клиент должен собираться");
+    }
+
+    /// Друзья грузятся одновременно с пачкой запросов каналов гильдий и ловят
+    /// 429. У каналов повтор был, у друзей — нет, поэтому вкладка «Friends»
+    /// оставалась с нулём. Проверяем на настоящем сокете: первый ответ — 429
+    /// с `retry-after: 0`, второй — список. Друг обязан доехать, а блокировка
+    /// (`type` 2) — нет.
+    #[test]
+    fn relationships_fetch_retries_after_429() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                if attempt == 0 {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    let body = r#"[{"id":"1","type":1,"user":{"id":"42","username":"friend"}},{"id":"2","type":2,"user":{"id":"43","username":"blocked"}}]"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+                let _ = stream.flush();
+            }
+        });
+
+        let client = api_client().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let friends = rt
+            .block_on(fetch_relationships(
+                client,
+                "токен".into(),
+                format!("http://{}/users/@me/relationships", addr),
+            ))
+            .expect("после 429 друзья должны догрузиться");
+        assert_eq!(friends.len(), 1, "на экран идут только друзья: {friends:?}");
+        assert_eq!(friends[0].username, "friend");
     }
 
     /// Отправка не должна висеть на сервере, который принял соединение и
