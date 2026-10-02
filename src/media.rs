@@ -29,6 +29,27 @@ const MAX_GIF_FRAMES: usize = 16;
 /// трёх параллельных загрузках клиент на этом умирает. Обычное фото
 /// (12–24 Мпикс) проходит без проблем.
 const MAX_SOURCE_PIXELS: u64 = 40_000_000;
+/// Сколько байт ответа вообще готовы принять. Распаковщик проверяет размер
+/// пикселей ПОСЛЕ чтения тела, а ссылку на картинку в эмбеде задаёт чужой
+/// сайт (models.rs) — он мог бы отдать гигабайты и занять память ещё до
+/// проверки. Потолок с запасом покрывает MAX_SOURCE_PIXELS пикселей даже в
+/// несжатом виде (4 байта на пиксель) плюс запас на контейнер.
+const MAX_DOWNLOAD_BYTES: u64 = MAX_SOURCE_PIXELS * 8;
+
+/// Прочитать тело ответа, но не больше `max` байт.
+///
+/// `None` — тело больше лимита (или чтение сорвалось): распаковывать такое
+/// нельзя. Читаем по кускам через `Read::take`, поэтому лишнее не оседает в
+/// памяти целиком.
+fn read_limited(resp: reqwest::blocking::Response, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    resp.take(max + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > max {
+        return None;
+    }
+    Some(buf)
+}
 
 /// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
 /// это новый пул соединений и TLS-сессия на каждый запрос.
@@ -156,7 +177,7 @@ impl App {
                     return;
                 }
                 let outcome = match http().get(&url_moved).send().ok()
-                    .and_then(|resp| resp.bytes().ok())
+                    .and_then(|resp| read_limited(resp, MAX_DOWNLOAD_BYTES))
                     .and_then(|bytes| image::load_from_memory(&bytes).ok())
                 {
                     Some(img) => {
@@ -329,7 +350,7 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
             // Слот отпускается на любом выходе, включая падение.
             let _slot = ImageSlot;
             if let Ok(resp) = http().get(&url_moved).send() {
-                if let Ok(bytes) = resp.bytes() {
+                if let Some(bytes) = read_limited(resp, MAX_DOWNLOAD_BYTES) {
                     if let Some(payload) = Self::decode_image_payload(&bytes) {
                         let _ = result_tx.send(Some(payload));
                         return;
@@ -758,6 +779,57 @@ mod tests {
         // CRC считать не нужно: до данных дело не дойдёт, лимит отсечёт
         // картинку по заголовку.
         out.extend_from_slice(&[0, 0, 0, 0]);
+    }
+
+    /// Сервер, отдающий тело заданного размера. Нужен, чтобы проверить
+    /// потолок на чтение ответа, не скачивая настоящие гигабайты.
+    fn body_server(total: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                total
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = vec![0u8; 64 * 1024];
+            let mut sent = 0;
+            while sent < total {
+                let n = (total - sent).min(chunk.len());
+                if stream.write_all(&chunk[..n]).is_err() {
+                    return;
+                }
+                sent += n;
+            }
+            let _ = stream.flush();
+        });
+        addr
+    }
+
+    /// Тело ответа читается с потолком: ссылку на картинку в эмбеде задаёт
+    /// чужой сайт, и без потолка его «картинка» на полгигабайта оседала бы в
+    /// памяти ещё до того, как распаковщик проверит размер.
+    #[test]
+    fn oversized_response_body_is_refused() {
+        let addr = body_server(200);
+        let resp = http().get(format!("http://{}/small.png", addr)).send().unwrap();
+        let small = read_limited(resp, 1024).expect("маленькое тело должно прочитаться");
+        assert_eq!(small.len(), 200);
+
+        let addr = body_server(8 * 1024 * 1024);
+        let resp = http().get(format!("http://{}/huge.png", addr)).send().unwrap();
+        assert!(
+            read_limited(resp, 4096).is_none(),
+            "тело сверх потолка должно отсекаться, а не читаться целиком"
+        );
     }
 }
 
