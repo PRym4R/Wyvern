@@ -8,6 +8,31 @@ use crate::app::App;
 use crate::models::StoredAccount;
 use crate::util::{base64_decode, base64_string};
 
+/// Записать хранилище на диск надёжно: во временный файл, с правами только
+/// для владельца (`0600`), со сбросом на диск и атомарной заменой. Так обрыв
+/// или нехватка места не оставляют полузаписанный файл, а токены не читает
+/// чужой пользователь на той же машине.
+fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        // Не оставляем мусор рядом с хранилищем.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
         // Переопределение нужно тестам, чтобы не трогать настоящий файл.
@@ -89,7 +114,7 @@ impl App {
     pub(crate) fn legacy_accounts(content: &str) -> Option<Vec<StoredAccount>> {
         serde_json::from_str::<Vec<StoredAccount>>(content).ok()
     }
-    pub(crate) fn save_accounts(&self, password: &str) {
+    pub(crate) fn save_accounts(&mut self, password: &str) {
         // Старый открытый файл сам себя не перезаписывает. Пароль в нём не
         // проверялся, поэтому запись перешифровала бы хранилище тем, что
         // случайно оказалось в поле ввода, — и доступ к своим аккаунтам был бы
@@ -98,14 +123,14 @@ impl App {
         if self.vault_legacy {
             return;
         }
-        if let Some(s) = Self::encrypt_accounts(&self.saved_accounts, password) {
-            // Пишем во временный файл и переименовываем: если клиент убить
-            // посреди записи, старый файл останется целым.
-            let path = self.vault_path();
-            let tmp = path.with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        let Some(encrypted) = Self::encrypt_accounts(&self.saved_accounts, password) else {
+            return;
+        };
+        // Ошибку записи нельзя глотать: иначе UI показывает «сохранено», а на
+        // диске пусто или прошлая версия. Раньше `rename` уходил в `let _`, а
+        // неудачный `write` просто ничего не делал.
+        if let Err(e) = write_vault_file(&self.vault_path(), encrypted.as_bytes()) {
+            self.status = format!("Не удалось сохранить хранилище: {}", e);
         }
     }
     /// Файл хранилища конкретного экземпляра. Переопределение живёт в полях
@@ -154,7 +179,8 @@ impl App {
         // второго полного прогона PBKDF2 (100 000 итераций) впустую — только
         // чтобы записать то же самое.
         if changed {
-            self.save_accounts(&self.master_password);
+            let pw = self.master_password.clone();
+            self.save_accounts(&pw);
         }
     }
     pub(crate) fn refresh_active_index(&mut self) {
@@ -761,5 +787,96 @@ mod legacy_vault_tests {
         assert!(!app.vault_legacy);
         assert!(app.unlock_vault("правильный").is_ok());
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod vault_write_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    static TAG: AtomicU64 = AtomicU64::new(0);
+
+    /// Свой файл на каждый тест: тесты идут параллельно.
+    fn vaulted() -> (App, std::path::PathBuf) {
+        let tag = TAG.fetch_add(1, Ordering::SeqCst);
+        let mut p = std::env::temp_dir();
+        p.push(format!("wyvern-test-write-{}-{}.json", std::process::id(), tag));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&p);
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.vault_path_override = Some(p.clone());
+        (app, p)
+    }
+
+    fn one_account(app: &mut App) {
+        app.saved_accounts = vec![StoredAccount { token: "секрет".into(), username: "вася".into() }];
+    }
+
+    /// Файл хранилища не должен быть доступен никому, кроме владельца: внутри
+    /// токены. Раньше `std::fs::write` создавал его с обычными правами (0644
+    /// под umask), и содержимое читал любой пользователь машины.
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut app, tmp) = vaulted();
+        one_account(&mut app);
+        app.save_accounts("правильный");
+        let mode = std::fs::metadata(&tmp)
+            .expect("файл хранилища не записался")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "хранилище должно быть только для владельца, а не {:o}",
+            mode & 0o777
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Если запись не удалась, UI обязан сказать, а не делать вид, что
+    /// сохранил. Родителя нет — временный файл создать нельзя.
+    #[test]
+    fn vault_write_error_is_reported_in_status() {
+        let (mut app, tmp) = vaulted();
+        let missing = std::env::temp_dir()
+            .join(format!("wyvern-no-such-dir-{}", std::process::id()))
+            .join("accounts.json");
+        let _ = std::fs::remove_dir_all(missing.parent().unwrap());
+        app.vault_path_override = Some(missing);
+        one_account(&mut app);
+        app.save_accounts("правильный");
+        assert!(
+            app.status.contains("хранилищ"),
+            "ошибка записи должна попасть в статус, а там: {:?}",
+            app.status
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Отдельно — замена файла: временный файл записался, а `rename` не прошёл
+    /// (на месте хранилища уже каталог). Раньше эта ошибка глоталась через
+    /// `let _`, и о неудаче никто не узнавал.
+    #[test]
+    fn vault_rename_error_is_reported_and_tmp_is_cleaned() {
+        let (mut app, dir) = vaulted();
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        one_account(&mut app);
+        app.save_accounts("правильный");
+        assert!(
+            app.status.contains("хранилищ"),
+            "ошибка замены файла должна попасть в статус, а там: {:?}",
+            app.status
+        );
+        assert!(
+            !dir.with_extension("tmp").exists(),
+            "временный файл должен быть убран"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

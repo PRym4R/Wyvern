@@ -393,7 +393,8 @@ impl App {
                             .position(|a| a.token == tkn && a.username.is_empty());
                         if let Some(i) = blank {
                             self.saved_accounts[i].username = username.clone();
-                            self.save_accounts(&self.master_password);
+                            let pw = self.master_password.clone();
+                            self.save_accounts(&pw);
                         }
                     }
                     self.push_debug("READY received!".into());
