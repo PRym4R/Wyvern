@@ -4,6 +4,7 @@ use crate::app::App;
 
 use crate::messages::ToGateway;
 use crate::models::{ChatChannel, ChatMessage, LOCAL_ID_PREFIX};
+use crate::ui::ERROR_RED;
 
 /// Префикс отладочных команд. Всё, что не начинается с него, — обычный текст
 /// для канала, даже если похоже на команду.
@@ -22,6 +23,20 @@ const MIN_INPUT_WIDTH: f32 = 60.0;
 /// Сколько места в строке ввода уходит на отступ, название канала, кнопку
 /// «Send» и зазоры.
 const INPUT_CHROME: f32 = 110.0;
+/// Лимит Discord на длину сообщения в символах Unicode.
+///
+/// Именно символы, а не байты: 2000 кириллических букв весят 4000 байт, но
+/// Discord их принимает. Считаем кодпоинты, как и он.
+pub(crate) const MAX_MESSAGE_CHARS: usize = 2000;
+
+/// Помещается ли текст в лимит Discord.
+///
+/// Сообщение длиннее лимита Discord отвергает кодом 400, а клиент потом
+/// показывает его в чате как отправленное и не убирает — человек думает, что
+/// всё в порядке. Поэтому проверяем ДО отправки.
+pub(crate) fn within_message_limit(text: &str) -> bool {
+    text.chars().count() <= MAX_MESSAGE_CHARS
+}
 
 /// Ширина поля ввода по свободному месту в строке.
 ///
@@ -70,6 +85,18 @@ impl App {
                         ui.label(RichText::new("← select a channel on the left").italics()
                             .size(12.0).color(self.theme.text_secondary));
                     } else {
+                        // Счётчик «n/2000» стоит перед полем: свободная
+                        // ширина для поля считается уже с учётом счётчика, и
+                        // длинное число не вытолкнет кнопку Send за край.
+                        let typed = trim_input(&self.input);
+                        let count = typed.chars().count();
+                        let fits = within_message_limit(typed);
+                        ui.label(
+                            RichText::new(format!("{count}/{MAX_MESSAGE_CHARS}"))
+                                .size(12.0)
+                                .color(if fits { self.theme.text_secondary } else { ERROR_RED }),
+                        );
+                        ui.add_space(6.0);
                         let field_w = input_width(ui.available_width());
                         self.push_debug(format!("INPUT_FIELD: w={:.0}", field_w));
                         let resp = ui.add_sized(
@@ -85,11 +112,15 @@ impl App {
                         if resp.changed() {
                             self.input_dirty = true;
                         }
-                        let send_btn = ui.add_sized(
-                            [84.0, 36.0],
+                        // Отправка заблокирована, пока текст не влезает в
+                        // лимит Discord: иначе он отвергнет сообщение кодом
+                        // 400, а в чате останется «отправленное» навсегда.
+                        let send_btn = ui.add_enabled(
+                            fits,
                             egui::Button::new(RichText::new("Send").size(14.0).color(Color32::WHITE))
-                                .fill(self.theme.accent),
-                        );
+                                .fill(self.theme.accent)
+                                .min_size(egui::vec2(84.0, 36.0)),
+                        ).on_hover_text(if fits { "" } else { "сообщение длиннее 2000 символов" });
 
                         let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let send_clicked = send_btn.clicked();
@@ -154,6 +185,16 @@ impl App {
     /// момент, когда человек проверяет, дошло ли сообщение.
     pub(crate) fn submit_input(&mut self) {
         let text = trim_input(&self.input).to_string();
+        // Слишком длинное не отправляем и поле не чистим: Discord отверг бы
+        // его кодом 400, а набранное потерялось бы. Пусть человек сократит.
+        if !within_message_limit(&text) {
+            self.push_debug(format!(
+                "Message over limit: {} chars > {}",
+                text.chars().count(),
+                MAX_MESSAGE_CHARS
+            ));
+            return;
+        }
         if !text.is_empty() {
             self.handle_input(&text);
             // Запоминаем, что ушло, и сбрасываем признак правки: повторная
@@ -420,6 +461,40 @@ mod tests {
         assert!(
             w >= MIN_INPUT_WIDTH,
             "поле ввода схлопнулось при растянутой панели каналов: {w} px"
+        );
+    }
+
+    /// Сообщение длиннее лимита Discord не должно уходить: Discord отвергнет
+    /// его кодом 400, а клиент покажет текст как отправленный и не уберёт.
+    /// Поле при этом не чистим, чтобы набранное можно было сократить.
+    #[test]
+    fn over_limit_message_is_not_sent() {
+        let (mut app, _ctx) = narrow_app();
+
+        app.input = "я".repeat(MAX_MESSAGE_CHARS + 1);
+        app.submit_input();
+        assert!(
+            app.messages.get("c1").is_none_or(|v| v.is_empty()),
+            "сообщение длиннее лимита не должно уходить"
+        );
+        assert_eq!(
+            app.input.chars().count(),
+            MAX_MESSAGE_CHARS + 1,
+            "заблокированная отправка не должна стирать набранное"
+        );
+
+        // Ровно лимит — это ещё можно.
+        app.input = "я".repeat(MAX_MESSAGE_CHARS);
+        app.submit_input();
+        assert_eq!(app.messages["c1"].len(), 1, "2000 символов должны отправляться");
+        assert_eq!(app.input, "", "успешная отправка очищает поле");
+
+        // Лимит считается в символах Unicode, а не в байтах: 2000 кириллических
+        // букв — это 4000 байт, но Discord их принимает.
+        assert_eq!(
+            "я".repeat(MAX_MESSAGE_CHARS).len(),
+            MAX_MESSAGE_CHARS * 2,
+            "тест должен проверять многобайтовый случай"
         );
     }
 }
