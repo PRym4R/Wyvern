@@ -18,6 +18,15 @@ use crate::models::{
 /// без него длинный канал растёт бесконечно, и держать в памяти сотни
 /// сообщений, которых не видно, смысла нет.
 pub(crate) const MAX_MESSAGES_PER_CHANNEL: usize = 500;
+/// Сколько событий гейтвея разбираем за один кадр.
+///
+/// Очередь без ограничения — это подлаг ровно тогда, когда сообщения идут
+/// быстрее всего: разбуженный канал или всплеск после реконнекта шлёт сотни
+/// `MESSAGE_CREATE`, а на каждом — линейный поиск дубля по списку канала (до
+/// 500 строк). Пятьсот событий за кадр — это сотни тысяч сравнений строк и
+/// заметная пауза интерфейса. Остаток разберём следующим кадром: список
+/// сообщений backlog переживёт, а кадр — нет.
+pub(crate) const MAX_EVENTS_PER_FRAME: usize = 200;
 /// Сколько текстур аватаров/иконок guild'ов держим.
 const MAX_AVATAR_CACHE: usize = 192;
 /// Сколько картинок-вложений держим (каждая — это мегабайты VRAM/RAM).
@@ -358,7 +367,13 @@ impl App {
         // покое новое сообщение ждало бы случайной перерисовки.
         self.egui_ctx = Some(ctx.clone());
         let mut any = false;
-        while let Ok(ev) = self.from_gw.try_recv() {
+        // За кадр разбираем только порцию очереди: разбушевавшийся канал
+        // успеет прислать сотни событий, и без потолка кадр уходил бы в
+        // многомиллисекундную обработку (Т-23). Остаток ждёт следующего кадра.
+        let mut processed = 0usize;
+        while processed < MAX_EVENTS_PER_FRAME {
+            let Ok(ev) = self.from_gw.try_recv() else { break };
+            processed += 1;
             any = true;
             match ev {
                 ToApp::Ready { username, user_id, avatar } => {
@@ -566,6 +581,14 @@ impl App {
                 }
                 ToApp::Debug(d) => self.push_debug(d),
             }
+        }
+        // Очередь не опустела — кадр её не выгреб. Следующий `poll` разберёт
+        // остаток: `schedule_repaint` попросит кадр, раз были события.
+        if !self.from_gw.is_empty() {
+            self.push_debug(format!(
+                "Gateway backlog: processed {} events, more pending",
+                processed
+            ));
         }
         any
     }
@@ -2833,7 +2856,12 @@ mod layout_tests {
             tx.send(ToApp::Message(test_msg(&format!("b{i}"), "c2", "чужое"))).unwrap();
         }
         tx.send(ToApp::Message(test_msg("mine", "c1", "своё"))).unwrap();
-        app.poll(&ctx);
+        // Очередь разбирается порциями (Т-23), а не целиком за кадр: кадр
+        // крутим, пока события не кончатся, иначе c1-сообщение останется на
+        // следующий кадр и проверка ниже сработает не на том состоянии.
+        while !app.from_gw.is_empty() {
+            app.poll(&ctx);
+        }
 
         assert!(
             app.messages.get("c2").is_none_or(|e| e.is_empty()),
@@ -3042,6 +3070,55 @@ mod layout_tests {
             app.channels[0].topic.as_deref(),
             Some("тема"),
             "отсутствующая тема не должна затираться"
+        );
+    }
+
+    /// Очередь гейтвея не должна выгребаться целиком за один кадр.
+    ///
+    /// На всплеске после реконнекта это сотни `MESSAGE_CREATE`, и на каждом —
+    /// линейный поиск дубля по всему списку канала. За кадр разбираем не больше
+    /// `MAX_EVENTS_PER_FRAME`, а остаток — следующим: список backlog переживёт,
+    /// кадр — нет (Т-23).
+    #[test]
+    fn gateway_backlog_is_drained_in_bounded_batches() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.connected = true;
+        app.gw_started = true;
+        app.channels.push(ChatChannel {
+            id: "c1".into(),
+            name: "канал".into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+        });
+        app.selected_channel = Some(0);
+
+        let total = MAX_EVENTS_PER_FRAME + 25;
+        for i in 0..total {
+            tx.send(ToApp::Message(test_msg(
+                &format!("m{i}"),
+                "c1",
+                &format!("сообщение {i}"),
+            )))
+            .unwrap();
+        }
+
+        app.poll(&ctx);
+        assert_eq!(
+            app.messages["c1"].len(),
+            MAX_EVENTS_PER_FRAME,
+            "за один кадр должно разбираться не больше {MAX_EVENTS_PER_FRAME} событий"
+        );
+
+        // Остаток не теряется — его забирает следующий poll.
+        app.poll(&ctx);
+        assert_eq!(
+            app.messages["c1"].len(),
+            total,
+            "остаток очереди должен разобраться следующим кадром"
         );
     }
 }
