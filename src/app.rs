@@ -1111,6 +1111,9 @@ impl App {
         // Флаг анимации собирается заново каждый кадр: его выставит отрисовка,
         // если на экране анимированная картинка.
         self.animating = false;
+        // Новый кадр кэша картинок: то, что было видно в прошлом кадре,
+        // перестаёт быть «только что виденным» ещё на один кадр вперёд.
+        self.image_cache.begin_frame();
         if self.shows_login() {
             self.draw_login(ctx);
         } else {
@@ -2835,6 +2838,46 @@ mod layout_tests {
         cache.insert("k".into(), Weighted(500));
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.bytes(), 500);
+    }
+
+    /// Видимая картинка не вытесняется той, что только что загрузилась.
+    ///
+    /// Иначе картинка/гифка на экране вылетает из кэша, в следующем кадре её
+    /// снова качают — она мигает, а высота сообщения скачет. Особенно заметно
+    /// на гифках: после починки длинных анимаций одна гифка занимает больше
+    /// бюджета, и обычное LRU-вытеснение роняло именно её.
+    #[test]
+    fn bounded_cache_does_not_evict_visible_items() {
+        let mut cache = BoundedCache::with_budget(10, 120);
+        // Три картинки на экране, суммарно ровно в бюджет.
+        cache.insert("a".into(), Weighted(40));
+        cache.insert("b".into(), Weighted(40));
+        cache.insert("c".into(), Weighted(40));
+        cache.begin_frame();
+        // Отрисовка этого кадра трогает все три.
+        cache.mark_visible("a");
+        cache.mark_visible("b");
+        cache.mark_visible("c");
+        // Пришла четвёртая, бюджет переполнен: уходить должен невидимый
+        // элемент, а не тот, что сейчас на экране.
+        cache.insert("d".into(), Weighted(40));
+        assert!(
+            cache.contains_key("a") && cache.contains_key("b") && cache.contains_key("c"),
+            "картинка, которая на экране, вытеснена только что загруженной"
+        );
+
+        // Следующие два кадра a и b не рисуются — вот их и вытесняем, а
+        // видимую c держим. Два кадра, потому что вытеснение бережёт то, что
+        // было на экране в прошлом кадре: рисование идёт сверху вниз.
+        cache.begin_frame();
+        cache.begin_frame();
+        cache.mark_visible("c");
+        cache.insert("e".into(), Weighted(40));
+        assert!(cache.contains_key("c"), "видимая картинка не должна вытесняться");
+        assert!(
+            !cache.contains_key("a") && !cache.contains_key("b"),
+            "давно не видимые должны освободить место"
+        );
     }
 
     /// Живые сообщения из закрытых каналов не должны копиться в памяти.

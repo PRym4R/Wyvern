@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use eframe::egui::{self, Color32, TextureHandle};
 use serde_json::Value;
@@ -32,11 +32,45 @@ pub(crate) struct BoundedCache<V> {
     cap: usize,
     budget: usize,
     bytes: usize,
+    /// Ключи, которые рисовались в этом и прошлом кадре: то, что сейчас на
+    /// экране. Их не вытесняем. Иначе картинка, которую человек в эту секунду
+    /// смотрит, вылетает из-за той, что только что догрузилась, в следующем
+    /// кадре её качают заново — гифка мигает, а высота сообщения скачет.
+    /// Прошлый кадр в паре нужен, потому что рисование идёт сверху вниз: у
+    /// картинки ниже по списку `mark_visible` в этом кадре ещё впереди, а
+    /// вытеснение может случиться раньше.
+    used_now: HashSet<String>,
+    used_prev: HashSet<String>,
 }
 
 impl<V: CacheCost> BoundedCache<V> {
     pub(crate) fn with_budget(cap: usize, budget: usize) -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new(), cap, budget, bytes: 0 }
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+            budget,
+            bytes: 0,
+            used_now: HashSet::new(),
+            used_prev: HashSet::new(),
+        }
+    }
+    /// Начать кадр. Прошлый набор «использованных» становится позапрошлым:
+    /// так картинка защищена от вытеснения ещё один кадр после того, как её
+    /// перестали рисовать.
+    pub(crate) fn begin_frame(&mut self) {
+        self.used_prev = std::mem::take(&mut self.used_now);
+    }
+    /// Показывалась ли картинка в этом или прошлом кадре.
+    fn is_visible(&self, key: &str) -> bool {
+        self.used_now.contains(key) || self.used_prev.contains(key)
+    }
+    /// Отметить картинку как нарисованную в этом кадре: до конца следующего
+    /// кадра её не вытесняем.
+    pub(crate) fn mark_visible(&mut self, key: &str) {
+        if !self.used_now.contains(key) {
+            self.used_now.insert(key.to_string());
+        }
     }
     /// Взять значение из кэша. Обращение считается использованием: ключ
     /// уезжает в хвост очереди, поэтому вытесняется то, к чему давно не
@@ -78,12 +112,22 @@ impl<V: CacheCost> BoundedCache<V> {
         let added = self.map[&key].cache_bytes();
         self.bytes = self.bytes.saturating_add(added);
         // Последний элемент не выкидываем: иначе одна картинка крупнее всего
-        // бюджета не показалась бы вообще.
+        // бюджета не показалась бы вообще. Видимые не выкидываем тоже.
         while self.order.len() > self.cap || (self.bytes > self.budget && self.order.len() > 1) {
-            if let Some(old) = self.order.pop_front() {
+            // Только что вставленную картинку не вытесняем ею же: она вот-вот
+            // появится на экране.
+            let Some(pos) = self.order.iter().position(|k| k != &key && !self.is_visible(k)) else {
+                // Всё, что в кэше, сейчас на экране. Пусть временно будет
+                // больше бюджета: мигающая картинка хуже лишней памяти. Как
+                // только она уйдёт с экрана, следующий кадр её вытеснит.
+                break;
+            };
+            if let Some(old) = self.order.remove(pos) {
                 if let Some(v) = self.map.remove(&old) {
                     self.bytes = self.bytes.saturating_sub(v.cache_bytes());
                 }
+                self.used_now.remove(&old);
+                self.used_prev.remove(&old);
             }
         }
     }
@@ -92,6 +136,8 @@ impl<V: CacheCost> BoundedCache<V> {
         self.map.clear();
         self.order.clear();
         self.bytes = 0;
+        self.used_now.clear();
+        self.used_prev.clear();
     }
 }
 
