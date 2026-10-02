@@ -488,52 +488,13 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
     });
 
     match pending.try_recv() {
-        Ok(result) => {
+        Ok(Some(payload)) => {
             self.pending_images.remove(&key);
-            match result {
-                Some(ImagePayload::Static(color_image)) => {
-                    let handle = ctx2.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
-                    let loaded = LoadedImage::Static(handle);
-                    self.image_cache.insert(key.clone(), loaded.clone());
-                    self.push_debug(format!(
-                        "IMG: {} в кэше — {} шт, {:.1} МБ текстур",
-                        key,
-                        self.image_cache.len(),
-                        self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
-                    ));
-                    ctx2.request_repaint();
-                    return Some(loaded);
-                }
-                Some(ImagePayload::Animated { frames }) => {
-                    let mut handles = Vec::with_capacity(frames.len());
-                    let mut delays = Vec::with_capacity(frames.len());
-                    for (i, (ci, delay)) in frames.into_iter().enumerate() {
-                        let tkey = format!("{}#f{}", key, i);
-                        handles.push(ctx2.load_texture(&tkey, ci, egui::TextureOptions::LINEAR));
-                        delays.push(delay);
-                    }
-                    if handles.len() > 1 {
-                        let frames_count = handles.len();
-                        let loaded = LoadedImage::Animated {
-                            frames: handles,
-                            delays,
-                            started: std::time::Instant::now(),
-                        };
-                        self.image_cache.insert(key.clone(), loaded.clone());
-                        self.push_debug(format!(
-                            "GIF: {} кадров в кэше — {} шт, {:.1} МБ текстур",
-                            frames_count,
-                            self.image_cache.len(),
-                            self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
-                        ));
-                        ctx2.request_repaint();
-                        return Some(loaded);
-                    }
-                }
-                None => {
-                    remember_failed(&mut self.failed_images, key);
-                }
-            }
+            return self.store_image_payload(&ctx2, key, payload);
+        }
+        Ok(None) => {
+            self.pending_images.remove(&key);
+            remember_failed(&mut self.failed_images, key);
         }
         // Поток ещё работает — подождём следующего кадра.
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -546,6 +507,90 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
     }
 
     None
+}
+
+/// Превратить готовые пиксели в текстуры и положить в кэш.
+///
+/// Отдельно от `download_image`, потому что результат нужно уметь забрать и
+/// без отрисовки этой картинки: см. `reap_pending_images`.
+fn store_image_payload(
+    &mut self,
+    ctx: &egui::Context,
+    key: String,
+    payload: ImagePayload,
+) -> Option<LoadedImage> {
+    match payload {
+        ImagePayload::Static(color_image) => {
+            let handle = ctx.load_texture(&key, color_image, egui::TextureOptions::LINEAR);
+            let loaded = LoadedImage::Static(handle);
+            self.image_cache.insert(key.clone(), loaded.clone());
+            self.push_debug(format!(
+                "IMG: {} в кэше — {} шт, {:.1} МБ текстур",
+                key,
+                self.image_cache.len(),
+                self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
+            ));
+            ctx.request_repaint();
+            Some(loaded)
+        }
+        ImagePayload::Animated { frames } => {
+            let mut handles = Vec::with_capacity(frames.len());
+            let mut delays = Vec::with_capacity(frames.len());
+            for (i, (ci, delay)) in frames.into_iter().enumerate() {
+                let tkey = format!("{}#f{}", key, i);
+                handles.push(ctx.load_texture(&tkey, ci, egui::TextureOptions::LINEAR));
+                delays.push(delay);
+            }
+            if handles.len() > 1 {
+                let frames_count = handles.len();
+                let loaded = LoadedImage::Animated {
+                    frames: handles,
+                    delays,
+                    started: std::time::Instant::now(),
+                };
+                self.image_cache.insert(key.clone(), loaded.clone());
+                self.push_debug(format!(
+                    "GIF: {} кадров в кэше — {} шт, {:.1} МБ текстур",
+                    frames_count,
+                    self.image_cache.len(),
+                    self.image_cache.bytes() as f64 / (1024.0 * 1024.0)
+                ));
+                ctx.request_repaint();
+                Some(loaded)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Забрать готовые загрузки, даже если их картинок сейчас не видно.
+///
+/// Раньше готовый результат забирался только при отрисовке этой картинки.
+/// Если картинка успевала прокрутиться за экран, её распакованные пиксели
+/// навсегда оставались в `pending_images`: загрузок одновременно мало, но
+/// каждая гифка — это мегабайты, и на длинном чате набегали сотни мегабайт.
+/// Забираем всё готовое в кэш, где память ограничена бюджетом и LRU.
+pub(crate) fn reap_pending_images(&mut self, ctx: &egui::Context) {
+    if self.pending_images.is_empty() {
+        return;
+    }
+    // Забираем карту целиком, чтобы не копировать ключи на каждом кадре;
+    // незавершённые загрузки возвращаем на место.
+    for (key, rx) in std::mem::take(&mut self.pending_images) {
+        match rx.try_recv() {
+            Ok(Some(payload)) => {
+                self.store_image_payload(ctx, key, payload);
+            }
+            Ok(None) => {
+                remember_failed(&mut self.failed_images, key);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pending_images.insert(key, rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
 }
 }
 
@@ -822,6 +867,46 @@ mod tests {
             IMAGE_DOWNLOADS_IN_FLIGHT.load(Ordering::SeqCst),
             0,
             "слоты загрузки не вернулись"
+        );
+    }
+
+    /// Готовая загрузка не должна висеть в очереди, если её картинку
+    /// прокрутили за экран и больше не рисуют.
+    ///
+    /// Раньше результат забирался только при отрисовке. Картинка, которую
+    /// успели пролистать, оставалась в `pending_images` вместе с
+    /// распакованными пикселями: загрузок одновременно мало, но каждая гифка
+    /// — это мегабайты, и на длинном чате набегали сотни мегабайт.
+    #[test]
+    fn completed_download_for_scrolled_away_image_is_reaped() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        let key = "https://cdn.discordapp.com/attachments/1/off.png".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(ImagePayload::Static(egui::ColorImage::new(
+            [8, 8],
+            egui::Color32::RED,
+        ))))
+        .unwrap();
+        app.pending_images.insert(key.clone(), rx);
+
+        // Кадр, на котором эту картинку никто не рисует (канал не открыт).
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| app.run_frame(ctx));
+
+        assert!(
+            !app.pending_images.contains_key(&key),
+            "готовый результат остался висеть в очереди"
+        );
+        assert!(
+            app.image_cache.contains_key(&key),
+            "готовую картинку нужно забрать в кэш, где память ограничена"
         );
     }
 

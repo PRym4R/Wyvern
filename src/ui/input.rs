@@ -23,6 +23,11 @@ const MIN_INPUT_WIDTH: f32 = 60.0;
 /// Сколько места в строке ввода уходит на отступ, название канала, кнопку
 /// «Send» и зазоры.
 const INPUT_CHROME: f32 = 110.0;
+/// Ширина места под счётчик «n/2000» перед полем.
+///
+/// Место держим всегда, даже когда счётчика не видно: иначе поле ввода
+/// прыгает по ширине на первом же набранном (или стёртом) символе.
+const COUNTER_WIDTH: f32 = 60.0;
 /// Лимит Discord на длину сообщения в символах Unicode.
 ///
 /// Именно символы, а не байты: 2000 кириллических букв весят 4000 байт, но
@@ -85,17 +90,29 @@ impl App {
                         ui.label(RichText::new("← select a channel on the left").italics()
                             .size(12.0).color(self.theme.text_secondary));
                     } else {
-                        // Счётчик «n/2000» стоит перед полем: свободная
-                        // ширина для поля считается уже с учётом счётчика, и
-                        // длинное число не вытолкнет кнопку Send за край.
+                        // Счётчик «n/2000» показываем, только когда есть что
+                        // считать: «0/2000» на пустом поле ничего не сообщает
+                        // и выглядит как застывший индикатор. Место под него
+                        // при этом зарезервировано всегда, чтобы поле не
+                        // прыгало по ширине на первом же символе, а строка
+                        // считалась уже с учётом счётчика — длинное число не
+                        // вытолкнет кнопку Send за край.
                         let typed = trim_input(&self.input);
                         let count = typed.chars().count();
                         let fits = within_message_limit(typed);
-                        ui.label(
-                            RichText::new(format!("{count}/{MAX_MESSAGE_CHARS}"))
-                                .size(12.0)
-                                .color(if fits { self.theme.text_secondary } else { ERROR_RED }),
+                        let (counter_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(COUNTER_WIDTH, 16.0),
+                            egui::Sense::hover(),
                         );
+                        if count > 0 {
+                            ui.painter().text(
+                                counter_rect.right_center(),
+                                egui::Align2::RIGHT_CENTER,
+                                format!("{count}/{MAX_MESSAGE_CHARS}"),
+                                egui::FontId::proportional(12.0),
+                                if fits { self.theme.text_secondary } else { ERROR_RED },
+                            );
+                        }
                         ui.add_space(6.0);
                         let field_w = input_width(ui.available_width());
                         self.push_debug(format!("INPUT_FIELD: w={:.0}", field_w));
@@ -496,5 +513,38 @@ mod tests {
             MAX_MESSAGE_CHARS * 2,
             "тест должен проверять многобайтовый случай"
         );
+    }
+
+    /// На пустом поле счётчик «0/2000» не рисуется: он ничего не сообщает и
+    /// выглядит как застывший индикатор. Прежний код показывал его всегда.
+    #[test]
+    fn empty_input_has_no_character_counter() {
+        let (mut app, ctx) = narrow_app();
+        let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        assert!(
+            !has_counter_text(&out),
+            "на пустом поле не должно быть счётчика символов"
+        );
+    }
+
+    /// Как только текст набран, счётчик появляется: именно он показывает,
+    /// сколько символов из лимита Discord уже занято.
+    #[test]
+    fn typed_input_shows_character_counter() {
+        let (mut app, ctx) = narrow_app();
+        app.input = "привет".to_string();
+        let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        assert!(
+            has_counter_text(&out),
+            "при набранном тексте счётчик должен быть виден"
+        );
+    }
+
+    /// Найти в нарисованном кадре текст вида «n/2000».
+    fn has_counter_text(out: &egui::FullOutput) -> bool {
+        out.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Text(t) => t.galley.text().contains("/2000"),
+            _ => false,
+        })
     }
 }
