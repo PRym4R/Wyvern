@@ -1114,6 +1114,46 @@ mod geometry_tests {
         );
     }
 
+    /// Кадр, в котором пришло новое сообщение, обязан дотянуть до настоящего
+    /// низа — а не отстать на высоту этого сообщения.
+    ///
+    /// [Т-20] подозревал, что поправка `content_h - est_h` отстаёт: `content_h`
+    /// снят с прошлого списка, а `total` — с текущего. Но `est_h` — это тоже
+    /// прошлый `total`, поэтому `total_new - inner + (content_old - est_old)` =
+    /// `content_old + est_new - inner`, то есть вклад нового сообщения учтён
+    /// (с точностью до ошибки его собственной оценки, которую никакая поправка
+    /// из прошлого кадра знать не может). Здесь это зафиксировано числом.
+    #[test]
+    fn new_message_frame_reaches_the_real_bottom() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        assert!(h.app.chat_at_bottom, "открытый чат должен быть внизу");
+
+        // Сообщение приходит между кадрами — ровно случай из [Т-20].
+        h.tx.send(ToApp::Message(message(9999))).unwrap();
+        h.app.poll(&ctx);
+        frame(&mut h.app, &ctx);
+
+        let (inner, content, ask) = scroll_sizes(&h.app);
+        let real_bottom = (content - inner).max(0.0);
+        let new_h = h
+            .app
+            .msg_heights
+            .get("m9999")
+            .copied()
+            .expect("новое сообщение должно быть измерено");
+        assert!(
+            new_h > 40.0,
+            "сообщение для проверки должно быть заметно выше допуска: {new_h:.0}"
+        );
+        assert!(
+            (ask - real_bottom).abs() <= 1.0,
+            "кадр с новым сообщением не дотянул до низа на высоту сообщения: \
+             просили {ask:.1}, настоящий низ {real_bottom:.1} (сообщение {new_h:.0})"
+        );
+    }
+
     /// Один кадр приложения.
     fn frame(app: &mut App, ctx: &egui::Context) -> egui::FullOutput {
         ctx.run(screen(), |ctx| app.draw_chat(ctx))
