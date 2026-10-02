@@ -132,6 +132,11 @@ pub(crate) struct App {
     /// Только для тестов.
     #[cfg(test)]
     pub(crate) probe_guilds_in_render: usize,
+    /// Только для тестов: не поднимать настоящий гейтвей. Смена аккаунта рвёт
+    /// соединение и стартует новое — в тесте это поход в сеть, а проверяется
+    /// здесь сброс состояния (Т-16).
+    #[cfg(test)]
+    pub(crate) no_gateway: bool,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
@@ -262,6 +267,8 @@ impl App {
             probe_msg_refs: 0,
             #[cfg(test)]
             probe_guilds_in_render: 0,
+            #[cfg(test)]
+            no_gateway: false,
             to_gw: None,
             from_gw,
             gw_started: false,
@@ -551,6 +558,12 @@ impl App {
         any
     }
     pub(crate) fn start_gateway(&mut self, token: String) {
+        #[cfg(test)]
+        if self.no_gateway {
+            // Тест смены аккаунта не ходит в сеть: проверяется сброс состояния.
+            self.gw_started = true;
+            return;
+        }
         let (to_gw_tx, to_gw_rx) = mpsc::unbounded_channel();
         let (from_gw_tx, from_gw_rx) = mpsc::unbounded_channel();
         self.to_gw = Some(to_gw_tx);
@@ -617,6 +630,15 @@ impl App {
         self.username.clear();
         self.user_id.clear();
         self.user_avatar = None;
+        // Кэши и отказы картинок принадлежат прежнему аккаунту: его вложения
+        // и аватары новый показывать не должен, а список отказов иначе
+        // запретил бы скачать то, что не вышло у прежнего (Т-16).
+        self.image_cache.clear();
+        self.avatar_cache.clear();
+        self.pending_images.clear();
+        self.pending_avatars.clear();
+        self.failed_images.clear();
+        self.failed_avatars.clear();
         self.token_input = token.clone();
         self.start_gateway(token.clone());
         self.add_saved_account(&token, "");
@@ -2225,6 +2247,61 @@ mod layout_tests {
         assert!(app.gw_started, "без «Запомнить» вход должен продолжаться");
         assert!(app.status.is_empty(), "вход без ошибок не должен ничего ругать: {:?}", app.status);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Картинки и отказы картинок принадлежат аккаунту: после переключения
+    /// они не должны оставаться ни в кэше, ни в списке отказов, иначе новый
+    /// аккаунт не скачает то, что не вышло у прежнего (Т-16).
+    #[test]
+    fn switching_account_drops_the_previous_accounts_media() {
+        let mut app = make_app();
+        app.no_gateway = true;
+        // Токен уже в списке — add_saved_account не станет писать хранилище.
+        app.saved_accounts = vec![StoredAccount {
+            token: "switch-me".into(),
+            username: String::new(),
+        }];
+
+        let ctx = egui::Context::default();
+        let handle = ctx.load_texture(
+            "old-img",
+            egui::ColorImage::new([4, 4], egui::Color32::BLUE),
+            egui::TextureOptions::default(),
+        );
+        app.image_cache.insert(
+            "https://cdn.discordapp.com/attachments/1/old.png".into(),
+            LoadedImage::Static(handle),
+        );
+        let avatar = ctx.load_texture(
+            "old-avatar",
+            egui::ColorImage::new([4, 4], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        app.avatar_cache.insert("a1_hash".into(), avatar);
+        app.failed_images.insert("https://cdn.example/broken.png".into());
+        app.failed_avatars.insert("u2_bad".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(ImagePayload::Static(egui::ColorImage::new([512, 512], egui::Color32::BLACK))))
+            .unwrap();
+        app.pending_images.insert(
+            "https://cdn.discordapp.com/attachments/1/pending.png".into(),
+            rx,
+        );
+
+        app.switch_account("switch-me".into());
+
+        assert!(
+            app.image_cache.get("https://cdn.discordapp.com/attachments/1/old.png").is_none(),
+            "кэш картинок прежнего аккаунта должен быть очищен"
+        );
+        assert!(app.avatar_cache.get("a1_hash").is_none(), "кэш аватаров прежнего аккаунта тоже");
+        assert!(
+            app.failed_images.is_empty(),
+            "отказы картинок прежнего аккаунта не должны блокировать новый"
+        );
+        assert!(app.failed_avatars.is_empty(), "отказы аватаров тоже");
+        assert!(app.pending_images.is_empty(), "незабранные загрузки не должны висеть в памяти");
+        assert!(app.pending_avatars.is_empty());
     }
 
     /// Строка в поле сообщения — это текст для канала, а не команда клиенту.

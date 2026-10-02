@@ -87,6 +87,12 @@ impl<V: CacheCost> BoundedCache<V> {
             }
         }
     }
+    /// Полный сброс (смена аккаунта): и карта, и очередь, и счётчик байт.
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
 }
 
 /// Эмбед в том виде, в каком его умеет показать клиент: картинка и текст.
