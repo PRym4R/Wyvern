@@ -137,6 +137,14 @@ pub(crate) struct App {
     /// здесь сброс состояния (Т-16).
     #[cfg(test)]
     pub(crate) no_gateway: bool,
+    /// Сколько раз панель аккаунтов клонировала весь список аккаунтов за кадр.
+    /// Пробник для теста: копия списка выставит единицу (Т-19).
+    #[cfg(test)]
+    pub(crate) probe_accounts_cloned: usize,
+    /// Сколько раз список каналов клонировал выбранную гильдию за кадр.
+    /// Пробник для теста: копия выставит единицу (Т-19).
+    #[cfg(test)]
+    pub(crate) probe_channel_guild_cloned: usize,
     pub(crate) to_gw: Option<mpsc::UnboundedSender<ToGateway>>,
     pub(crate) from_gw: mpsc::UnboundedReceiver<ToApp>,
     pub(crate) gw_started: bool,
@@ -269,6 +277,10 @@ impl App {
             probe_guilds_in_render: 0,
             #[cfg(test)]
             no_gateway: false,
+            #[cfg(test)]
+            probe_accounts_cloned: 0,
+            #[cfg(test)]
+            probe_channel_guild_cloned: 0,
             to_gw: None,
             from_gw,
             gw_started: false,
@@ -484,7 +496,7 @@ impl App {
                     let idx = if let Some(idx) = self.channels.iter().position(|c| c.id == ch.id) {
                         idx
                     } else {
-                        self.channels.push(ch.clone());
+                        self.channels.push(ch);
                         self.channels.len() - 1
                     };
                     self.selected_guild = None;

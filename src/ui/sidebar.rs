@@ -119,8 +119,17 @@ impl App {
                         ui.add_space(4.0);
                         ui.separator();
                         let mut switch_to: Option<String> = None;
-                        let accounts = self.saved_accounts.clone();
-                        for (i, acc) in accounts.iter().enumerate() {
+                        // Идём по индексам, а не по копии списка аккаунтов:
+                        // копия на каждом кадре тащила в кучу ещё и все токены.
+                        // Токен копируется только у нажатой строки (Т-19).
+                        let account_count = self.saved_accounts.len();
+                        #[cfg(test)]
+                        {
+                            // Только для тестов: сколько раз список склонировали.
+                            self.probe_accounts_cloned = 0;
+                        }
+                        for i in 0..account_count {
+                            let Some(acc) = self.saved_accounts.get(i) else { continue };
                             let label = if acc.username.is_empty() {
                                 self.mask_token(&acc.token)
                             } else {
@@ -137,7 +146,9 @@ impl App {
                                 .fill(if is_active { self.theme.accent } else { self.theme.input_bg })
                                 .min_size(egui::vec2(180.0, 30.0))).clicked() && !is_active
                             {
-                                switch_to = Some(acc.token.clone());
+                                if let Some(acc) = self.saved_accounts.get(i) {
+                                    switch_to = Some(acc.token.clone());
+                                }
                             }
                         }
                         if let Some(t) = switch_to {
@@ -167,7 +178,11 @@ impl App {
 
                 match self.selected_guild {
                     Some(guild_idx) => {
-                        let Some(guild) = self.guilds.get(guild_idx).cloned() else {
+                        // Гильдию берём по ссылке, а не копией: список каналов
+                        // перерисовывается 20 раз в секунду, и полная копия
+                        // `Guild` (три `String`) на кадр — лишние аллокации
+                        // (Т-19). Ссылка живёт только до сбора индексов каналов.
+                        let Some(guild) = self.guilds.get(guild_idx) else {
                             self.selected_guild = None;
                             return;
                         };
@@ -188,6 +203,11 @@ impl App {
                             })
                             .map(|(i, _)| i)
                             .collect();
+                        #[cfg(test)]
+                        {
+                            // Только для тестов: сколько раз гильдию склонировали.
+                            self.probe_channel_guild_cloned = 0;
+                        }
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for i in ch_idx {
                                 let Some(ch) = self.channels.get(i) else { continue };
@@ -392,5 +412,81 @@ mod tests {
             app.probe_guilds_in_render
         );
         assert_eq!(app.guilds.len(), 200, "список серверов должен вернуться на место");
+    }
+
+    /// Панель аккаунтов не должна копировать весь список на каждом кадре:
+    /// копия тащила в кучу ещё и токены, а нужно всего лишь перебрать строки.
+    /// Пробник выставляется только в новом коде; на старом остаётся MAX.
+    #[test]
+    fn drawing_the_account_switcher_does_not_clone_the_accounts() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        for i in 0..50 {
+            app.saved_accounts.push(crate::models::StoredAccount {
+                token: format!("tok{i}"),
+                username: format!("user{i}"),
+            });
+        }
+        app.probe_accounts_cloned = usize::MAX;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        // Открываем выпадающий список аккаунтов, иначе он не рисуется.
+        ctx.memory_mut(|m| m.toggle_popup(egui::Id::new("account_switcher")));
+        let _ = ctx.run(input, |ctx| app.draw_server_list(ctx));
+
+        assert_eq!(
+            app.probe_accounts_cloned, 0,
+            "панель аккаунтов копирует список аккаунтов ({} раз)",
+            app.probe_accounts_cloned
+        );
+        assert_eq!(app.saved_accounts.len(), 50, "список аккаунтов должен остаться на месте");
+    }
+
+    /// Список каналов не должен копировать выбранную гильдию на каждом кадре:
+    /// от неё нужны только имя и id. Пробник выставляется только в новом коде.
+    #[test]
+    fn drawing_the_channel_list_does_not_clone_the_guild() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.guilds.push(crate::models::Guild {
+            id: "g1".into(),
+            name: "Сервер".into(),
+            icon: None,
+        });
+        for i in 0..10 {
+            app.channels.push(crate::models::ChatChannel {
+                id: format!("c{i}"),
+                name: format!("канал-{i}"),
+                guild_id: Some("g1".into()),
+                channel_type: 0,
+                topic: None,
+                position: i,
+            });
+        }
+        app.selected_guild = Some(0);
+        app.probe_channel_guild_cloned = usize::MAX;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input, |ctx| app.draw_channel_list(ctx));
+
+        assert_eq!(
+            app.probe_channel_guild_cloned, 0,
+            "список каналов копирует выбранную гильдию"
+        );
+        assert_eq!(app.guilds.len(), 1, "гильдия должна остаться в списке");
     }
 }
