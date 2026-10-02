@@ -265,10 +265,22 @@ pub(crate) struct UserProfile {
     pub(crate) username: String,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StoredAccount {
     pub(crate) token: String,
     pub(crate) username: String,
+}
+
+/// Токен в отладочном выводе не показываем: структура попадает в `{:?}` при
+/// диагностике, а `#[derive(Debug)]` печатал токен целиком — любая отладочная
+/// печать или паника могла вынести его в лог.
+impl std::fmt::Debug for StoredAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredAccount")
+            .field("token", &"…")
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -422,6 +434,25 @@ pub(crate) fn test_user(id: &str, username: &str) -> UserProfile {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Токен не должен утекать через отладочный вывод: `StoredAccount` хранит
+    /// его рядом с именем, и `{:?}` раньше печатал токен целиком.
+    #[test]
+    fn stored_account_debug_hides_the_token() {
+        let acc = StoredAccount {
+            token: "секретный-токен-1234567890".into(),
+            username: "вася".into(),
+        };
+        let shown = format!("{:?}", acc);
+        assert!(
+            !shown.contains("секретный-токен-1234567890"),
+            "отладочный вывод напечатал токен: {shown}"
+        );
+        assert!(
+            shown.contains("вася"),
+            "имя в выводе оставить полезно: {shown}"
+        );
+    }
 
     /// Из эмбеда берём только картинку и текст — остальное клиент не рисует,
     /// а места занимает много.
