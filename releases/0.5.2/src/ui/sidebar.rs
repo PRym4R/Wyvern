@@ -1,0 +1,492 @@
+use eframe::egui::{self, Color32, RichText};
+
+use crate::app::App;
+use crate::messages::ToGateway;
+
+impl App {
+    /// Клик по кнопке «@»: только снимок выделения сервера и канала.
+    ///
+    /// Раньше здесь же переключался вид «Друзья / личные сообщения», то есть
+    /// подпись «домой» не соответствовала действию: нажал «домой», чтобы
+    /// вернуться к списку личных сообщений, а попал в «Друзей», и обратное
+    /// нажатие увело в третий экран.
+    pub(crate) fn go_home(&mut self) {
+        self.selected_guild = None;
+        self.selected_channel = None;
+    }
+    /// Переключение вида в боковой панели: отдельная кнопка «Friends / DMs».
+    pub(crate) fn set_friends_view(&mut self, show_friends: bool) {
+        self.show_friends = show_friends;
+    }
+    pub(crate) fn draw_server_list(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("servers")
+            .resizable(false)
+            .default_width(72.0)
+            .exact_width(72.0)
+            .frame(egui::Frame::new().fill(self.theme.bg))
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    let home_btn = ui.add_sized(
+                        [48.0, 48.0],
+                        egui::Button::new(RichText::new("@").size(20.0).color(Color32::WHITE))
+                            .fill(if self.selected_guild.is_none() { self.theme.accent } else { self.theme.input_bg })
+                            .corner_radius(24.0),
+                    );
+                    if home_btn.clicked() {
+                        self.go_home();
+                    }
+                    home_btn.on_hover_text("Direct messages");
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Список серверов уезжает из self на время отрисовки, чтобы не
+                // копировать его целиком каждый кадр (Т-4): на двухстах серверах
+                // это четыре тысячи копий `Guild` в секунду, в каждой по три
+                // `String`. Обратно список кладём сразу после прокрутки.
+                let guilds = std::mem::take(&mut self.guilds);
+                // Только для тестов: сколько серверов осталось в self в момент
+                // отрисовки. Копия списка оставила бы его нетронутым (Т-4).
+                #[cfg(test)]
+                {
+                    self.probe_guilds_in_render = self.guilds.len();
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, guild) in guilds.iter().enumerate() {
+                        ui.vertical_centered(|ui| {
+                            let is_sel = self.selected_guild == Some(i);
+                            let icon_tex = guild.icon.as_ref()
+                                .and_then(|h| self.download_guild_icon(ctx, &guild.id, h));
+                            let btn = if let Some(tex) = icon_tex {
+                                let img = tex.clone();
+                                ui.add_sized(
+                                    [48.0, 48.0],
+                                    egui::ImageButton::new(
+                                        egui::load::SizedTexture::new(img.id(), egui::vec2(48.0, 48.0))
+                                    ).corner_radius(24.0),
+                                )
+                            } else {
+                                let label: String = guild.name.chars().take(2).collect();
+                                ui.add_sized(
+                                    [48.0, 48.0],
+                                    egui::Button::new(RichText::new(&label).size(16.0).color(Color32::WHITE))
+                                        .fill(if is_sel { self.theme.accent } else { self.theme.input_bg })
+                                        .corner_radius(24.0),
+                                )
+                            };
+                            if btn.clicked() {
+                                self.selected_guild = Some(i);
+                                self.selected_channel = None;
+                                self.show_friends = false;
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+                // Возвращаем список серверов на место: на время кадра он был
+                // у нас.
+                self.guilds = guilds;
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    let ubtn = ui.add_sized(
+                        [48.0, 48.0],
+                        egui::Button::new(RichText::new("◐").size(20.0).color(Color32::WHITE))
+                            .fill(self.theme.input_bg)
+                            .corner_radius(24.0),
+                    );
+                    if ubtn.clicked() {
+                        self.theme_index = (self.theme_index + 1) % 3;
+                    }
+                    ubtn.on_hover_text("Toggle theme");
+
+                    let abtn = ui.add_sized(
+                        [48.0, 42.0],
+                        egui::Button::new(RichText::new("👤").size(18.0).color(Color32::WHITE))
+                            .fill(if self.connected { self.theme.accent } else { self.theme.input_bg })
+                            .corner_radius(21.0),
+                    );
+                    let popup_id = egui::Id::new("account_switcher");
+                    if abtn.clicked() {
+                        ui.close_menu();
+                        ui.memory_mut(|m| m.toggle_popup(popup_id));
+                    }
+                    abtn.clone().on_hover_text(&self.username);
+                    egui::popup_below_widget(ui, popup_id, &abtn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(190.0);
+                        ui.label(RichText::new("Accounts").strong().size(12.0).color(self.theme.text_secondary));
+                        ui.add_space(4.0);
+                        ui.separator();
+                        let mut switch_to: Option<String> = None;
+                        // Идём по индексам, а не по копии списка аккаунтов:
+                        // копия на каждом кадре тащила в кучу ещё и все токены.
+                        // Токен копируется только у нажатой строки (Т-19).
+                        let account_count = self.saved_accounts.len();
+                        #[cfg(test)]
+                        {
+                            // Только для тестов: сколько раз список склонировали.
+                            self.probe_accounts_cloned = 0;
+                        }
+                        for i in 0..account_count {
+                            let Some(acc) = self.saved_accounts.get(i) else { continue };
+                            let label = if acc.username.is_empty() {
+                                self.mask_token(&acc.token)
+                            } else {
+                                acc.username.clone()
+                            };
+                            let is_active = self.active_index == Some(i);
+                            let text = if is_active {
+                                format!("{} ✓", label)
+                            } else {
+                                label
+                            };
+                            if ui.add(egui::Button::new(RichText::new(text).size(13.0)
+                                .color(if is_active { Color32::BLACK } else { self.theme.text }))
+                                .fill(if is_active { self.theme.accent } else { self.theme.input_bg })
+                                .min_size(egui::vec2(180.0, 30.0))).clicked() && !is_active
+                            {
+                                if let Some(acc) = self.saved_accounts.get(i) {
+                                    switch_to = Some(acc.token.clone());
+                                }
+                            }
+                        }
+                        if let Some(t) = switch_to {
+                            self.switch_account(t);
+                            ui.close_menu();
+                        }
+                    });
+                });
+            });
+    }
+    pub(crate) fn draw_channel_list(&mut self, ctx: &egui::Context) {
+        let panel = egui::SidePanel::left("channels")
+            .resizable(true)
+            .default_width(240.0)
+            .min_width(180.0)
+            // Верхней границы не было вовсе, и панель растягивалась мышью на
+            // всю ширину окна. В самом узком окне (минимум 700 px, минус рельс
+            // серверов — 628) на строку ввода оставалось 28 px, из которых
+            // кнопка «Send» и отступы забирали больше, чем оставалось: ширина
+            // поля уходила в минус. В релизной сборке поле схлопывалось в ноль
+            // и печатать было нечем, в отладочной egui паниковала на отрицательном
+            // прямоугольнике.
+            .max_width(360.0)
+            .frame(egui::Frame::new().fill(self.theme.panel_bg));
+        let resp = panel.show(ctx, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                match self.selected_guild {
+                    Some(guild_idx) => {
+                        // Гильдию берём по ссылке, а не копией: список каналов
+                        // перерисовывается 20 раз в секунду, и полная копия
+                        // `Guild` (три `String`) на кадр — лишние аллокации
+                        // (Т-19). Ссылка живёт только до сбора индексов каналов.
+                        let Some(guild) = self.guilds.get(guild_idx) else {
+                            self.selected_guild = None;
+                            return;
+                        };
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(&guild.name).strong().size(15.0).color(self.theme.text));
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // Собираем только индексы каналов гильдии, а не копии
+                        // самих каналов: список перерисовывается 20 раз в
+                        // секунду, и полное клонирование на кадр съедало
+                        // тысячи аллокаций.
+                        let ch_idx: Vec<usize> = self.channels.iter()
+                            .enumerate()
+                            .filter(|(_, ch)| {
+                                ch.guild_id.as_deref() == Some(guild.id.as_str()) && ch.channel_type == 0
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        #[cfg(test)]
+                        {
+                            // Только для тестов: сколько раз гильдию склонировали.
+                            self.probe_channel_guild_cloned = 0;
+                        }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for i in ch_idx {
+                                let Some(ch) = self.channels.get(i) else { continue };
+                                let is_sel = self.selected_channel == Some(i);
+                                let label = format!("# {}", ch.name);
+                                let response = ui.add_sized(
+                                    [ui.available_width(), 32.0],
+                                    egui::Button::new(
+                                        RichText::new(&label)
+                                            .color(if is_sel { Color32::WHITE } else { self.theme.text_secondary })
+                                            .size(14.0)
+                                    ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
+                                );
+                                if response.clicked() {
+                                    let cid = ch.id.clone();
+                                    self.selected_channel = Some(i);
+                                    self.scroll_to_bottom = true;
+                                    self.open_channel(&cid);
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        // Переключатель «Друзья / Личные сообщения». Раньше он
+                        // был спрятан в кнопке «@»: тот по клику сбрасывал
+                        // выделение сервера И переключал вид, так что два
+                        // нажатия «домой» уводили не туда, куда человек шёл.
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for (label, want_friends) in [("Friends", true), ("DMs", false)] {
+                                let active = self.show_friends == want_friends;
+                                let color = if active { Color32::WHITE } else { self.theme.text_secondary };
+                                let fill = if active { self.theme.accent } else { Color32::TRANSPARENT };
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width() / 2.0 - 4.0, 28.0],
+                                        egui::Button::new(RichText::new(label).size(13.0).color(color)).fill(fill),
+                                    )
+                                    .clicked()
+                                {
+                                    self.set_friends_view(want_friends);
+                                }
+                            }
+                        });
+                        if self.show_friends {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("Friends").strong().size(15.0).color(self.theme.text));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(format!("{} friends", self.friends.len()))
+                                .size(12.0).color(self.theme.text_secondary));
+                            ui.add_space(4.0);
+                            ui.separator();
+                            // Список друзей и список DM перебираем по индексам и
+                            // копируем только нужные строки: раньше тут на
+                            // каждом кадре клонировался весь список целиком
+                            // (сотни аллокаций 20 раз в секунду).
+                            let friend_count = self.friends.len();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for i in 0..friend_count {
+                                    let (label, username) = match self.friends.get(i) {
+                                        Some(f) => (format!("@{}", f.username), f.username.clone()),
+                                        None => continue,
+                                    };
+                                    let response = ui.add_sized(
+                                        [ui.available_width(), 32.0],
+                                        egui::Button::new(
+                                            RichText::new(&label).size(14.0).color(self.theme.text)
+                                        ).fill(Color32::TRANSPARENT),
+                                    );
+                                    if response.clicked() {
+                                        if let Some(f) = self.friends.get(i) {
+                                            if f.id.is_empty() {
+                                                continue;
+                                            }
+                                            let fid = f.id.clone();
+                                            self.push_debug(format!("Clicked friend '{}' (id {})", username, &fid[..fid.len().min(12)]));
+                                            self.send_cmd(ToGateway::OpenDM { user_id: fid });
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("DMs").strong().size(15.0).color(self.theme.text));
+                            ui.add_space(4.0);
+                            ui.separator();
+                            let dm_count = self.channels.len();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for i in 0..dm_count {
+                                    let (cid, cname) = match self.channels.get(i) {
+                                        Some(ch)
+                                            if ch.guild_id.is_none()
+                                                && (ch.channel_type == 1 || ch.channel_type == 3) =>
+                                        {
+                                            (ch.id.clone(), ch.name.clone())
+                                        }
+                                        _ => continue,
+                                    };
+                                    let is_sel = self.selected_channel
+                                        .and_then(|s| self.channels.get(s))
+                                        .map(|c| c.id == cid)
+                                        .unwrap_or(false);
+                                    let response = ui.add_sized(
+                                        [ui.available_width(), 32.0],
+                                        egui::Button::new(
+                                            RichText::new(&cname)
+                                                .color(if is_sel { Color32::WHITE } else { self.theme.text_secondary })
+                                                .size(14.0)
+                                        ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
+                                    );
+                                    if response.clicked() {
+                                        self.selected_channel = Some(i);
+                                        self.scroll_to_bottom = true;
+                                        self.open_channel(&cid);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        // Ширину панели запоминаем и пишем в лог только когда она изменилась:
+        // панель тянут мышью, и по этой строке видно, до чего её растянули.
+        let panel_w = resp.response.rect.width();
+        if (panel_w - self.channel_panel_w).abs() > 0.5 {
+            self.channel_panel_w = panel_w;
+            self.push_debug(format!("CHANNELS_PANEL: w={panel_w:.0}"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Кнопка «@» подписана «домой»: клик должен только снимать выделение
+    /// сервера. Раньше она заодно переключала вид «Друзья / личные
+    /// сообщения», и человек, нажавший «домой» дважды подряд, оказывался
+    /// в другом экране, чем собирался.
+    #[test]
+    fn home_button_only_drops_the_server_selection() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.selected_guild = Some(2);
+        app.selected_channel = Some(5);
+        app.show_friends = false;
+
+        app.go_home();
+
+        assert!(app.selected_guild.is_none(), "выделение сервера должно сброситься");
+        assert!(app.selected_channel.is_none(), "выделение канала должно сброситься");
+        assert!(!app.show_friends, "«@» не должен переключать вид «Друзья / личные сообщения»");
+    }
+
+    /// Вид переключается отдельной кнопкой — и только им.
+    #[test]
+    fn friends_view_has_its_own_switch() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.selected_guild = Some(0);
+        app.selected_channel = Some(1);
+
+        app.set_friends_view(true);
+        assert!(app.show_friends);
+        app.set_friends_view(false);
+        assert!(!app.show_friends);
+        // Переключение вида не выкидывает пользователя из открытого канала.
+        assert_eq!(app.selected_channel, Some(1), "переключатель вида не должен сбрасывать выбор");
+    }
+
+    /// Панель серверов не должна копировать список `guilds` на каждом кадре.
+    ///
+    /// Раньше отрисовка начиналась с `self.guilds.clone()` — на двухстах
+    /// серверах это тысячи копий `Guild` в секунду. Теперь список уезжает из
+    /// `self` на время кадра, и пробник фиксирует, что в момент отрисовки в
+    /// `self.guilds` пусто.
+    #[test]
+    fn drawing_the_server_list_does_not_clone_the_guilds() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        for i in 0..200 {
+            app.guilds.push(crate::models::Guild {
+                id: format!("g{i}"),
+                name: format!("Сервер {i}"),
+                icon: None,
+            });
+        }
+        app.probe_guilds_in_render = usize::MAX;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input, |ctx| app.draw_server_list(ctx));
+
+        assert_eq!(
+            app.probe_guilds_in_render, 0,
+            "панель серверов копирует список серверов: в self осталось {}",
+            app.probe_guilds_in_render
+        );
+        assert_eq!(app.guilds.len(), 200, "список серверов должен вернуться на место");
+    }
+
+    /// Панель аккаунтов не должна копировать весь список на каждом кадре:
+    /// копия тащила в кучу ещё и токены, а нужно всего лишь перебрать строки.
+    /// Пробник выставляется только в новом коде; на старом остаётся MAX.
+    #[test]
+    fn drawing_the_account_switcher_does_not_clone_the_accounts() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        for i in 0..50 {
+            app.saved_accounts.push(crate::models::StoredAccount {
+                token: format!("tok{i}"),
+                username: format!("user{i}"),
+            });
+        }
+        app.probe_accounts_cloned = usize::MAX;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        // Открываем выпадающий список аккаунтов, иначе он не рисуется.
+        ctx.memory_mut(|m| m.toggle_popup(egui::Id::new("account_switcher")));
+        let _ = ctx.run(input, |ctx| app.draw_server_list(ctx));
+
+        assert_eq!(
+            app.probe_accounts_cloned, 0,
+            "панель аккаунтов копирует список аккаунтов ({} раз)",
+            app.probe_accounts_cloned
+        );
+        assert_eq!(app.saved_accounts.len(), 50, "список аккаунтов должен остаться на месте");
+    }
+
+    /// Список каналов не должен копировать выбранную гильдию на каждом кадре:
+    /// от неё нужны только имя и id. Пробник выставляется только в новом коде.
+    #[test]
+    fn drawing_the_channel_list_does_not_clone_the_guild() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.guilds.push(crate::models::Guild {
+            id: "g1".into(),
+            name: "Сервер".into(),
+            icon: None,
+        });
+        for i in 0..10 {
+            app.channels.push(crate::models::ChatChannel {
+                id: format!("c{i}"),
+                name: format!("канал-{i}"),
+                guild_id: Some("g1".into()),
+                channel_type: 0,
+                topic: None,
+                position: i,
+            });
+        }
+        app.selected_guild = Some(0);
+        app.probe_channel_guild_cloned = usize::MAX;
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1052.0, 1054.0),
+            )),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input, |ctx| app.draw_channel_list(ctx));
+
+        assert_eq!(
+            app.probe_channel_guild_cloned, 0,
+            "список каналов копирует выбранную гильдию"
+        );
+        assert_eq!(app.guilds.len(), 1, "гильдия должна остаться в списке");
+    }
+}
