@@ -49,6 +49,21 @@ fn is_human_debug(line: &str) -> bool {
     !GEOMETRY_PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
+/// Состояние соединения, а не ошибка ввода.
+///
+/// Гейтвей кладёт в `status` и то, и другое: настоящие отказы (отклонённый
+/// токен, «Аккаунт не найден в хранилище») и сетевые сообщения («Connecting…»,
+/// «Reconnecting: …», «Disconnected», «Resumed»). Красный цвет на экране входа
+/// оставлен ошибкам; состояние соединения показывается нейтрально. Раньше
+/// пользователь видел красное «Reconnecting: websocket closed» и не понимал,
+/// что это не его вина и что вообще делать (Т-12).
+fn is_connection_status(s: &str) -> bool {
+    s.starts_with("Connecting")
+        || s.starts_with("Reconnecting")
+        || s.starts_with("Disconnected")
+        || s.starts_with("Resumed")
+}
+
 impl App {
     pub(crate) fn draw_login(&mut self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
@@ -427,7 +442,16 @@ impl App {
 
     fn login_footer(&self, ui: &mut egui::Ui) {
         if !self.status.is_empty() {
-            ui.label(RichText::new(&self.status).size(13.0).color(ERROR_RED));
+            // Т-12: состояние соединения — не ошибка входа. Красный оставлен
+            // отказам (неверный токен, пароль хранилища), а «Connecting…» /
+            // «Reconnecting…» показываются нейтрально, иначе пользователь
+            // читает красное «Reconnecting: websocket closed» как свою ошибку.
+            let color = if is_connection_status(&self.status) {
+                self.theme.text_secondary
+            } else {
+                ERROR_RED
+            };
+            ui.label(RichText::new(&self.status).size(13.0).color(color));
         } else if !self.login_notice.is_empty() {
             ui.label(RichText::new(&self.login_notice).size(13.0).color(self.theme.accent));
         } else if let Some(last) = self.debug_log.iter().rev().find(|l| is_human_debug(l)) {
@@ -512,11 +536,71 @@ mod tests {
             .collect()
     }
 
+    /// Текст вместе с цветом: нужен там, где важно не только «что написано»,
+    /// но и «как выглядит» (ошибка входа красная, состояние соединения — нет).
+    ///
+    /// Цвет берём из первого раздела набора: `RichText::color` кладёт его
+    /// именно туда, а `fallback_color` у всех подписей одинаковый.
+    fn colored_texts(app: &mut App) -> Vec<(String, Color32, f32, f32)> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw.clone(), |ctx| app.draw_login(ctx));
+        let out = ctx.run(raw, |ctx| app.draw_login(ctx));
+        let mut found = Vec::new();
+        for cs in out.shapes {
+            if let egui::Shape::Text(t) = cs.shape {
+                let color = t
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| s.format.color)
+                    .unwrap_or(t.fallback_color);
+                found.push((t.galley.text().to_string(), color, t.pos.x, t.pos.y));
+            }
+        }
+        found
+    }
+
     fn make_app() -> App {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(rx);
         app.status = "статус".into();
         app
+    }
+
+    /// Состояние соединения — не ошибка входа: красный цвет должен остаться
+    /// настоящим отказам. Раньше `login_footer` красил любой `status` красным,
+    /// и «Reconnecting: websocket closed» выглядело как ошибка пользователя.
+    #[test]
+    fn connection_status_is_not_painted_as_login_error() {
+        let mut app = make_app();
+        app.status = "Reconnecting: websocket closed".into();
+
+        let list = colored_texts(&mut app);
+        let color = list
+            .iter()
+            .find(|(t, _, _, _)| t.contains("Reconnecting"))
+            .map(|(_, c, _, _)| *c)
+            .expect("состояние соединения не найдено на экране входа");
+        assert_ne!(color, ERROR_RED, "сеть — не ошибка входа");
+        assert_eq!(color, app.theme.text_secondary);
+
+        // А настоящий отказ по-прежнему красный.
+        app.status = "Неверный токен".into();
+        let list = colored_texts(&mut app);
+        let color = list
+            .iter()
+            .find(|(t, _, _, _)| t.contains("Неверный токен"))
+            .map(|(_, c, _, _)| *c)
+            .expect("ошибка входа не найдена");
+        assert_eq!(color, ERROR_RED, "ошибку входа нужно красить красным");
     }
 
     /// В подписи входа не должно быть строк геометрии: они пишутся каждый кадр
