@@ -51,6 +51,17 @@ fn read_limited(resp: reqwest::blocking::Response, max: u64) -> Option<Vec<u8>> 
     Some(buf)
 }
 
+/// Регистронезависимый поиск подстроки без создания новой строки.
+///
+/// `download_image` вызывается на каждом кадре для каждой видимой картинки, а
+/// раньше тут делался `url.to_lowercase()` — при двадцати картинках на экране
+/// это сотни аллокаций в секунду ради проверки «не аватарка ли это».
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
 /// это новый пул соединений и TLS-сессия на каждый запрос.
 fn http() -> &'static reqwest::blocking::Client {
@@ -341,8 +352,7 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
     let ctx2 = ctx.clone();
     let key = cache_key.clone();
 
-    let lower = url.to_lowercase();
-    if lower.contains("/avatars/") || lower.contains("/users/") {
+    if contains_ignore_case(url, "/avatars/") || contains_ignore_case(url, "/users/") {
         remember_failed(&mut self.failed_images, key);
         return None;
     }
@@ -567,6 +577,29 @@ mod tests {
             survivors >= max - 1,
             "переполнение стёрло больше одной записи: выжило {survivors} из {max}"
         );
+    }
+
+    /// «Это аватарка?» должно опознаваться независимо от регистра — как
+    /// раньше через `to_lowercase().contains(...)` — но без создания строки
+    /// на каждый кадр и каждую картинку.
+    #[test]
+    fn avatar_url_detection_is_case_insensitive() {
+        let is_avatar =
+            |u: &str| contains_ignore_case(u, "/avatars/") || contains_ignore_case(u, "/users/");
+        for url in [
+            "https://cdn.discordapp.com/avatars/1/hash.png",
+            "https://cdn.discordapp.com/AVATARS/1/hash.png",
+            "https://cdn.discordapp.com/Users/1/hash.png",
+            "https://example.com/USERS/1/hash.png",
+        ] {
+            assert!(is_avatar(url), "ссылка должна опознаваться как аватарка: {url}");
+            assert_eq!(
+                is_avatar(url),
+                url.to_lowercase().contains("/avatars/") || url.to_lowercase().contains("/users/"),
+                "регистронезависимый поиск разошёлся со старым: {url}"
+            );
+        }
+        assert!(!is_avatar("https://example.com/pic.png"), "обычная картинка — не аватарка");
     }
 
     /// Отказ занять слот не должен увеличивать счётчик: иначе он уезжает
