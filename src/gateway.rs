@@ -207,6 +207,28 @@ fn classify_raw(raw: &str) -> RawFrame {
 struct SessionState {
     session_id: Option<String>,
     seq: Option<i64>,
+    /// Пары «канал, страница», для которых запрос истории уже в полёте.
+    /// Живёт вместе с сессией, а не внутри одного подключения: `run_gateway`
+    /// передаёт один и тот же `SessionState` в каждый новый `gw_inner`, а
+    /// задача, запущенная на прошлом соединении, держит тот же `Arc`. Раньше
+    /// множество создавалось заново на каждой попытке, и после реконнекта
+    /// защита от дублей пропадала (Т-21).
+    history_inflight: HistoryInflight,
+}
+
+/// Множество запросов истории в полёте. Ключ — канал и страница (`before`).
+type HistoryInflight =
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, Option<String>)>>>;
+
+/// Занять пару (канал, страница) под запрос истории. `false` — такой запрос
+/// уже идёт: повторный клик по каналу не должен слать дубль.
+async fn claim_history(inflight: &HistoryInflight, key: (String, Option<String>)) -> bool {
+    inflight.lock().await.insert(key)
+}
+
+/// Отпустить пару после завершения запроса.
+async fn release_history(inflight: &HistoryInflight, key: &(String, Option<String>)) {
+    inflight.lock().await.remove(key);
 }
 
 /// Сколько сообщений тянуть за один раз. Discord отдаёт до 100, но начинать
@@ -933,13 +955,6 @@ async fn gw_inner(
     // навсегда (см. `api_client`).
     let http = api_client()?;
     let tkn = token.to_string();
-    // Каналы, история которых уже грузится: защита от дублей при кликах.
-    // Каналы и страницы, история которых уже грузится: защита от дублей при
-    // кликах. Ключ — (канал, запрошенная страница): повтор той же страницы
-    // действительно лишний, а вот первая страница и догрузка вверх — разные
-    // запросы, и раньше вторая отбрасывалась как дубль первой.
-    let history_inflight =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<(String, Option<String>)>::new()));
     let mut heartbeat = time::interval(Duration::from_millis(interval));
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
@@ -1350,7 +1365,7 @@ async fn gw_inner(
                         // и клик по следующему каналу «зависал» до его конца.
                         // Повторный запрос по тому же каналу игнорируем, иначе
                         // два одинаковых запроса и лишний риск 429.
-                        let inflight = history_inflight.clone();
+                        let inflight = session.history_inflight.clone();
                         let httpc = http.clone();
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
@@ -1364,18 +1379,15 @@ async fn gw_inner(
                         let key = (cid.clone(), before.clone());
                         let cid_short: String = cid.chars().take(14).collect();
                         tokio::spawn(async move {
-                            {
-                                let mut busy = inflight.lock().await;
-                                if !busy.insert(key.clone()) {
-                                    let _ = ev.send(ToApp::Debug(format!(
-                                        "History for {} already in flight, skipping",
-                                        cid_short
-                                    )));
-                                    return;
-                                }
+                            if !claim_history(&inflight, key.clone()).await {
+                                let _ = ev.send(ToApp::Debug(format!(
+                                    "History for {} already in flight, skipping",
+                                    cid_short
+                                )));
+                                return;
                             }
                             fetch_history_page(httpc, tkc, ev.clone(), cid.clone(), before).await;
-                            inflight.lock().await.remove(&key);
+                            release_history(&inflight, &key).await;
                         });
                     }
                     ToGateway::OpenDM { user_id } => {
@@ -1591,6 +1603,41 @@ mod generation_tests {
         assert!(second > first, "поколения должны расти: {first} → {second}");
         assert!(gen.is_current(second));
         assert!(!gen.is_current(first), "прежнее поколение больше не актуально");
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::{claim_history, release_history, SessionState};
+
+    /// Защита от дублей истории обязана пережить реконнект.
+    ///
+    /// `run_gateway` держит один `SessionState` и передаёт его в каждый новый
+    /// `gw_inner`, а задача прошлого соединения продолжает держать тот же
+    /// `Arc`. Если бы множество запросов создавалось заново на каждое
+    /// подключение, второй клик по каналу после реконнекта ушёл бы в Discord
+    /// ещё раз (Т-21).
+    #[tokio::test]
+    async fn history_inflight_survives_a_reconnect() {
+        let session = SessionState::default();
+        let key = ("c1".to_string(), None);
+
+        assert!(
+            claim_history(&session.history_inflight, key.clone()).await,
+            "первый запрос истории должен пройти"
+        );
+        // «Реконнект» — это тот же SessionState в следующем gw_inner.
+        assert!(
+            !claim_history(&session.history_inflight, key.clone()).await,
+            "после реконнекта защита от дублей пропала: запрос уйдёт второй раз"
+        );
+
+        // Запрос завершился — пару отпускаем, и следующий клик снова проходит.
+        release_history(&session.history_inflight, &key).await;
+        assert!(
+            claim_history(&session.history_inflight, key).await,
+            "после завершения запроса канал снова должен открываться"
+        );
     }
 }
 
