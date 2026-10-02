@@ -79,8 +79,18 @@ pub(crate) fn source_size_allowed(w: u32, h: u32) -> bool {
     u64::from(w) * u64::from(h) <= MAX_SOURCE_PIXELS
 }
 
-fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) {    if failed.len() >= MAX_FAILED_IMAGES {
-        failed.clear();
+/// Запомнить неудачу, не раздувая список.
+///
+/// При переполнении вытесняется ОДНА запись, а не весь список: полный сброс
+/// приходился ровно на момент, когда сбои пошли потоком (сеть легла, CDN
+/// отдал 429), и клиент тут же забывал всё, что уже признано нерабочим, и
+/// начинал качать это заново. Какую именно запись потерять — неважно; важно,
+/// что теряется одна, а не 512.
+fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) {
+    if failed.len() >= MAX_FAILED_IMAGES {
+        if let Some(victim) = failed.iter().next().cloned() {
+            failed.remove(&victim);
+        }
     }
     failed.insert(key);
 }
@@ -517,7 +527,7 @@ mod tests {
 
     /// Память об отказах не должна расти без предела: аватары приходят с
     /// новыми хешами, и ключи никогда не повторяются. При достижении предела
-    /// список сбрасывается целиком — это лучше, чем расти до падения.
+    /// вытесняется одна запись — старые ключи постепенно уходят.
     #[test]
     fn failed_avatars_are_bounded() {
         let ctx = egui::Context::default();
@@ -532,8 +542,31 @@ mod tests {
             "память об отказах выросла без предела: {}",
             app.failed_avatars.len()
         );
-        // Первые ключи после сброса забыты — но новые-то запомнены.
-        assert!(app.failed_avatars.len() > 0, "сброс должен был начаться не с пустого места");
+        // Старые ключи постепенно вытесняются — но свежие запомнены.
+        assert!(app.failed_avatars.len() > 0, "список отказов не должен опустеть");
+    }
+
+    /// Переполнение памяти об отказах не должно стирать всё разом: иначе в
+    /// самый разгар массового сбоя (сеть легла, CDN отдал 429) клиент забывает
+    /// всё, что уже признано нерабочим, и начинает качать это заново.
+    #[test]
+    fn failed_avatars_are_evicted_one_by_one() {
+        let ctx = egui::Context::default();
+        let mut app = plain_app();
+        let max = crate::app::MAX_FAILED_IMAGES;
+        for i in 0..max {
+            app.store_avatar(ctx.clone(), format!("u{i}_h"), AvatarFetch::Failed);
+        }
+        // Переполняем ровно на одну запись.
+        app.store_avatar(ctx.clone(), "overflow_hash".into(), AvatarFetch::Failed);
+
+        let survivors = (0..max)
+            .filter(|i| app.failed_avatars.contains(&format!("u{i}_h")))
+            .count();
+        assert!(
+            survivors >= max - 1,
+            "переполнение стёрло больше одной записи: выжило {survivors} из {max}"
+        );
     }
 
     /// Отказ занять слот не должен увеличивать счётчик: иначе он уезжает
