@@ -20,6 +20,16 @@ fn ends_with_ci(hay: &str, needle: &str) -> bool {
 
 const VIDEO_EXTS: [&str; 5] = [".mp4", ".webm", ".ogg", ".m4v", ".mov"];
 
+/// Во сколько картинку в чате можно показывать. От этого зависит и размер
+/// текстуры, и высота сообщения в списке.
+pub(crate) const MAX_IMAGE_DISPLAY: f32 = 360.0;
+
+/// Место под картинку, для которой Discord не прислал размер. Берётся
+/// только как последний обходной путь: обычно размер известен заранее, и
+/// резервируется ровно столько места, сколько картинка займёт. Число одно
+/// и то же для оценки высоты сообщения и для отрисовки, иначе список дёргается.
+pub(crate) const IMAGE_PLACEHOLDER: f32 = 180.0;
+
 /// Ссылка на картинку из эмбеда, если её вообще нужно показывать.
 /// Аватары и видео пропускаем: аватары мы рисуем отдельно, видео всё равно
 /// нечем показать. Возвращаем кусок исходной строки, а не её копию.
@@ -36,33 +46,72 @@ pub(crate) fn embed_image_url(url: &str) -> Option<&str> {
     Some(url)
 }
 
+/// Перебрать картинки сообщения — вложения и эмбеды — и вызвать `f` на
+/// каждой. Вместе со ссылкой отдаём размер, который Discord прислал рядом с
+/// ней: по нему место под картинку резервируется точно, не дожидаясь
+/// загрузки, и сообщение не меняет высоту, когда картинка наконец приходит.
+///
+/// Список не собирается: он нужен на каждом кадре и для каждого сообщения
+/// (в том числе для оценки высоты ещё не нарисованных), а копия URL'ов в куче
+/// — ровно та аллокация, ради которой эту строчку когда-то и переписывали.
+pub(crate) fn for_each_image(msg: &ChatMessage, mut f: impl FnMut(&str, Option<egui::Vec2>)) {
+    for att in &msg.attachments {
+        if att.content_type.as_deref().map(|ct| ct.starts_with("image/")).unwrap_or(false) {
+            f(att.url.as_str(), known_size(att.size));
+        }
+    }
+    for e in &msg.embeds {
+        if let Some(u) = e.image_url.as_deref().and_then(embed_image_url) {
+            f(u, known_size(e.image_size));
+        }
+    }
+}
+
+/// Размер из пары `width`/`height` в виде, который ждёт `display_size`.
+fn known_size(size: Option<[u32; 2]>) -> Option<egui::Vec2> {
+    size.map(|[w, h]| egui::vec2(w as f32, h as f32))
+}
+
+/// Высота картинки в чате: настоящая, если она уже в кэше.
+pub(crate) fn display_size(size: egui::Vec2) -> egui::Vec2 {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return egui::Vec2::ZERO;
+    }
+    let scale = (MAX_IMAGE_DISPLAY / size.x).min(MAX_IMAGE_DISPLAY / size.y).min(1.0);
+    egui::vec2(size.x * scale, size.y * scale)
+}
+
+/// Сколько места займёт картинка в сообщении, когда её ещё нет в кэше.
+/// Размер Discord присылает вместе со ссылкой, поэтому место резервируется
+/// точно и сообщение не скачет на сотни пикселей в момент загрузки. Если
+/// размера нет (старые сообщения, битая ссылка) — берём заглушку.
+pub(crate) fn reserved_size(known: Option<egui::Vec2>) -> egui::Vec2 {
+    match known {
+        Some(s) => display_size(s),
+        None => egui::vec2(MAX_IMAGE_DISPLAY, IMAGE_PLACEHOLDER),
+    }
+}
+
 impl App {
     pub(crate) fn draw_attachments(&mut self, ui: &mut egui::Ui, msg: &ChatMessage) {
-        // Ссылки берём из сообщения, а не копируем: список показывается на
-        // каждом кадре, и копии URL'ов в куче не нужны.
-        let mut urls: Vec<&str> = Vec::new();
-        for att in &msg.attachments {
-            if att.content_type.as_deref().map(|ct| ct.starts_with("image/")).unwrap_or(false) {
-                urls.push(att.url.as_str());
-            }
-        }
-        for e in &msg.embeds {
-            if let Some(u) = e.image_url.as_deref() {
-                if let Some(u) = embed_image_url(u) {
-                    urls.push(u);
-                }
-            }
-        }
-        for url in urls {
+        // Ссылка на картинку в уже скачанном виде или место под неё: URL'ы
+        // берём из сообщения, а не копируем — список показывается на каждом
+        // кадре, и копии URL'ов в куче не нужны.
+        for_each_image(msg, |url, known| {
             if let Some(tex) = self.download_image(ui.ctx(), url) {
-                let size = tex.size_vec2();
-                if size.x <= 0.0 || size.y <= 0.0 {
-                    continue;
+                // Картинка (или гифка) на экране: не дадим вытеснить её из
+                // кэша, пока её видно. Иначе в следующем кадре её снова
+                // качают — она мигает, и высота сообщения скачет.
+                self.image_cache.mark_visible(url);
+                // Анимированную нужно перерисовывать непрерывно, пока она на
+                // экране: в покое кадров больше нет (Т-7).
+                if tex.is_animated() {
+                    self.animating = true;
                 }
-                let max_w = 360.0_f32;
-                let max_h = 360.0_f32;
-                let scale = (max_w / size.x).min(max_h / size.y).min(1.0);
-                let disp = egui::vec2(size.x * scale, size.y * scale);
+                let disp = display_size(tex.size_vec2());
+                if disp.x <= 0.0 || disp.y <= 0.0 {
+                    return;
+                }
                 ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)))
                     .on_hover_text(url.to_string());
             } else if self.failed_images.contains(url) {
@@ -74,9 +123,23 @@ impl App {
                         .color(self.theme.text_secondary),
                 );
             } else {
-                ui.spinner();
+                // Ждём: место под картинку резервируем сразу и ровно столько,
+                // сколько она потом займёт, иначе в момент её появления
+                // высота сообщения скачет и всё, что ниже, уезжает вниз.
+                let disp = reserved_size(known);
+                let color = self.theme.input_bg;
+                let (rect, _) = ui.allocate_exact_size(disp, egui::Sense::hover());
+                ui.painter().rect_filled(rect, 6.0, color);
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                    |ui| {
+                        ui.spinner();
+                    },
+                );
             }
-        }
+        });
     }
 }
 

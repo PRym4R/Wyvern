@@ -1,0 +1,375 @@
+use std::collections::{HashMap, VecDeque};
+
+use eframe::egui::{self, Color32, TextureHandle};
+use serde_json::Value;
+
+/// Сколько памяти занимает значение в кэше. Нужно, чтобы ограничивать кэш
+/// не по числу элементов, а по байтам: 200 аватарок — это 3 МБ, а 200 картинок
+/// — это 800 МБ, и само число элементов ни о чём не говорит.
+pub(crate) trait CacheCost {
+    fn cache_bytes(&self) -> usize;
+}
+
+impl CacheCost for TextureHandle {
+    fn cache_bytes(&self) -> usize {
+        let s = self.size();
+        s[0].saturating_mul(s[1]).saturating_mul(4)
+    }
+}
+
+/// Кеш с ограничением размера: при переполнении вытесняется самый старый
+/// элемент. Ограничение сразу по двум параметрам — по количеству и по
+/// памяти, — поэтому кэш не раздуется ни от числа элементов, ни от одной
+/// большой картинки.
+pub(crate) struct BoundedCache<V> {
+    map: HashMap<String, V>,
+    order: VecDeque<String>,
+    cap: usize,
+    budget: usize,
+    bytes: usize,
+}
+
+impl<V: CacheCost> BoundedCache<V> {
+    pub(crate) fn with_budget(cap: usize, budget: usize) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), cap, budget, bytes: 0 }
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+        self.map.get(key)
+    }
+    /// Сколько памяти кэш держит прямо сейчас.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+    // Хелперы для тестов и отладки — в самом клиенте не вызываются.
+    #[allow(dead_code)]
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub(crate) fn insert(&mut self, key: String, value: V) {
+        if let Some(old) = self.map.insert(key.clone(), value) {
+            // Тот же ключ перезаписан: снимаем вес старого значения, иначе
+            // память посчитается дважды.
+            self.bytes = self.bytes.saturating_sub(old.cache_bytes());
+        } else {
+            self.order.push_back(key.clone());
+        }
+        let added = self.map[&key].cache_bytes();
+        self.bytes = self.bytes.saturating_add(added);
+        // Последний элемент не выкидываем: иначе одна картинка крупнее всего
+        // бюджета не показалась бы вообще.
+        while self.order.len() > self.cap || (self.bytes > self.budget && self.order.len() > 1) {
+            if let Some(old) = self.order.pop_front() {
+                if let Some(v) = self.map.remove(&old) {
+                    self.bytes = self.bytes.saturating_sub(v.cache_bytes());
+                }
+            }
+        }
+    }
+}
+
+/// Эмбед в том виде, в каком его умеет показать клиент: картинка и текст.
+/// Discord присылает с ними author, footer, provider, fields и прочее, но
+/// клиенту это не нужно, а в памяти такой JSON стоит в разы дороже двух строк.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Embed {
+    pub(crate) image_url: Option<String>,
+    pub(crate) description: Option<String>,
+}
+
+impl Embed {
+    /// Достать из эмбеда Discord только то, что клиент рисует. Если рисуть
+    /// нечего — `None`, и эмбед не хранится вовсе.
+    pub(crate) fn from_json(e: &Value) -> Option<Self> {
+        let image_url = ["image", "thumbnail", "video"]
+            .iter()
+            .find_map(|f| e[*f]["url"].as_str())
+            .filter(|u| !u.is_empty())
+            .map(|u| u.to_string());
+        let description = e["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if image_url.is_none() && description.is_none() {
+            return None;
+        }
+        Some(Embed { image_url, description })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatMessage {
+    pub(crate) id: String,
+    pub(crate) channel_id: String,
+    pub(crate) author_id: String,
+    pub(crate) author_name: String,
+    pub(crate) author_avatar: Option<String>,
+    pub(crate) nickname: Option<String>,
+    pub(crate) content: String,
+    pub(crate) timestamp: String,
+    pub(crate) attachments: Vec<Attachment>,
+    pub(crate) embeds: Vec<Embed>,
+    pub(crate) is_own: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Attachment {
+    pub(crate) url: String,
+    pub(crate) content_type: Option<String>,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChatChannel {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) guild_id: Option<String>,
+    pub(crate) channel_type: i64,
+    pub(crate) topic: Option<String>,
+    pub(crate) position: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Guild {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) icon: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UserProfile {
+    pub(crate) id: String,
+    pub(crate) username: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredAccount {
+    pub(crate) token: String,
+    pub(crate) username: String,
+}
+
+#[derive(Clone)]
+pub(crate) enum LoadedImage {
+    Static(TextureHandle),
+    Animated {
+        frames: Vec<TextureHandle>,
+        delays: Vec<f32>,
+        started: std::time::Instant,
+    },
+}
+
+impl CacheCost for LoadedImage {
+    fn cache_bytes(&self) -> usize {
+        match self {
+            LoadedImage::Static(t) => t.cache_bytes(),
+            // Анимированная картинка — это все её кадры, а не один.
+            LoadedImage::Animated { frames, .. } => frames.iter().map(|f| f.cache_bytes()).sum(),
+        }
+    }
+}
+
+pub(crate) enum ImagePayload {
+    Static(egui::ColorImage),
+    Animated { frames: Vec<(egui::ColorImage, f32)> },
+}
+
+
+impl LoadedImage {
+    pub(crate) fn size_vec2(&self) -> egui::Vec2 {
+        match self {
+            LoadedImage::Static(t) => t.size_vec2(),
+            LoadedImage::Animated { frames, .. } => frames[0].size_vec2(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> egui::TextureId {
+        self.display_texture().id()
+    }
+
+    pub(crate) fn display_texture(&self) -> TextureHandle {
+        match self {
+            LoadedImage::Static(t) => t.clone(),
+            LoadedImage::Animated { frames, delays, started } => {
+                if frames.len() == 1 || delays.iter().all(|d| *d <= 0.0) {
+                    return frames[0].clone();
+                }
+                let total: f32 = delays.iter().sum();
+                let mut elapsed = started.elapsed().as_secs_f32();
+                if total > 0.0 {
+                    elapsed = elapsed % total;
+                }
+                let mut acc = 0.0f32;
+                for (i, d) in delays.iter().enumerate() {
+                    acc += d;
+                    if elapsed < acc {
+                        return frames[i].clone();
+                    }
+                }
+                frames.last().cloned().unwrap_or_else(|| frames[0].clone())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Theme {
+    pub(crate) bg: Color32,
+    pub(crate) panel_bg: Color32,
+    pub(crate) channel_bg: Color32,
+    pub(crate) text: Color32,
+    pub(crate) text_secondary: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) input_bg: Color32,
+    pub(crate) message_hover: Color32,
+    pub(crate) divider: Color32,
+    pub(crate) self_bg: Color32,
+}
+
+impl Theme {
+    pub(crate) fn dark() -> Self {
+        Self {
+            bg: Color32::from_rgb(49, 51, 56),
+            panel_bg: Color32::from_rgb(42, 44, 48),
+            channel_bg: Color32::from_rgb(30, 31, 34),
+            text: Color32::from_rgb(220, 221, 222),
+            text_secondary: Color32::from_rgb(114, 118, 125),
+            accent: Color32::from_rgb(88, 101, 242),
+            input_bg: Color32::from_rgb(64, 68, 75),
+            message_hover: Color32::from_rgb(50, 52, 57),
+            divider: Color32::from_rgb(66, 68, 72),
+            self_bg: Color32::from_rgb(55, 58, 64),
+        }
+    }
+
+    pub(crate) fn cyberpunk() -> Self {
+        Self {
+            bg: Color32::from_rgb(16, 12, 32),
+            panel_bg: Color32::from_rgb(22, 17, 42),
+            channel_bg: Color32::from_rgb(28, 22, 52),
+            text: Color32::from_rgb(223, 226, 255),
+            text_secondary: Color32::from_rgb(140, 142, 185),
+            accent: Color32::from_rgb(0, 229, 255),
+            input_bg: Color32::from_rgb(34, 28, 62),
+            message_hover: Color32::from_rgb(32, 25, 58),
+            divider: Color32::from_rgb(60, 52, 110),
+            self_bg: Color32::from_rgb(36, 29, 66),
+        }
+    }
+
+    pub(crate) fn light() -> Self {
+        Self {
+            bg: Color32::from_rgb(232, 234, 237),
+            panel_bg: Color32::from_rgb(242, 243, 245),
+            channel_bg: Color32::from_rgb(255, 255, 255),
+            text: Color32::from_rgb(30, 31, 34),
+            text_secondary: Color32::from_rgb(120, 122, 128),
+            accent: Color32::from_rgb(70, 96, 220),
+            input_bg: Color32::from_rgb(228, 230, 234),
+            message_hover: Color32::from_rgb(240, 241, 244),
+            divider: Color32::from_rgb(220, 222, 226),
+            self_bg: Color32::from_rgb(235, 237, 241),
+        }
+    }
+}
+
+/// Фикстуры для замера памяти (`src/memcheck.rs`): у базовой версии структуры
+/// устроены иначе, а код замера должен быть один и тот же.
+#[cfg(test)]
+pub(crate) fn test_guild(id: &str, name: &str) -> Guild {
+    Guild { id: id.into(), name: name.into(), icon: None }
+}
+
+#[cfg(test)]
+pub(crate) fn test_user(id: &str, username: &str) -> UserProfile {
+    UserProfile { id: id.into(), username: username.into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Из эмбеда берём только картинку и текст — остальное клиент не рисует,
+    /// а места занимает много.
+    #[test]
+    fn embed_keeps_only_what_is_drawn() {
+        let raw = json!({
+            "type": "rich",
+            "title": "Заголовок",
+            "description": "  текст  ",
+            "url": "https://example.com",
+            "color": 123,
+            "author": { "name": "Автор" },
+            "footer": { "text": "подвал" },
+            "provider": { "name": "Провайдер" },
+            "fields": [{ "name": "n", "value": "v" }],
+            "thumbnail": { "url": "https://cdn.discordapp.com/thumb.png" },
+        });
+        let e = Embed::from_json(&raw).expect("эмбед с картинкой и текстом должен остаться");
+        assert_eq!(e.image_url.as_deref(), Some("https://cdn.discordapp.com/thumb.png"));
+        assert_eq!(e.description.as_deref(), Some("текст"));
+    }
+
+    /// Картинка приоритетнее превью: если есть и image, и thumbnail, берём image.
+    #[test]
+    fn embed_prefers_image_over_thumbnail() {
+        let raw = json!({
+            "thumbnail": { "url": "https://cdn.discordapp.com/thumb.png" },
+            "image": { "url": "https://cdn.discordapp.com/full.png" },
+        });
+        let e = Embed::from_json(&raw).expect("эмбед с картинкой должен остаться");
+        assert_eq!(e.image_url.as_deref(), Some("https://cdn.discordapp.com/full.png"));
+        assert!(e.description.is_none());
+    }
+
+    /// Эмбед, в котором рисуть нечего, в памяти не хранится вовсе.
+    #[test]
+    fn embed_without_drawable_content_is_dropped() {
+        let raw = json!({
+            "title": "только заголовок",
+            "author": { "name": "Автор" },
+            "description": "   ",
+        });
+        assert!(Embed::from_json(&raw).is_none());
+    }
+
+    /// Урезанный эмбед должен быть заметно дешевле полного JSON-дерева:
+    /// именно на этом держится экономия памяти в шумном канале.
+    #[test]
+    fn compact_embed_is_cheaper_than_raw_json() {
+        let raw = json!({
+            "type": "rich",
+            "description": "описание ".repeat(10),
+            "url": "https://example.com/watch",
+            "color": 0x3498db,
+            "author": { "name": "Автор эмбеда", "url": "https://example.com", "icon_url": "https://cdn.discordapp.com/embed/avatars/1.png" },
+            "footer": { "text": "подвал", "icon_url": "https://cdn.discordapp.com/embed/avatars/2.png" },
+            "image": { "url": "https://cdn.discordapp.com/embed/picture.png", "width": 1600, "height": 1200 },
+            "thumbnail": { "url": "https://cdn.discordapp.com/embed/thumb.png", "width": 300, "height": 300 },
+            "provider": { "name": "Провайдер", "url": "https://example.com" },
+            "fields": [
+                { "name": "поле один", "value": "значение один", "inline": true },
+                { "name": "поле два", "value": "значение два", "inline": false }
+            ],
+            "timestamp": "2026-09-26T12:00:00.000Z"
+        });
+        let compact = Embed::from_json(&raw).expect("эмбед должен остаться");
+        // Что клиент реально держит: две строки плюс два Option<String>.
+        let retained = compact.image_url.as_ref().map_or(0, |s| s.len())
+            + compact.description.as_ref().map_or(0, |s| s.len())
+            + 2 * std::mem::size_of::<Option<String>>();
+        let raw_text = serde_json::to_string(&raw).unwrap();
+        assert!(
+            retained * 3 < raw_text.len(),
+            "урезанный эмбед ({} байт) должен быть заметно дешевле сырого JSON ({} байт)",
+            retained,
+            raw_text.len()
+        );
+        // Дерево serde_json::Value при этом ещё дороже самого текста: каждая
+        // строка и каждый ключ в нём — отдельная аллокация.
+    }
+}
