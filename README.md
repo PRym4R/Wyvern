@@ -46,7 +46,7 @@ PBKDF2). Путь можно переопределить переменной `
 ## Тесты и замеры
 
 ```bash
-cargo test --release                                        # 69 тестов
+cargo test --release                                        # 157 тестов
 cargo test --release -- --ignored --nocapture memcheck       # замер памяти
 ```
 
