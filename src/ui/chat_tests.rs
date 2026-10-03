@@ -614,6 +614,41 @@ mod geometry_tests {
         assert!(content > inner * 3.0, "история должна быть заметно выше экрана");
     }
 
+    /// The height cache must not accumulate messages that scrolled out of the
+    /// window: it once grew to a cap and then wiped everything, re-measuring
+    /// the whole channel. Only the current window should stay cached.
+    #[test]
+    fn height_cache_drops_messages_that_left_the_window() {
+        let mut h = app_with_messages(300);
+        let ctx = egui::Context::default();
+        // Open at the top and remember what was measured there.
+        scroll_to(&mut h.app, 0.0);
+        frames(&mut h.app, &ctx, 2);
+        let top_ids: Vec<String> = h.app.msg_heights.keys().cloned().collect();
+        assert!(!top_ids.is_empty(), "наверху нечего измерять");
+
+        // Jump to the bottom: the top window is far away and must be gone.
+        let (inner, _content, _ask) = scroll_sizes(&h.app);
+        let far = (total_height(&h.app) - inner).max(0.0);
+        scroll_to(&mut h.app, far);
+        frames(&mut h.app, &ctx, 2);
+
+        let kept = top_ids
+            .iter()
+            .filter(|id| h.app.msg_heights.contains_key(*id))
+            .count();
+        assert_eq!(
+            kept, 0,
+            "высоты ушедших из окна сообщений остались в кэше: {kept} из {}",
+            top_ids.len()
+        );
+        assert!(
+            h.app.msg_heights.len() < 100,
+            "кэш высот разросся: {} записей",
+            h.app.msg_heights.len()
+        );
+    }
+
     /// The main virtualization risk is gaps. At several scroll positions,
     /// every visible message must be drawn and thus have a cached height.
     #[test]

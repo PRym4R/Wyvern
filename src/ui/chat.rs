@@ -28,9 +28,6 @@ const IMAGE_GAP: f32 = 6.0;
 /// Average 14pt character width; only for estimation — on-screen heights
 /// are measured for real.
 const CHAR_W: f32 = 7.0;
-/// Height-cache cap. Message ids would linger after messages are trimmed,
-/// so we clear the whole cache.
-const MAX_HEIGHT_CACHE: usize = 4096;
 
 /// Which actions a message's context menu offers. Not every action applies to
 /// every message (Edit/Delete only to our own confirmed messages; Reply needs
@@ -490,14 +487,27 @@ impl App {
                                         if !msg.id.is_empty()
                                             && stored.map(|m| (m.height, m.width)) != Some((h, key))
                                         {
-                                            if self.msg_heights.len() > MAX_HEIGHT_CACHE {
-                                                self.msg_heights.clear();
-                                            }
                                             self.msg_heights.insert(
                                                 msg.id.clone(),
                                                 MsgHeight { height: h, width: key },
                                             );
                                         }
+                                    }
+                                    // Keep only the heights of messages still in
+                                    // the window: ids of trimmed or scrolled-away
+                                    // messages would otherwise pile up until the
+                                    // whole cache is wiped and everything is
+                                    // re-measured.
+                                    let live_count =
+                                        window.iter().filter(|m| !m.id.is_empty()).count();
+                                    if self.msg_heights.len() > live_count {
+                                        let live: std::collections::HashSet<&str> = window
+                                            .iter()
+                                            .filter(|m| !m.id.is_empty())
+                                            .map(|m| m.id.as_str())
+                                            .collect();
+                                        self.msg_heights
+                                            .retain(|id, _| live.contains(id.as_str()));
                                     }
                                     // Pad to the estimated total so the
                                     // scrollbar reflects the whole list.
