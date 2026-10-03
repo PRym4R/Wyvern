@@ -232,7 +232,7 @@ Gemini).
 
 Часть 4 (Б-1…Б-25) — поведение и надёжность, часть 5 (Т-1…Т-23) — цена кадра
 и уборка. Закрыты все; подробности — в истории коммитов, здесь только то,
-что стоит помнить. Тестов стало 164.
+что стоит помнить. Тестов сейчас 175 (174 проходят, 1 — замер памяти).
 
 - **Друзья**: запрос `/users/@me/relationships` вынесен в
   `fetch_relationships` с ретраем на 429 (по `retry-after`, до трёх попыток),
@@ -341,7 +341,7 @@ Gemini).
       4096 записей и копит всё, что хоть раз показали.
 - [x] **Compress comments, switch them to English** (M). Rationale trimmed to
       1–2 lines; user-facing Russian strings and test messages untouched.
-      `src/`: 2315 → 1056 comment lines, 174 tests, 0 warnings.
+      `src/`: 2315 → 1056 comment lines, 175 tests, 0 warnings.
 
 ## Эпики (детали — в ROADMAP)
 
