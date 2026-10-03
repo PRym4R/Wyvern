@@ -981,3 +981,109 @@ mod wheel_probe {
         );
     }
 }
+
+#[cfg(test)]
+mod menu_tests {
+    use eframe::egui;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::messages::ToApp;
+    use crate::models::ChatMessage;
+
+    /// A minimal message; only the fields the menu looks at matter.
+    fn message(id: &str, content: &str, own: bool) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            channel_id: "c0".into(),
+            author_id: "u1".into(),
+            author_name: "user".into(),
+            author_avatar: None,
+            nickname: None,
+            content: content.into(),
+            timestamp: String::new(),
+            attachments: vec![],
+            embeds: vec![],
+            is_own: own,
+        }
+    }
+
+    fn app() -> App {
+        let (_tx, rx) = mpsc::unbounded_channel::<ToApp>();
+        App::new(rx)
+    }
+
+    /// Copying a message puts its text into egui's clipboard output.
+    #[test]
+    fn copy_action_puts_text_on_the_clipboard() {
+        let mut app = app();
+        let msg = message("m1", "привет мир", false);
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            app.run_message_action(ctx, MessageAction::Copy, &msg);
+        });
+        let copied: Vec<String> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, vec!["привет мир".to_string()]);
+    }
+
+    /// A message without text (e.g. image only) has nothing to copy.
+    #[test]
+    fn copy_action_ignores_empty_content() {
+        let mut app = app();
+        let msg = message("m1", "", false);
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            app.run_message_action(ctx, MessageAction::Copy, &msg);
+        });
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .filter(|c| matches!(c, egui::OutputCommand::CopyText(_)))
+            .count();
+        assert_eq!(copied, 0, "пустое сообщение нечего копировать");
+    }
+
+    /// The menu offers everything for a confirmed own message, but hides
+    /// edit/delete for others' messages and everything id-based for an
+    /// unconfirmed send.
+    #[test]
+    fn menu_reflects_which_actions_apply() {
+        let app = app();
+        let own = app.message_menu(&message("m1", "текст", true));
+        assert!(own.reply && own.edit && own.delete && own.copy, "own: {own:?}");
+
+        let other = app.message_menu(&message("m1", "текст", false));
+        assert!(other.reply && other.copy, "other reply/copy: {other:?}");
+        assert!(!other.edit && !other.delete, "other edit/delete: {other:?}");
+
+        let unconfirmed = app.message_menu(&message("", "текст", true));
+        assert!(!unconfirmed.reply && !unconfirmed.edit && !unconfirmed.delete);
+        assert!(unconfirmed.copy, "unconfirmed copy: {unconfirmed:?}");
+
+        let empty = app.message_menu(&message("m1", "", false));
+        assert!(!empty.copy, "empty copy: {empty:?}");
+    }
+
+    /// Choosing "Reply" points the composer at the chosen message.
+    #[test]
+    fn choosing_reply_sets_the_composer_target() {
+        let mut app = app();
+        let msg = message("m1", "исходное сообщение", false);
+        let ctx = egui::Context::default();
+        app.run_message_action(&ctx, MessageAction::Reply, &msg);
+
+        let target = app.reply_to.clone().expect("reply должен быть выбран");
+        assert_eq!(target.message_id, "m1");
+        assert_eq!(target.author_name, "user");
+        assert_eq!(target.preview, "исходное сообщение");
+    }
+}

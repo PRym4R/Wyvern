@@ -41,8 +41,9 @@ pub(crate) enum ToApp {
 #[derive(Debug)]
 pub(crate) enum ToGateway {
     /// Send a message. `local_id` identifies the optimistic echo to remove on
-    /// failure.
-    Send { channel_id: String, content: String, local_id: String },
+    /// failure. `reply_to` is the id of the message being answered, if any;
+    /// it becomes `message_reference` in the REST body.
+    Send { channel_id: String, content: String, local_id: String, reply_to: Option<String> },
     /// History page. `before` is the oldest shown id: `None` for the first
     /// page, otherwise paging upward.
     FetchHistory { channel_id: String, before: Option<String> },

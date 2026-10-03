@@ -51,6 +51,15 @@ fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>, keep_newest: bool) -> usize 
     extra
 }
 
+/// What the composer is replying to. `message_id` goes into
+/// `message_reference`; the rest only feeds the reply bar.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplyTarget {
+    pub(crate) message_id: String,
+    pub(crate) author_name: String,
+    pub(crate) preview: String,
+}
+
 pub(crate) struct App {
     pub(crate) connected: bool,
     pub(crate) username: String,
@@ -62,6 +71,8 @@ pub(crate) struct App {
     pub(crate) selected_channel: Option<usize>,
     pub(crate) messages: HashMap<String, Vec<Arc<ChatMessage>>>,
     pub(crate) input: String,
+    /// Message the composer is replying to; cleared on send, cancel, or channel switch.
+    pub(crate) reply_to: Option<ReplyTarget>,
     pub(crate) token_input: String,
     pub(crate) master_password: String,
     /// Vault is in the old unencrypted format; while set, don't rewrite the file or a typo could silently re-key it.
@@ -178,6 +189,7 @@ impl App {
             selected_channel: None,
             messages: HashMap::new(),
             input: String::new(),
+            reply_to: None,
             token_input: String::new(),
             master_password: String::new(),
             vault_legacy: false,
@@ -509,6 +521,7 @@ impl App {
         self.guilds.clear();
         self.channels.clear();
         self.messages.clear();
+        self.reply_to = None;
         self.friends.clear();
         self.selected_guild = None;
         self.selected_channel = None;
@@ -590,6 +603,8 @@ impl App {
         self.pending_images.clear();
         self.pending_avatars.clear();
         self.msg_heights.clear();
+        // Switching channels drops the reply target along with the old list.
+        self.reply_to = None;
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
     }
     /// Stores a history page: the first page replaces, `prepend` inserts at the front.

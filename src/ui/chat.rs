@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::App;
+use crate::app::{App, ReplyTarget};
 use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 use crate::ui::ERROR_RED;
@@ -32,6 +32,27 @@ const CHAR_W: f32 = 7.0;
 /// so we clear the whole cache.
 const MAX_HEIGHT_CACHE: usize = 4096;
 
+/// Which actions a message's context menu offers. Not every action applies to
+/// every message (Edit/Delete only to our own confirmed messages; Reply needs
+/// an id to reference).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct MessageMenu {
+    pub(crate) reply: bool,
+    pub(crate) edit: bool,
+    pub(crate) delete: bool,
+    pub(crate) copy: bool,
+}
+
+/// A chosen context-menu entry. Copy is wired up now; the others carry the
+/// user's intent to be connected to the gateway protocol later.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MessageAction {
+    Reply,
+    Edit,
+    Delete,
+    Copy,
+}
+
 /// Finds the visible message range. `offsets` is prefix sums, so this is a
 /// binary search rather than a full scan.
 pub(crate) fn visible_window(offsets: &[f32], offset: f32, viewport: f32) -> (usize, usize) {
@@ -54,6 +75,17 @@ fn estimate_lines(chars: usize, text_w: f32) -> f32 {
         return 1.0;
     }
     ((chars as f32 * CHAR_W) / text_w).ceil().max(1.0)
+}
+
+/// One-line preview of a replied message, capped so the composer bar stays
+/// short. Newlines are folded so the bar never grows taller.
+pub(crate) fn reply_preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 120;
+    let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
+    if text.chars().count() > PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview.replace(['\n', '\r'], " ")
 }
 
 /// Chat width rounded to a pixel, used as the height-cache key. Ignoring
@@ -103,6 +135,88 @@ impl App {
     /// Whether this is our own message; own and other bubbles differ.
     pub(crate) fn is_own_msg(&self, msg: &ChatMessage) -> bool {
         msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id)
+    }
+    /// Which context-menu actions apply to `msg`. Reply/Edit/Delete need a
+    /// confirmed id; only our own messages can be edited or deleted.
+    pub(crate) fn message_menu(&self, msg: &ChatMessage) -> MessageMenu {
+        let confirmed = !msg.id.is_empty();
+        let own = self.is_own_msg(msg);
+        MessageMenu {
+            reply: confirmed,
+            edit: own && confirmed,
+            delete: own && confirmed,
+            copy: !self.display_content(msg).trim().is_empty(),
+        }
+    }
+    /// Runs a chosen menu action. Copy is implemented; the rest are the
+    /// connection points for the upcoming reply/edit/delete work.
+    fn run_message_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: MessageAction,
+        msg: &ChatMessage,
+    ) {
+        match action {
+            MessageAction::Copy => {
+                let text = self.display_content(msg);
+                if !text.trim().is_empty() {
+                    ctx.copy_text(text.to_string());
+                }
+            }
+            // Reply hands the target to the composer; sending it is A1's REST path.
+            MessageAction::Reply => {
+                let author_name = self.display_name(msg).to_string();
+                let preview = reply_preview(self.display_content(msg));
+                let preview = if preview.is_empty() {
+                    "сообщение".to_string()
+                } else {
+                    preview
+                };
+                self.reply_to = Some(ReplyTarget {
+                    message_id: msg.id.clone(),
+                    author_name,
+                    preview,
+                });
+            }
+            // Edit/Delete: the menu wiring exists; the gateway commands are
+            // added together with A2/A3.
+            MessageAction::Edit | MessageAction::Delete => {}
+        }
+    }
+    /// Context menu for one message, attached to its frame response.
+    fn message_context_menu(&mut self, response: &egui::Response, msg: &ChatMessage) {
+        let menu = self.message_menu(msg);
+        response.context_menu(|ui| {
+            if ui
+                .add_enabled(menu.reply, egui::Button::new("Ответить"))
+                .clicked()
+            {
+                self.run_message_action(ui.ctx(), MessageAction::Reply, msg);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(menu.edit, egui::Button::new("Изменить"))
+                .clicked()
+            {
+                self.run_message_action(ui.ctx(), MessageAction::Edit, msg);
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(menu.delete, egui::Button::new("Удалить"))
+                .clicked()
+            {
+                self.run_message_action(ui.ctx(), MessageAction::Delete, msg);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(menu.copy, egui::Button::new("Копировать текст"))
+                .clicked()
+            {
+                self.run_message_action(ui.ctx(), MessageAction::Copy, msg);
+                ui.close_menu();
+            }
+        });
     }
     /// Measured height after drawing, otherwise an estimate from text length;
     /// virtualization needs it to decide what to draw.
@@ -492,7 +606,7 @@ impl App {
         if self.is_own_msg(msg) {
             let max_w = (ui.available_width() * 0.75).clamp(160.0, 480.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                egui::Frame::new()
+                let frame = egui::Frame::new()
                     .fill(self.theme.self_bg)
                     .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
                     .corner_radius(8.0)
@@ -513,10 +627,11 @@ impl App {
                         self.draw_attachments(ui, msg);
                     });
                 });
+                self.message_context_menu(&frame.response, msg);
             });
             ui.add_space(6.0);
         } else {
-            egui::Frame::new()
+            let frame = egui::Frame::new()
                 .fill(self.theme.message_hover)
                 .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
                 .corner_radius(8.0)
@@ -569,6 +684,7 @@ impl App {
                     });
                 });
                 });
+                self.message_context_menu(&frame.response, msg);
                 ui.add_space(6.0);
         }
     }

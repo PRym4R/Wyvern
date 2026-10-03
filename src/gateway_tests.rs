@@ -97,6 +97,7 @@ mod http_tests {
             "привет".into(),
             "local:7".into(),
             "c1".into(),
+            None,
         ));
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -112,6 +113,87 @@ mod http_tests {
             seen.iter().any(|e| matches!(e, ToApp::SendFailed { reason, .. } if reason.contains("нет связи"))),
             "пользователь должен узнать об отказе, получено: {seen:?}"
         );
+    }
+
+    /// A reply must carry its target in `message_reference`, not just content.
+    /// Verified against a real socket that records the request body.
+    #[test]
+    fn reply_send_carries_message_reference() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return String::new();
+            };
+            let request = read_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            let _ = stream.flush();
+            request
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gen = Arc::new(Generation::default());
+        let event_tx = EventTx::new(tx, gen.next(), gen.clone());
+        let client = api_client().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(send_message_to(
+            client,
+            "токен".into(),
+            event_tx,
+            format!("http://{}/channels/c1/messages", addr),
+            "ответ".into(),
+            "local:1".into(),
+            "c1".into(),
+            Some("m42".into()),
+        ));
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("\"message_reference\""),
+            "в запросе нет message_reference: {request}"
+        );
+        assert!(
+            request.contains("\"message_id\":\"m42\""),
+            "неверный message_id: {request}"
+        );
+        assert!(
+            request.contains("\"channel_id\":\"c1\""),
+            "неверный channel_id: {request}"
+        );
+    }
+
+    /// Read a full HTTP request (headers plus body) so the JSON payload can be
+    /// checked without racing the client's writes.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut data = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n".as_slice()) {
+                        let header_end = pos + 4;
+                        let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
+                        let len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if data.len() >= header_end + len {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&data).to_string()
     }
 
     /// Send failures are explained in words, not status codes.

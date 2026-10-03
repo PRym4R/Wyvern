@@ -27,9 +27,13 @@ pub(super) async fn send_message(
     channel_id: String,
     content: String,
     local_id: String,
+    reply_to: Option<String>,
 ) {
     let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
-    send_message_to(httpc, tkn, event_tx, url, content, local_id, channel_id).await;
+    send_message_to(
+        httpc, tkn, event_tx, url, content, local_id, channel_id, reply_to,
+    )
+    .await;
 }
 
 /// Map a send failure to user-facing words. Raw codes and response bodies are
@@ -70,11 +74,21 @@ pub(crate) async fn send_message_to(
     content: String,
     local_id: String,
     channel_id: String,
+    reply_to: Option<String>,
 ) {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().to_string())
         .unwrap_or_default();
+    // A reply adds `message_reference`; Discord needs the replied id and the
+    // channel it lives in. Ordinary sends keep the old two-field body.
+    let mut body = json!({ "content": content, "nonce": nonce });
+    if let Some(reference) = reply_to.as_deref() {
+        body["message_reference"] = json!({
+            "message_id": reference,
+            "channel_id": channel_id.as_str(),
+        });
+    }
     let req = httpc
         .post(&url)
         .header("Authorization", &*tkn)
@@ -82,7 +96,7 @@ pub(crate) async fn send_message_to(
         .header("X-Super-Properties", &super_props())
         .header("X-Discord-Locale", "en-US")
         .header("X-Discord-Timezone", "Europe/Moscow")
-        .json(&json!({ "content": content, "nonce": nonce }));
+        .json(&body);
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();

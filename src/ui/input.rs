@@ -51,6 +51,31 @@ impl App {
                 let ir = ui.min_rect();
                 self.push_debug(format!("INPUT_BAR: h={:.0} y={:.0}", ir.height(), ir.min.y));
                 ui.add_space(4.0);
+                // Reply bar: shows what the next message answers and can be cancelled.
+                if let Some(reply) = self.reply_to.clone() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let (bar, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
+                        ui.painter().rect_filled(bar, 1.0, self.theme.accent);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Отмена").clicked() {
+                                self.cancel_reply();
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "Ответ {}: {}",
+                                        reply.author_name, reply.preview
+                                    ))
+                                    .size(12.0)
+                                    .color(self.theme.text_secondary),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
                     ui.label(RichText::new(ch_name).strong().size(13.0).color(self.theme.text_secondary));
@@ -122,6 +147,8 @@ impl App {
 
         if let Some(idx) = self.selected_channel {
             let cid = self.channels[idx].id.clone();
+            // Reply target, if any, travels with this send only.
+            let reply_to = self.reply_to.as_ref().map(|r| r.message_id.clone());
             // Optimistic echo with a fake local id; MESSAGE_CREATE replaces it by id.
             let local_id = format!("{}{}", LOCAL_ID_PREFIX, self.next_local_id);
             self.next_local_id += 1;
@@ -140,7 +167,7 @@ impl App {
                 embeds: Vec::new(),
                 is_own: true,
             }));
-            self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id });
+            self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id, reply_to });
         }
     }
 
@@ -158,6 +185,8 @@ impl App {
         }
         if !text.is_empty() {
             self.handle_input(&text);
+            // The reply target is consumed by this send; the next message starts fresh.
+            self.reply_to = None;
             // Remember what was sent and clear the edit flag to block duplicate sends.
             self.last_submitted = Some(text);
             self.input_dirty = false;
@@ -175,6 +204,11 @@ impl App {
             return;
         }
         self.submit_input();
+    }
+
+    /// Drops the pending reply, returning the composer to its normal state.
+    pub(crate) fn cancel_reply(&mut self) {
+        self.reply_to = None;
     }
 
     /// Debug command from the message field; the first press only asks for confirmation.
@@ -225,7 +259,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, ReplyTarget};
     use crate::models::ChatChannel;
 
     /// Whitespace-only input must not survive submit: the field clears even when nothing is sent.
@@ -456,6 +490,107 @@ mod tests {
     fn has_counter_text(out: &egui::FullOutput) -> bool {
         out.shapes.iter().any(|cs| match &cs.shape {
             egui::Shape::Text(t) => t.galley.text().contains("/2000"),
+            _ => false,
+        })
+    }
+
+    /// Setting a reply and sending must put the target into the outgoing command.
+    #[test]
+    fn reply_message_carries_message_reference_and_clears_state() {
+        let (mut app, _ctx) = narrow_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.to_gw = Some(tx);
+        app.reply_to = Some(ReplyTarget {
+            message_id: "m42".into(),
+            author_name: "Алиса".into(),
+            preview: "исходное".into(),
+        });
+        app.input = "ответ".to_string();
+
+        app.submit_input();
+
+        match rx.try_recv() {
+            Ok(ToGateway::Send {
+                content, reply_to, ..
+            }) => {
+                assert_eq!(content, "ответ");
+                assert_eq!(
+                    reply_to.as_deref(),
+                    Some("m42"),
+                    "reply-сообщение должно ссылаться на исходное"
+                );
+            }
+            other => panic!("ожидалась отправка, получено {other:?}"),
+        }
+        assert!(
+            app.reply_to.is_none(),
+            "после отправки reply должен сброситься"
+        );
+    }
+
+    /// A plain message must not grow a `message_reference`.
+    #[test]
+    fn plain_message_is_sent_without_reply() {
+        let (mut app, _ctx) = narrow_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.to_gw = Some(tx);
+        app.input = "привет".to_string();
+
+        app.submit_input();
+
+        match rx.try_recv() {
+            Ok(ToGateway::Send {
+                content, reply_to, ..
+            }) => {
+                assert_eq!(content, "привет");
+                assert!(
+                    reply_to.is_none(),
+                    "обычная отправка без reply: {reply_to:?}"
+                );
+            }
+            other => panic!("ожидалась отправка, получено {other:?}"),
+        }
+    }
+
+    /// Cancelling a reply returns the composer to its normal state.
+    #[test]
+    fn cancelling_reply_clears_the_state() {
+        let (mut app, _ctx) = narrow_app();
+        app.reply_to = Some(ReplyTarget {
+            message_id: "m42".into(),
+            author_name: "Алиса".into(),
+            preview: "исходное".into(),
+        });
+
+        app.cancel_reply();
+
+        assert!(app.reply_to.is_none(), "отмена должна убрать reply");
+    }
+
+    /// The reply bar names the author, shows the source text and offers cancel.
+    #[test]
+    fn reply_bar_shows_the_replied_message() {
+        let (mut app, ctx) = narrow_app();
+        app.reply_to = Some(ReplyTarget {
+            message_id: "m42".into(),
+            author_name: "Алиса".into(),
+            preview: "исходный текст".into(),
+        });
+
+        let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+
+        assert!(frame_has_text(&out, "Алиса"), "в строке ответа нет автора");
+        assert!(
+            frame_has_text(&out, "исходный текст"),
+            "в строке ответа нет текста"
+        );
+        assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены reply");
+    }
+
+    /// Find a text fragment in the drawn frame.
+    fn frame_has_text(out: &egui::FullOutput, needle: &str) -> bool {
+        out.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Text(t) => t.galley.text().contains(needle),
             _ => false,
         })
     }

@@ -771,14 +771,14 @@ async fn gw_inner(
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
-                    ToGateway::Send { channel_id, content, local_id } => {
+                    ToGateway::Send { channel_id, content, local_id, reply_to } => {
                         // Send in a separate task so the gateway keeps reading
                         // events and commands during the POST.
                         let httpc = http.clone();
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
                         tokio::spawn(async move {
-                            send_message(httpc, tkc, ev, channel_id, content, local_id).await;
+                            send_message(httpc, tkc, ev, channel_id, content, local_id, reply_to).await;
                         });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {
