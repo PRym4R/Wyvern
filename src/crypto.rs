@@ -139,6 +139,41 @@ impl App {
     pub(crate) fn vault_path(&self) -> std::path::PathBuf {
         self.vault_path_override.clone().unwrap_or_else(Self::accounts_path)
     }
+    /// Путь к файлу-замку рядом с хранилищем: `~/.wyvern_accounts.lock`.
+    pub(crate) fn vault_lock_path(&self) -> std::path::PathBuf {
+        self.vault_path().with_extension("lock")
+    }
+    /// Взять замок на хранилище на всю сессию. Текстом ошибки отвечаем, если
+    /// файл уже занят другим экземпляром клиента. Повторный вызов на этом же
+    /// App — не ошибка: замок уже наш.
+    ///
+    /// Почему на всю сессию, а не только на запись: два клиента с одним
+    /// аккаунтом одновременно держат по гейтвею, и кто из них записал
+    /// последним, решает гонка. Замок на время записи такую пару не разводит.
+    pub(crate) fn acquire_vault_lock(&mut self) -> Result<(), String> {
+        if self.vault_lock.is_some() {
+            return Ok(());
+        }
+        let path = self.vault_lock_path();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("Не удалось открыть замок хранилища ({}): {}", path.display(), e))?;
+        match file.try_lock() {
+            Ok(()) => {
+                self.vault_lock = Some(file);
+                Ok(())
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err("Хранилище уже открыто в другом экземпляре клиента".to_string())
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("Не удалось заблокировать хранилище: {}", e))
+            }
+        }
+    }
     /// Показать токен частично: первые и последние четыре символа.
     ///
     /// Режем по символам, а не по байтам. Раньше бралось `&token[..4]` и
@@ -217,6 +252,9 @@ impl App {
         if password.is_empty() {
             return Err("Введите пароль хранилища".to_string());
         }
+        // Замок берём до чтения файла: пока он у нас, второй экземпляр не
+        // откроет то же хранилище и не начнёт писать поверх.
+        self.acquire_vault_lock()?;
         let content = match std::fs::read_to_string(self.vault_path()) {
             Ok(s) => s,
             Err(_) => {
@@ -878,5 +916,47 @@ mod vault_write_tests {
             "временный файл должен быть убран"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ещё один экземпляр клиента, смотрящий в тот же файл хранилища.
+    fn app_at(path: &std::path::Path) -> App {
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.vault_path_override = Some(path.to_path_buf());
+        app
+    }
+
+    /// Второй экземпляр не должен открывать то же хранилище: иначе два гейтвея
+    /// работают с одним аккаунтом и перетирают записи. Замок берётся на всю
+    /// сессию, поэтому после закрытия первого экземпляра он освобождается.
+    #[test]
+    fn second_instance_cannot_open_the_same_vault() {
+        let (mut first, tmp) = vaulted();
+        one_account(&mut first);
+        first.save_accounts("правильный");
+        assert!(
+            first.unlock_vault("правильный").is_ok(),
+            "первый экземпляр должен открыть своё хранилище"
+        );
+
+        let mut second = app_at(&tmp);
+        let err = second
+            .unlock_vault("правильный")
+            .expect_err("второй экземпляр не должен открыть занятое хранилище");
+        assert!(
+            err.contains("другом экземпляре"),
+            "нужен понятный отказ, а не {err:?}"
+        );
+
+        // Первый экземпляр закрылся — замок освобождён, вход снова возможен.
+        drop(first);
+        let mut third = app_at(&tmp);
+        assert!(
+            third.unlock_vault("правильный").is_ok(),
+            "после выхода замок должен освобождаться"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("lock"));
     }
 }

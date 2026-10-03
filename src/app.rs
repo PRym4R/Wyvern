@@ -108,6 +108,10 @@ pub(crate) struct App {
     /// Нужен тестам: они идут параллельно, и общий env-переопределитель
     /// приводил к записи в настоящий файл.
     pub(crate) vault_path_override: Option<std::path::PathBuf>,
+    /// Замок на файл хранилища, взятый на всю сессию. Пока он у нас, другой
+    /// экземпляр клиента не откроет то же хранилище: иначе два гейтвея держали
+    /// бы один аккаунт и перетирали бы записи друг друга.
+    pub(crate) vault_lock: Option<std::fs::File>,
     pub(crate) login_selected: Option<String>,
     pub(crate) remember_account: bool,
     pub(crate) saved_accounts: Vec<StoredAccount>,
@@ -270,6 +274,7 @@ impl App {
             login_password: String::new(),
             login_notice: String::new(),
             vault_path_override: None,
+            vault_lock: None,
             login_selected: None,
             remember_account: true,
             saved_accounts: Vec::new(),
@@ -1467,6 +1472,9 @@ mod layout_tests {
         assert_eq!(app.account_label(&app.saved_accounts[0]), "мой_юзер");
 
         // 2. «Перезапуск клиента»: новый экземпляр, ничего не помнит.
+        // Старый закрываем: замок хранилища держится, пока экземпляр жив, и
+        // без этого «перезапуск» наткнулся бы на собственный замок.
+        drop(app);
         let mut app2 = App::new(mpsc::unbounded_channel().1);
         app2.vault_path_override = Some(tmp.clone());
         assert!(app2.saved_accounts.is_empty(), "после перезапуска список пуст");
@@ -1493,6 +1501,7 @@ mod layout_tests {
         assert!(app2.login_password.is_empty(), "пароль из поля должен очищаться");
 
         // 6. Хранилище на диске не пострадало от входа.
+        drop(app2);
         let mut app3 = App::new(mpsc::unbounded_channel().1);
         app3.vault_path_override = Some(tmp.clone());
         assert!(app3.unlock_vault(pw).is_ok(), "файл должен остаться читаемым");
