@@ -35,6 +35,11 @@ pub(crate) enum ToApp {
     /// Send failed: Discord refused (403, 400, 429) or the request never
     /// arrived. Removes the optimistic echo by `local_id` and shows `reason`.
     SendFailed { channel_id: String, local_id: String, reason: String },
+    /// Edit refused (404, no permission, network). The row keeps its old text;
+    /// `content` lets the composer restore the draft for another try.
+    EditFailed { channel_id: String, message_id: String, content: String, reason: String },
+    /// Delete refused; the row stays and `reason` is shown in chat.
+    DeleteFailed { channel_id: String, reason: String },
     Debug(String),
 }
 
@@ -44,6 +49,12 @@ pub(crate) enum ToGateway {
     /// failure. `reply_to` is the id of the message being answered, if any;
     /// it becomes `message_reference` in the REST body.
     Send { channel_id: String, content: String, local_id: String, reply_to: Option<String> },
+    /// Edit one of our messages. Discord answers with MESSAGE_UPDATE, which is
+    /// what actually replaces the row; a rejection comes back as `EditFailed`.
+    EditMessage { channel_id: String, message_id: String, content: String },
+    /// Delete one of our messages. Discord answers with MESSAGE_DELETE, which
+    /// removes the row; a rejection comes back as `DeleteFailed`.
+    DeleteMessage { channel_id: String, message_id: String },
     /// History page. `before` is the oldest shown id: `None` for the first
     /// page, otherwise paging upward.
     FetchHistory { channel_id: String, before: Option<String> },

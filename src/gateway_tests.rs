@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod http_tests {
     use super::{
-        api_client, client_with_timeout, fetch_relationships, send_failure_reason, send_message_to,
-        EventTx, Generation, API_TIMEOUT,
+        api_client, client_with_timeout, delete_message_to, edit_message_to, fetch_relationships,
+        message_action_reason, message_url, send_failure_reason, send_message_to, EventTx,
+        Generation, API_TIMEOUT,
     };
     use crate::messages::ToApp;
     use std::sync::Arc;
@@ -163,6 +164,113 @@ mod http_tests {
             request.contains("\"channel_id\":\"c1\""),
             "неверный channel_id: {request}"
         );
+    }
+
+    /// Editing PATCHes the message endpoint with the new text.
+    #[test]
+    fn edit_sends_patch_with_the_new_text() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return String::new();
+            };
+            let request = read_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            let _ = stream.flush();
+            request
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gen = Arc::new(Generation::default());
+        let event_tx = EventTx::new(tx, gen.next(), gen.clone());
+        let client = api_client().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(edit_message_to(
+            client,
+            "токен".into(),
+            event_tx,
+            format!("http://{}/channels/c1/messages/m1", addr),
+            "c1".into(),
+            "m1".into(),
+            "новый текст".into(),
+        ));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("PATCH "), "должен быть PATCH: {request}");
+        assert!(
+            request.contains("\"content\":\"новый текст\""),
+            "нет нового текста: {request}"
+        );
+    }
+
+    /// Deleting sends DELETE to the one-message endpoint.
+    #[test]
+    fn delete_sends_delete_for_the_message() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return String::new();
+            };
+            let request = read_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            request
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gen = Arc::new(Generation::default());
+        let event_tx = EventTx::new(tx, gen.next(), gen.clone());
+        let client = api_client().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(delete_message_to(
+            client,
+            "токен".into(),
+            event_tx,
+            format!("http://{}/channels/c1/messages/m1", addr),
+            "c1".into(),
+        ));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("DELETE "), "должен быть DELETE: {request}");
+    }
+
+    /// Edit and delete must target one message, not the channel collection.
+    #[test]
+    fn message_url_points_at_one_message() {
+        assert!(
+            message_url("c1", "m1").ends_with("/channels/c1/messages/m1"),
+            "неверный путь: {}",
+            message_url("c1", "m1")
+        );
+    }
+
+    /// Edit/delete failures are explained in words, not status codes.
+    #[test]
+    fn message_action_reasons_are_readable() {
+        for (status, must_contain) in [
+            (403u16, "прав"),
+            (404, "удалено"),
+            (429, "подождать"),
+            (500, "отклонил"),
+        ] {
+            let reason = message_action_reason(status);
+            assert!(
+                reason.contains(must_contain),
+                "код {status}: ожидалось про {must_contain:?}, а написано {reason:?}"
+            );
+            assert!(
+                !reason.contains(&status.to_string()),
+                "код не должен попадать в текст: {reason:?}"
+            );
+        }
     }
 
     /// Read a full HTTP request (headers plus body) so the JSON payload can be

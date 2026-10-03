@@ -1023,7 +1023,7 @@ mod menu_tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::messages::ToApp;
+    use crate::messages::{ToApp, ToGateway};
     use crate::models::ChatMessage;
 
     /// A minimal message; only the fields the menu looks at matter.
@@ -1096,6 +1096,11 @@ mod menu_tests {
         let own = app.message_menu(&message("m1", "текст", true));
         assert!(own.reply && own.edit && own.delete && own.copy, "own: {own:?}");
 
+        // Edit needs text: an image-only own message has nothing to change.
+        let image_only = app.message_menu(&message("m2", "", true));
+        assert!(!image_only.edit, "нет текста — править нечего: {image_only:?}");
+        assert!(image_only.delete, "удалить картинку можно: {image_only:?}");
+
         let other = app.message_menu(&message("m1", "текст", false));
         assert!(other.reply && other.copy, "other reply/copy: {other:?}");
         assert!(!other.edit && !other.delete, "other edit/delete: {other:?}");
@@ -1129,5 +1134,66 @@ mod menu_tests {
         assert_eq!(target.message_id, "m1");
         assert_eq!(target.author_name, "user");
         assert_eq!(target.preview, "исходное сообщение");
+    }
+
+    /// Choosing "Edit" loads the message into the composer and remembers it.
+    #[test]
+    fn choosing_edit_loads_the_composer() {
+        let mut app = app();
+        let msg = message("m1", "старый текст", true);
+        let ctx = egui::Context::default();
+        // A reply was pending; editing must abandon it.
+        app.reply_to = Some(ReplyTarget {
+            message_id: "m0".into(),
+            author_name: "кто-то".into(),
+            preview: "предыдущий".into(),
+        });
+
+        app.run_message_action(&ctx, MessageAction::Edit, &msg);
+
+        assert_eq!(app.input, "старый текст", "текст сообщения должен попасть в поле");
+        assert!(app.input_dirty, "первый Enter должен сохранять правку");
+        let target = app.edit_target.clone().expect("edit должен быть выбран");
+        assert_eq!(target.message_id, "m1");
+        assert_eq!(target.channel_id, "c0");
+        assert!(app.reply_to.is_none(), "правка должна отменить reply");
+    }
+
+    /// Choosing "Reply" while editing abandons the edit.
+    #[test]
+    fn choosing_reply_abandons_the_edit() {
+        let mut app = app();
+        app.edit_target = Some(EditTarget {
+            channel_id: "c0".into(),
+            message_id: "m9".into(),
+        });
+        let msg = message("m1", "исходное", false);
+        let ctx = egui::Context::default();
+
+        app.run_message_action(&ctx, MessageAction::Reply, &msg);
+
+        assert!(app.edit_target.is_none(), "reply должен отменить правку");
+        assert!(app.reply_to.is_some());
+    }
+
+    /// Choosing "Delete" asks the gateway to remove that message.
+    #[test]
+    fn choosing_delete_sends_a_delete_command() {
+        let (_tx, rx) = mpsc::unbounded_channel::<ToApp>();
+        let mut app = App::new(rx);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.to_gw = Some(tx);
+        let msg = message("m1", "текст", true);
+        let ctx = egui::Context::default();
+
+        app.run_message_action(&ctx, MessageAction::Delete, &msg);
+
+        match rx.try_recv() {
+            Ok(ToGateway::DeleteMessage { channel_id, message_id }) => {
+                assert_eq!(channel_id, "c0");
+                assert_eq!(message_id, "m1");
+            }
+            other => panic!("ожидалось удаление, получено {other:?}"),
+        }
     }
 }

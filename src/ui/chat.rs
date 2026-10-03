@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::{App, ReplyTarget};
+use crate::app::{App, EditTarget, ReplyTarget};
+use crate::messages::ToGateway;
 use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 use crate::ui::ERROR_RED;
@@ -134,14 +135,15 @@ impl App {
         msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id)
     }
     /// Which context-menu actions apply to `msg`. Reply/Edit/Delete need a
-    /// confirmed id; only our own messages can be edited or deleted. A pending
-    /// local echo has a `local:` id, which is not a real Discord id.
+    /// confirmed id; only our own messages can be edited or deleted, and edit
+    /// needs text (there is nothing to change in an image-only message). A
+    /// pending local echo has a `local:` id, which is not a real Discord id.
     pub(crate) fn message_menu(&self, msg: &ChatMessage) -> MessageMenu {
         let confirmed = !msg.id.is_empty() && !msg.is_local_echo();
         let own = self.is_own_msg(msg);
         MessageMenu {
             reply: confirmed,
-            edit: own && confirmed,
+            edit: own && confirmed && !msg.content.trim().is_empty(),
             delete: own && confirmed,
             copy: !self.display_content(msg).trim().is_empty(),
         }
@@ -163,6 +165,8 @@ impl App {
             }
             // Reply hands the target to the composer; sending it is A1's REST path.
             MessageAction::Reply => {
+                // Replying abandons any edit in progress.
+                self.edit_target = None;
                 let author_name = self.display_name(msg).to_string();
                 let preview = reply_preview(self.display_content(msg));
                 let preview = if preview.is_empty() {
@@ -176,10 +180,29 @@ impl App {
                     preview,
                 });
             }
-            // Edit/Delete: the menu wiring exists; the gateway commands are
-            // added together with A2/A3.
-            MessageAction::Edit | MessageAction::Delete => {}
+            // Edit loads the message into the composer; saving there sends an
+            // edit command instead of a new message.
+            MessageAction::Edit => self.start_edit(msg),
+            // Delete is settled by Discord's MESSAGE_DELETE event, not here.
+            MessageAction::Delete => {
+                self.send_cmd(ToGateway::DeleteMessage {
+                    channel_id: msg.channel_id.clone(),
+                    message_id: msg.id.clone(),
+                });
+            }
         }
+    }
+    /// Puts a message into the composer and remembers what is being edited.
+    fn start_edit(&mut self, msg: &ChatMessage) {
+        self.input = msg.content.clone();
+        // The first Enter must save even if this text equals the last send.
+        self.input_dirty = true;
+        self.reply_to = None;
+        self.send_error = None;
+        self.edit_target = Some(EditTarget {
+            channel_id: msg.channel_id.clone(),
+            message_id: msg.id.clone(),
+        });
     }
     /// Context menu for one message, attached to its frame response.
     fn message_context_menu(&mut self, response: &egui::Response, msg: &ChatMessage) {

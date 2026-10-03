@@ -1874,3 +1874,101 @@ fn gateway_backlog_is_drained_in_bounded_batches() {
         "остаток очереди должен разобраться следующим кадром"
     );
 }
+
+/// App with one open channel and a live event channel to push `ToApp` into.
+fn app_with_events() -> (App, mpsc::UnboundedSender<ToApp>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.channels.push(ChatChannel {
+        id: "c1".into(),
+        name: "chan".into(),
+        guild_id: None,
+        channel_type: 1,
+        topic: None,
+        position: 0,
+    });
+    app.selected_channel = Some(0);
+    (app, tx)
+}
+
+/// A failed edit puts the draft back and stays in edit mode so it can be retried.
+#[test]
+fn edit_failed_restores_the_draft() {
+    let ctx = egui::Context::default();
+    let (mut app, tx) = app_with_events();
+
+    tx.send(ToApp::EditFailed {
+        channel_id: "c1".into(),
+        message_id: "m1".into(),
+        content: "несохранённый текст".into(),
+        reason: "нет прав на это сообщение".into(),
+    })
+    .unwrap();
+    app.poll(&ctx);
+
+    assert_eq!(
+        app.input, "несохранённый текст",
+        "черновик правки должен вернуться"
+    );
+    assert!(
+        app.edit_target
+            .as_ref()
+            .is_some_and(|e| e.message_id == "m1"),
+        "правку можно повторить"
+    );
+    assert_eq!(app.send_error.as_deref(), Some("нет прав на это сообщение"));
+}
+
+/// A failed edit must not overwrite a new message the user started typing.
+#[test]
+fn edit_failed_keeps_a_newer_draft() {
+    let ctx = egui::Context::default();
+    let (mut app, tx) = app_with_events();
+    app.input = "новое сообщение".into();
+
+    tx.send(ToApp::EditFailed {
+        channel_id: "c1".into(),
+        message_id: "m1".into(),
+        content: "старый черновик".into(),
+        reason: "нет прав".into(),
+    })
+    .unwrap();
+    app.poll(&ctx);
+
+    assert_eq!(app.input, "новое сообщение", "новую строку не трогаем");
+    assert!(app.edit_target.is_none());
+}
+
+/// A failed delete keeps the row and explains itself in the same channel.
+#[test]
+fn delete_failed_shows_the_reason() {
+    let ctx = egui::Context::default();
+    let (mut app, tx) = app_with_events();
+
+    tx.send(ToApp::DeleteFailed {
+        channel_id: "c1".into(),
+        reason: "нет прав на это сообщение".into(),
+    })
+    .unwrap();
+    app.poll(&ctx);
+
+    assert_eq!(app.send_error.as_deref(), Some("нет прав на это сообщение"));
+}
+
+/// Switching channels abandons the pending edit along with the old list.
+#[test]
+fn switching_channels_drops_the_edit() {
+    let (mut app, _tx) = app_with_events();
+    app.edit_target = Some(EditTarget {
+        channel_id: "c1".into(),
+        message_id: "m1".into(),
+    });
+    app.input = "черновик".into();
+
+    app.open_channel("c2");
+
+    assert!(
+        app.edit_target.is_none(),
+        "смена канала должна убрать правку"
+    );
+}

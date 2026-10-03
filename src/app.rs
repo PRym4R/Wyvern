@@ -60,6 +60,14 @@ pub(crate) struct ReplyTarget {
     pub(crate) preview: String,
 }
 
+/// Message being edited in the composer. The text itself lives in `input`;
+/// only the id and channel go to the gateway.
+#[derive(Clone, Debug)]
+pub(crate) struct EditTarget {
+    pub(crate) channel_id: String,
+    pub(crate) message_id: String,
+}
+
 pub(crate) struct App {
     pub(crate) connected: bool,
     pub(crate) username: String,
@@ -73,6 +81,8 @@ pub(crate) struct App {
     pub(crate) input: String,
     /// Message the composer is replying to; cleared on send, cancel, or channel switch.
     pub(crate) reply_to: Option<ReplyTarget>,
+    /// Message the composer is editing; cleared on save, cancel, or channel switch.
+    pub(crate) edit_target: Option<EditTarget>,
     pub(crate) token_input: String,
     pub(crate) master_password: String,
     /// Vault is in the old unencrypted format; while set, don't rewrite the file or a typo could silently re-key it.
@@ -190,6 +200,7 @@ impl App {
             messages: HashMap::new(),
             input: String::new(),
             reply_to: None,
+            edit_target: None,
             token_input: String::new(),
             master_password: String::new(),
             vault_legacy: false,
@@ -452,6 +463,37 @@ impl App {
                     let short: String = local_id.chars().take(14).collect();
                     self.push_debug(format!("Send failed for {}", short));
                 }
+                ToApp::EditFailed {
+                    channel_id,
+                    message_id,
+                    content,
+                    reason,
+                } => {
+                    // A failed edit keeps the row as it was. Put the draft back
+                    // into the composer, but only if the user hasn't already
+                    // started writing something else.
+                    if self.current_channel_id() == Some(channel_id.as_str()) {
+                        let same = self
+                            .edit_target
+                            .as_ref()
+                            .is_some_and(|e| e.message_id == message_id);
+                        if self.input.trim().is_empty() && (self.edit_target.is_none() || same) {
+                            self.input = content;
+                            self.input_dirty = true;
+                            self.edit_target = Some(EditTarget {
+                                channel_id,
+                                message_id,
+                            });
+                        }
+                        self.send_error = Some(reason);
+                    }
+                }
+                ToApp::DeleteFailed { channel_id, reason } => {
+                    // The row stays; show the reason only where it happened.
+                    if self.current_channel_id() == Some(channel_id.as_str()) {
+                        self.send_error = Some(reason);
+                    }
+                }
                 ToApp::AuthFailed { reason } => {
                     // Token rejected: return to the login screen, keeping the token in the field so it can be fixed.
                     self.connected = false;
@@ -522,6 +564,7 @@ impl App {
         self.channels.clear();
         self.messages.clear();
         self.reply_to = None;
+        self.edit_target = None;
         self.friends.clear();
         self.selected_guild = None;
         self.selected_channel = None;
@@ -605,6 +648,7 @@ impl App {
         self.msg_heights.clear();
         // Switching channels drops the reply target along with the old list.
         self.reply_to = None;
+        self.edit_target = None;
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
     }
     /// Stores a history page: the first page replaces, `prepend` inserts at the front.

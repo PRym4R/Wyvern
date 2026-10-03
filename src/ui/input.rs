@@ -76,6 +76,29 @@ impl App {
                         });
                     });
                 }
+                // Edit bar: the composer is saving an edit, not sending a new
+                // message. It and the reply bar are mutually exclusive.
+                if self.edit_target.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let (bar, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
+                        ui.painter().rect_filled(bar, 1.0, self.theme.accent);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Отмена").clicked() {
+                                self.cancel_edit();
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new("Редактирование сообщения")
+                                        .size(12.0)
+                                        .color(self.theme.text_secondary),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
                     ui.label(RichText::new(ch_name).strong().size(13.0).color(self.theme.text_secondary));
@@ -183,6 +206,24 @@ impl App {
             ));
             return;
         }
+        // Editing saves to the existing message instead of sending a new one.
+        if let Some(edit) = self.edit_target.clone() {
+            if text.is_empty() {
+                // Nothing to save; keep the draft and stay in edit mode.
+                return;
+            }
+            self.edit_target = None;
+            self.send_error = None;
+            self.send_cmd(ToGateway::EditMessage {
+                channel_id: edit.channel_id,
+                message_id: edit.message_id,
+                content: text.clone(),
+            });
+            self.last_submitted = Some(text);
+            self.input_dirty = false;
+            self.input.clear();
+            return;
+        }
         if !text.is_empty() {
             self.handle_input(&text);
             // The reply target is consumed by this send; the next message starts fresh.
@@ -209,6 +250,13 @@ impl App {
     /// Drops the pending reply, returning the composer to its normal state.
     pub(crate) fn cancel_reply(&mut self) {
         self.reply_to = None;
+    }
+
+    /// Drops the pending edit and clears the message text it had loaded.
+    pub(crate) fn cancel_edit(&mut self) {
+        self.edit_target = None;
+        self.input.clear();
+        self.input_dirty = false;
     }
 
     /// Debug command from the message field; the first press only asks for confirmation.
@@ -259,7 +307,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ReplyTarget};
+    use crate::app::{App, EditTarget, ReplyTarget};
     use crate::models::ChatChannel;
 
     /// Whitespace-only input must not survive submit: the field clears even when nothing is sent.
@@ -585,6 +633,98 @@ mod tests {
             "в строке ответа нет текста"
         );
         assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены reply");
+    }
+
+    /// Saving an edit sends an edit command instead of a new message.
+    #[test]
+    fn edit_saves_with_edit_command_and_clears_state() {
+        let (mut app, _ctx) = narrow_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.to_gw = Some(tx);
+        app.edit_target = Some(EditTarget {
+            channel_id: "c1".into(),
+            message_id: "m42".into(),
+        });
+        app.input = "  новый текст  ".to_string();
+
+        app.submit_input();
+
+        match rx.try_recv() {
+            Ok(ToGateway::EditMessage {
+                channel_id,
+                message_id,
+                content,
+            }) => {
+                assert_eq!(channel_id, "c1");
+                assert_eq!(message_id, "m42");
+                assert_eq!(content, "новый текст");
+            }
+            other => panic!("ожидалась правка, получено {other:?}"),
+        }
+        assert!(
+            app.edit_target.is_none(),
+            "после сохранения цель правки сбрасывается"
+        );
+        assert_eq!(app.input, "", "поле должно очиститься");
+        assert!(
+            app.messages.get("c1").is_none_or(|v| v.is_empty()),
+            "правка не должна добавлять новое сообщение"
+        );
+    }
+
+    /// Cancelling an edit drops both the target and the text it had loaded.
+    #[test]
+    fn cancelling_edit_clears_state_and_field() {
+        let (mut app, _ctx) = narrow_app();
+        app.edit_target = Some(EditTarget {
+            channel_id: "c1".into(),
+            message_id: "m42".into(),
+        });
+        app.input = "черновик правки".to_string();
+
+        app.cancel_edit();
+
+        assert!(app.edit_target.is_none(), "отмена должна убрать правку");
+        assert!(app.input.is_empty(), "отмена должна очистить поле");
+    }
+
+    /// An empty edit is a no-op: nothing is sent and edit mode stays on.
+    #[test]
+    fn empty_edit_is_not_submitted() {
+        let (mut app, _ctx) = narrow_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.to_gw = Some(tx);
+        app.edit_target = Some(EditTarget {
+            channel_id: "c1".into(),
+            message_id: "m42".into(),
+        });
+        app.input = "   ".to_string();
+
+        app.submit_input();
+
+        assert!(rx.try_recv().is_err(), "пустую правку слать нечего");
+        assert!(
+            app.edit_target.is_some(),
+            "поле пустое — правка должна остаться"
+        );
+    }
+
+    /// The edit bar marks the composer as saving an edit and offers cancel.
+    #[test]
+    fn edit_bar_shows_editing_state() {
+        let (mut app, ctx) = narrow_app();
+        app.edit_target = Some(EditTarget {
+            channel_id: "c1".into(),
+            message_id: "m42".into(),
+        });
+
+        let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+
+        assert!(
+            frame_has_text(&out, "Редактирование сообщения"),
+            "нет пометки правки"
+        );
+        assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены правки");
     }
 
     /// Find a text fragment in the drawn frame.

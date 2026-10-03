@@ -18,7 +18,10 @@ mod parse;
 mod rest;
 
 use self::parse::parse_message_value;
-use self::rest::{api_client, fetch_history_page, fetch_relationships, open_dm, send_message};
+use self::rest::{
+    api_client, delete_message, edit_message, fetch_history_page, fetch_relationships, open_dm,
+    send_message,
+};
 
 // Re-exported so the `crate::gateway::...` paths used by the test modules keep
 // resolving without changes.
@@ -26,8 +29,9 @@ use self::rest::{api_client, fetch_history_page, fetch_relationships, open_dm, s
 pub(crate) use self::parse::{parse_history_page, parse_history_page_lenient};
 #[cfg(test)]
 pub(crate) use self::rest::{
-    client_with_timeout, history_url, more_history_available, next_before_id, send_failure_reason,
-    send_message_to, API_TIMEOUT, HISTORY_PAGE,
+    client_with_timeout, delete_message_to, edit_message_to, history_url, message_action_reason,
+    message_url, more_history_available, next_before_id, send_failure_reason, send_message_to,
+    API_TIMEOUT, HISTORY_PAGE,
 };
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -779,6 +783,23 @@ async fn gw_inner(
                         let ev = event_tx.clone();
                         tokio::spawn(async move {
                             send_message(httpc, tkc, ev, channel_id, content, local_id, reply_to).await;
+                        });
+                    }
+                    ToGateway::EditMessage { channel_id, message_id, content } => {
+                        // Same as sending: the PATCH must not stall the loop.
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            edit_message(httpc, tkc, ev, channel_id, message_id, content).await;
+                        });
+                    }
+                    ToGateway::DeleteMessage { channel_id, message_id } => {
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            delete_message(httpc, tkc, ev, channel_id, message_id).await;
                         });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {

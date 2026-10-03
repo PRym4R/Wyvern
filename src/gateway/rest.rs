@@ -125,6 +125,138 @@ pub(crate) async fn send_message_to(
     }
 }
 
+/// URL of one message, used by edit and delete.
+pub(crate) fn message_url(channel_id: &str, message_id: &str) -> String {
+    format!(
+        "{}/channels/{}/messages/{}",
+        API_BASE, channel_id, message_id
+    )
+}
+
+/// Why an edit or delete was refused, in words; raw statuses never reach the
+/// user.
+pub(crate) fn message_action_reason(status: u16) -> &'static str {
+    match status {
+        403 => "нет прав на это сообщение",
+        404 => "сообщение уже удалено",
+        429 => "Discord просит подождать (лимит запросов)",
+        _ => "Discord отклонил запрос",
+    }
+}
+
+/// Edit a message's text. The new text is applied only by the MESSAGE_UPDATE
+/// event, so a rejected edit leaves the row untouched.
+pub(super) async fn edit_message(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    message_id: String,
+    content: String,
+) {
+    let url = message_url(&channel_id, &message_id);
+    edit_message_to(httpc, tkn, event_tx, url, channel_id, message_id, content).await;
+}
+
+/// Edit against a ready URL; the URL is a parameter so tests can use a local
+/// socket.
+pub(crate) async fn edit_message_to(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    url: String,
+    channel_id: String,
+    message_id: String,
+    content: String,
+) {
+    let req = httpc
+        .patch(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+        .json(&json!({ "content": content }));
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                let _ = event_tx.send(ToApp::Debug("Message edited".into()));
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                let _ = event_tx.send(ToApp::Debug(format!("Edit failed {}: {}", status, body)));
+                let _ = event_tx.send(ToApp::EditFailed {
+                    channel_id,
+                    message_id,
+                    content,
+                    reason: message_action_reason(status.as_u16()).to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Edit error: {}", e)));
+            let _ = event_tx.send(ToApp::EditFailed {
+                channel_id,
+                message_id,
+                content,
+                reason: "не удалось изменить: нет связи с Discord".to_string(),
+            });
+        }
+    }
+}
+
+/// Delete a message. The row disappears on MESSAGE_DELETE, not here.
+pub(super) async fn delete_message(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    message_id: String,
+) {
+    let url = message_url(&channel_id, &message_id);
+    delete_message_to(httpc, tkn, event_tx, url, channel_id).await;
+}
+
+/// Delete against a ready URL; the URL is a parameter so tests can use a local
+/// socket.
+pub(crate) async fn delete_message_to(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    url: String,
+    channel_id: String,
+) {
+    let req = httpc
+        .delete(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow");
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                let _ = event_tx.send(ToApp::Debug("Message deleted".into()));
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                let _ = event_tx.send(ToApp::Debug(format!("Delete failed {}: {}", status, body)));
+                let _ = event_tx.send(ToApp::DeleteFailed {
+                    channel_id,
+                    reason: message_action_reason(status.as_u16()).to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Delete error: {}", e)));
+            let _ = event_tx.send(ToApp::DeleteFailed {
+                channel_id,
+                reason: "не удалось удалить: нет связи с Discord".to_string(),
+            });
+        }
+    }
+}
+
 /// Open a DM with a user. Separate task, like `send_message`, so the network
 /// request doesn't stall the gateway loop.
 pub(super) async fn open_dm(
