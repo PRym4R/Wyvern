@@ -89,6 +89,8 @@ pub(crate) async fn run_gateway(
 ) {
     let _ = event_tx.send(ToApp::Debug("Gateway thread started".into()));
     let mut session = SessionState::default();
+    // Сколько попыток подряд уже провалилось: от неё зависит пауза.
+    let mut attempt: u32 = 0;
     loop {
         // Приложение успело переключить аккаунт, пока мы спали между попытками.
         if !event_tx.alive() {
@@ -96,6 +98,7 @@ pub(crate) async fn run_gateway(
             return;
         }
         let use_resume = session.session_id.is_some();
+        let started = std::time::Instant::now();
         match gw_inner(&mut cmd_rx, event_tx.clone(), &token, &mut session, use_resume).await {
             Ok(()) => {
                 let _ = event_tx.send(ToApp::Debug("Gateway disconnected cleanly".into()));
@@ -115,16 +118,30 @@ pub(crate) async fn run_gateway(
                     break;
                 }
                 let _ = event_tx.send(ToApp::Status(format!("Reconnecting: {}", msg)));
-                // Паузу дробим и проверяем поколение: если за эти три секунды
-                // пользователь переключил аккаунт, старый гейтвей обязан
-                // остановиться сразу, а не доспать до конца и снова
-                // подключиться со старым токеном.
-                for _ in 0..30 {
+                // Соединение жило долго — сбой разовый, следующая пауза снова
+                // минимальна. Иначе один вечерний обрыв оставил бы клиент на
+                // 60 секундах до перезапуска.
+                if started.elapsed() >= Duration::from_secs(60) {
+                    attempt = 0;
+                }
+                let delay = reconnect_delay_with_jitter(attempt, rand::random::<f64>());
+                let _ = event_tx.send(ToApp::Debug(format!(
+                    "Reconnect in {:?} (attempt {})",
+                    delay,
+                    attempt + 1
+                )));
+                attempt = attempt.saturating_add(1);
+                // Паузу дробим и проверяем поколение: смена аккаунта должна
+                // останавливать старый гейтвей сразу, а не через все 60 секунд.
+                let mut left = delay;
+                while !left.is_zero() {
                     if !event_tx.alive() {
                         let _ = event_tx.send(ToApp::Debug("Gateway superseded while waiting, stopping".into()));
                         return;
                     }
-                    time::sleep(Duration::from_millis(100)).await;
+                    let step = left.min(Duration::from_millis(100));
+                    time::sleep(step).await;
+                    left -= step;
                 }
             }
         }
@@ -147,6 +164,51 @@ impl std::fmt::Display for GwClosed {
 }
 
 impl std::error::Error for GwClosed {}
+
+/// Сколько heartbeat'ов подряд могут остаться без ACK, прежде чем рвать
+/// соединение. По протоколу Discord достаточно одного: следующий heartbeat
+/// уйдёт уже в мёртвый сокет. Раньше порог был «больше пяти», и на пропавшей
+/// сети клиент молчал до ~3.5 минут.
+const HEARTBEAT_ACK_LIMIT: u32 = 1;
+
+/// Учёт heartbeat'ов: сколько уже отправлено без ответа. ACK сбрасывает счёт.
+#[derive(Default)]
+struct HeartbeatBook {
+    unanswered: u32,
+}
+
+impl HeartbeatBook {
+    /// Отправить очередной heartbeat. Ошибка — предыдущий остался без ACK,
+    /// соединение пора закрывать и переподключаться.
+    fn tick(&mut self) -> Result<(), &'static str> {
+        if self.unanswered >= HEARTBEAT_ACK_LIMIT {
+            return Err("heartbeat остался без ACK");
+        }
+        self.unanswered += 1;
+        Ok(())
+    }
+
+    /// Пришёл ACK — счётчик в ноль.
+    fn ack(&mut self) {
+        self.unanswered = 0;
+    }
+}
+
+/// Базовая пауза перед попыткой номер `attempt` (с нуля): 1, 2, 4, 8, 16, 32,
+/// дальше 60 секунд. Раньше пауза была всегда 3 секунды, и клиент долбил
+/// лежащий Discord без остановки.
+fn reconnect_delay(attempt: u32) -> Duration {
+    let secs = 1u64.checked_shl(attempt.min(6)).unwrap_or(64);
+    Duration::from_secs(secs.min(60))
+}
+
+/// Та же пауза плюс джиттер до четверти базы: без него все клиенты после
+/// сбоя приходят к Discord одновременно. `roll` — от 0.0 до 1.0.
+fn reconnect_delay_with_jitter(attempt: u32, roll: f64) -> Duration {
+    let base = reconnect_delay(attempt);
+    let extra = base.as_secs_f64() * 0.25 * roll.clamp(0.0, 1.0);
+    base + Duration::from_secs_f64(extra)
+}
 
 /// Что означает код закрытия вебсокета.
 ///
@@ -960,20 +1022,21 @@ async fn gw_inner(
     let mut heartbeat = time::interval(Duration::from_millis(interval));
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
-    let mut heartbeat_failures = 0u32;
+    let mut hb = HeartbeatBook::default();
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // Предыдущий heartbeat остался без ответа — Discord просит
+                // закрываться сразу, а не ждать пяти неудач подряд.
+                if let Err(why) = hb.tick() {
+                    let _ = event_tx.send(ToApp::Debug(why.into()));
+                    return Err("heartbeat ACK timeout".into());
+                }
                 let p = json!({ "op": 1, "d": seq });
                 if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
                     let _ = event_tx.send(ToApp::Debug("WebSocket write failed during heartbeat".into()));
                     return Err("heartbeat write failed".into());
-                }
-                heartbeat_failures += 1;
-                if heartbeat_failures > 5 {
-                    let _ = event_tx.send(ToApp::Debug("Too many heartbeats without ACK".into()));
-                    return Err("too many failed heartbeats".into());
                 }
             }
             Some(ws_msg) = ws_rx.recv() => {
@@ -1318,7 +1381,10 @@ async fn gw_inner(
                     }
                     1 => {
                         let _ = event_tx.send(ToApp::Debug("Gateway requested heartbeat".into()));
-                        heartbeat_failures = 0;
+                        // Сервер сам просит heartbeat: шлём сразу, ожидание ACK
+                        // начинается заново.
+                        hb.ack();
+                        let _ = hb.tick();
                         let p = json!({ "op": 1, "d": seq });
                         if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
                             break;
@@ -1340,7 +1406,7 @@ async fn gw_inner(
                         return Err("Reconnect requested".into());
                     }
                     11 => {
-                        heartbeat_failures = 0;
+                        hb.ack();
                     }
                     _ => {}
                 }
@@ -1965,5 +2031,47 @@ mod parse_tests {
         assert!(msgs.is_empty());
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("History parse error"), "{}", warns[0]);
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::{reconnect_delay, reconnect_delay_with_jitter, HeartbeatBook};
+    use std::time::Duration;
+
+    /// Хватает одного heartbeat без ACK, чтобы рвать соединение: раньше порог
+    /// был «больше пяти», и на мёртвом сокете клиент молчал минуты.
+    #[test]
+    fn one_missed_heartbeat_is_enough_to_reconnect() {
+        let mut hb = HeartbeatBook::default();
+        assert!(hb.tick().is_ok(), "первый heartbeat уходит");
+        assert!(hb.tick().is_err(), "без ACK второй уже рвёт соединение");
+        // ACK снимает ожидание.
+        hb.ack();
+        assert!(hb.tick().is_ok());
+        assert!(hb.tick().is_err());
+    }
+
+    /// Пауза между попытками растёт экспоненциально и упирается в потолок:
+    /// раньше она всегда была 3 секунды.
+    #[test]
+    fn reconnect_backoff_grows_and_is_capped() {
+        assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(32));
+        assert_eq!(reconnect_delay(6), Duration::from_secs(60));
+        // Дальше не растёт и не переполняется.
+        assert_eq!(reconnect_delay(50), Duration::from_secs(60));
+    }
+
+    /// Джиттер не больше четверти базы и не ломает формулу на краях.
+    #[test]
+    fn reconnect_jitter_stays_within_a_quarter() {
+        let base = reconnect_delay(3); // 8 с
+        assert_eq!(reconnect_delay_with_jitter(3, 0.0), base);
+        assert_eq!(reconnect_delay_with_jitter(3, 1.0), base + Duration::from_secs(2));
+        assert_eq!(reconnect_delay_with_jitter(3, -5.0), base);
+        assert_eq!(reconnect_delay_with_jitter(3, 5.0), base + Duration::from_secs(2));
     }
 }
