@@ -18,38 +18,31 @@ use crate::util::{client_properties, super_props};
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE: &str = "https://discord.com/api/v10";
 
-/// Счётчик подключений: у каждого запуска гейтвея — своё поколение.
-///
-/// Нужен из-за переключения аккаунта. `Shutdown` кладётся в очередь, а старый
-/// поток может сейчас спать между попытками переподключения или висеть на
-/// сетевом запросе — тогда он успевает ещё раз подключиться и ОПОЗНАТЬСЯ со
-/// старым токеном, и на Discord секунду живут две сессии. События от
-/// устаревшего поколения приложение теперь просто не слушает.
+/// Connection counter: each gateway run gets its own generation. Needed on
+/// account switch: a stale thread can reconnect and IDENTIFY with the old
+/// token, so events from an outdated generation are ignored.
 #[derive(Default)]
 pub(crate) struct Generation(AtomicU64);
 
 impl Generation {
-    /// Поколение нового подключения.
+    /// Generation for a new connection.
     pub(crate) fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
     }
-    /// Живо ли ещё это поколение.
+    /// Whether this generation is still current.
     pub(crate) fn is_current(&self, mine: u64) -> bool {
         self.0.load(Ordering::SeqCst) == mine
     }
 }
 
-/// Отправитель событий, который умеет замолчать, когда приложение ушло на
-/// другой аккаунт.
+/// Event sender that goes silent once the app has switched accounts.
 #[derive(Clone)]
 pub(crate) struct EventTx {
     tx: mpsc::UnboundedSender<ToApp>,
-    /// Поколение, которому принадлежит этот гейтвей.
+    /// Generation this gateway belongs to.
     mine: u64,
     current: Arc<Generation>,
-    /// Окно приложения: событие приходит на UI-поток, а egui перерисовывает
-    /// кадр только по требованию. Без этого пробуждения новое сообщение
-    /// ждало бы случайного кадра — а кадров в покое теперь нет вовсе (Т-7).
+    /// App window: egui only repaints on demand, so a new event must wake it.
     wake: Option<egui::Context>,
 }
 
@@ -57,26 +50,24 @@ impl EventTx {
     pub(crate) fn new(tx: mpsc::UnboundedSender<ToApp>, mine: u64, current: Arc<Generation>) -> Self {
         Self { tx, mine, current, wake: None }
     }
-    /// Привязать окно, которое нужно будить на каждое событие.
+    /// Attach the window to wake on every event.
     pub(crate) fn with_wake(mut self, ctx: egui::Context) -> Self {
         self.wake = Some(ctx);
         self
     }
-    /// Событие уходит в приложение, только если гейтвей ещё тот, за кем
-    /// приложение следит. Иначе события устаревшего потока перетирали бы
-    /// состояние нового: имя пользователя А выскакивало бы сразу после
-    /// переключения на Б.
+    /// Event reaches the app only if this gateway is still current; stale
+    /// events would otherwise clobber the new account's state.
     pub(crate) fn send(&self, ev: ToApp) {
         if !self.current.is_current(self.mine) {
             return;
         }
         let _ = self.tx.send(ev);
-        // Будим окно: событие из другого потока само кадра не вызовет.
+        // Wake the window: another thread's event won't trigger a frame itself.
         if let Some(ctx) = &self.wake {
             ctx.request_repaint();
         }
     }
-    /// Этому гейтвею ещё можно работать.
+    /// Whether this gateway may still work.
     pub(crate) fn alive(&self) -> bool {
         self.current.is_current(self.mine)
     }
@@ -89,10 +80,10 @@ pub(crate) async fn run_gateway(
 ) {
     let _ = event_tx.send(ToApp::Debug("Gateway thread started".into()));
     let mut session = SessionState::default();
-    // Сколько попыток подряд уже провалилось: от неё зависит пауза.
+    // Consecutive failed attempts; drives the backoff.
     let mut attempt: u32 = 0;
     loop {
-        // Приложение успело переключить аккаунт, пока мы спали между попытками.
+        // The app switched accounts while we slept between attempts.
         if !event_tx.alive() {
             let _ = event_tx.send(ToApp::Debug("Gateway superseded, stopping".into()));
             return;
@@ -110,17 +101,14 @@ pub(crate) async fn run_gateway(
                 let msg = e.to_string();
                 let _ = event_tx.send(ToApp::Debug(format!("Gateway error: {}", msg)));
                 if fatal {
-                    // Discord отказал в самом токене. Следующая попытка даст
-                    // тот же отказ: раньше клиент так и долбился в Discord
-                    // каждые 3 секунды сутками, не говоря ни слова почему.
-                    // Вместо этого возвращаемся на экран входа с текстом.
+                    // Discord rejected the token itself; retrying won't help.
+                    // Return to the login screen with the reason.
                     let _ = event_tx.send(ToApp::AuthFailed { reason: msg });
                     break;
                 }
                 let _ = event_tx.send(ToApp::Status(format!("Reconnecting: {}", msg)));
-                // Соединение жило долго — сбой разовый, следующая пауза снова
-                // минимальна. Иначе один вечерний обрыв оставил бы клиент на
-                // 60 секундах до перезапуска.
+                // The connection lived long, so treat the failure as isolated
+                // and reset the backoff.
                 if started.elapsed() >= Duration::from_secs(60) {
                     attempt = 0;
                 }
@@ -131,8 +119,8 @@ pub(crate) async fn run_gateway(
                     attempt + 1
                 )));
                 attempt = attempt.saturating_add(1);
-                // Паузу дробим и проверяем поколение: смена аккаунта должна
-                // останавливать старый гейтвей сразу, а не через все 60 секунд.
+                // Sleep in small steps and check the generation so an account
+                // switch stops the old gateway immediately.
                 let mut left = delay;
                 while !left.is_zero() {
                     if !event_tx.alive() {
@@ -148,9 +136,8 @@ pub(crate) async fn run_gateway(
     }
 }
 
-/// Обрыв гейтвея, который повторять бессмысленно: Discord отклонил сам
-/// токен или набор подписок. Отдельный тип нужен, чтобы отличить его от
-/// обычного обрыва, на который надо просто зайти снова.
+/// Gateway close that is pointless to retry: Discord rejected the token or
+/// intents. Distinguishes it from a normal drop that should reconnect.
 #[derive(Debug)]
 struct GwClosed {
     message: String,
@@ -165,21 +152,19 @@ impl std::fmt::Display for GwClosed {
 
 impl std::error::Error for GwClosed {}
 
-/// Сколько heartbeat'ов подряд могут остаться без ACK, прежде чем рвать
-/// соединение. По протоколу Discord достаточно одного: следующий heartbeat
-/// уйдёт уже в мёртвый сокет. Раньше порог был «больше пяти», и на пропавшей
-/// сети клиент молчал до ~3.5 минут.
+/// Unanswered heartbeats allowed before closing the connection. One is
+/// enough: the next heartbeat would go to a dead socket.
 const HEARTBEAT_ACK_LIMIT: u32 = 1;
 
-/// Учёт heartbeat'ов: сколько уже отправлено без ответа. ACK сбрасывает счёт.
+/// Heartbeat accounting: sent count without ACK; ACK resets it.
 #[derive(Default)]
 struct HeartbeatBook {
     unanswered: u32,
 }
 
 impl HeartbeatBook {
-    /// Отправить очередной heartbeat. Ошибка — предыдущий остался без ACK,
-    /// соединение пора закрывать и переподключаться.
+    /// Send the next heartbeat. `Err` means the previous one went unanswered,
+    /// so the connection should be closed.
     fn tick(&mut self) -> Result<(), &'static str> {
         if self.unanswered >= HEARTBEAT_ACK_LIMIT {
             return Err("heartbeat остался без ACK");
@@ -188,35 +173,28 @@ impl HeartbeatBook {
         Ok(())
     }
 
-    /// Пришёл ACK — счётчик в ноль.
+    /// ACK received — reset the counter.
     fn ack(&mut self) {
         self.unanswered = 0;
     }
 }
 
-/// Базовая пауза перед попыткой номер `attempt` (с нуля): 1, 2, 4, 8, 16, 32,
-/// дальше 60 секунд. Раньше пауза была всегда 3 секунды, и клиент долбил
-/// лежащий Discord без остановки.
+/// Base backoff before attempt `attempt` (zero-based): 1, 2, 4, … capped at
+/// 60 seconds.
 fn reconnect_delay(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt.min(6)).unwrap_or(64);
     Duration::from_secs(secs.min(60))
 }
 
-/// Та же пауза плюс джиттер до четверти базы: без него все клиенты после
-/// сбоя приходят к Discord одновременно. `roll` — от 0.0 до 1.0.
+/// Backoff plus jitter up to a quarter of the base so clients don't
+/// reconnect in lockstep. `roll` is 0.0–1.0.
 fn reconnect_delay_with_jitter(attempt: u32, roll: f64) -> Duration {
     let base = reconnect_delay(attempt);
     let extra = base.as_secs_f64() * 0.25 * roll.clamp(0.0, 1.0);
     base + Duration::from_secs_f64(extra)
 }
 
-/// Что означает код закрытия вебсокета.
-///
-/// Discord присылает код, который прямо говорит, фатально это или нет.
-/// Раньше код уходил в отладочный вывод и терялся: любой обрыв выглядел как
-/// «websocket closed», и клиент по одному и тому же отказу по кругу
-/// переподключался каждые 3 секунды — сутками, и по этому же поводу ещё и
-/// ловил rate limit.
+/// Meaning of a WebSocket close code: `Some` means fatal, do not retry.
 fn close_fatal_reason(code: u16) -> Option<&'static str> {
     match code {
         4004 => Some("токен отклонён Discord: он недействителен"),
@@ -227,28 +205,27 @@ fn close_fatal_reason(code: u16) -> Option<&'static str> {
     }
 }
 
-/// Достать код закрытия из служебного сообщения задачи чтения.
+/// Extract the close code from the read task's marker message.
 fn close_code_of(raw: &str) -> Option<u16> {
     raw.strip_prefix(CLOSE_MARK)?.parse().ok()
 }
 
-/// Служебные метки от задачи чтения вебсокета. Читаем мы в отдельной задаче:
-/// закрытие и конец потока видит она, а цикл гейтвея — нет, и без меток тот
-/// узнавал бы об этом только по неудачным heartbeat'ам.
+/// Markers from the WebSocket read task: it sees close and end-of-stream,
+/// which the gateway loop otherwise only learns about via failed heartbeats.
 const CLOSE_MARK: &str = "__CLOSE__";
 const WS_ERROR_MARK: &str = "__WS_ERROR__";
-/// Сервер закрыл соединение молча, без close-фрейма.
+/// Server closed the connection silently, without a close frame.
 const EOF_MARK: &str = "__EOF__";
 
-/// Что прислала задача чтения: событие Discord или одна из служебных меток.
+/// What the read task delivered: a Discord event or a marker.
 enum RawFrame {
-    /// Событие Discord — разбираем как JSON.
+    /// Discord event — parsed as JSON.
     Event,
-    /// Закрытие с кодом (0 — код не прислали).
+    /// Closed with a code (0 = none provided).
     Closed(u16),
-    /// Поток кончился без close-фрейма: обычный обрыв, заходим заново.
+    /// Stream ended without a close frame: ordinary drop, reconnect.
     Eof,
-    /// Ошибка чтения.
+    /// Read error.
     WsError(String),
 }
 
@@ -269,44 +246,34 @@ fn classify_raw(raw: &str) -> RawFrame {
 struct SessionState {
     session_id: Option<String>,
     seq: Option<i64>,
-    /// Пары «канал, страница», для которых запрос истории уже в полёте.
-    /// Живёт вместе с сессией, а не внутри одного подключения: `run_gateway`
-    /// передаёт один и тот же `SessionState` в каждый новый `gw_inner`, а
-    /// задача, запущенная на прошлом соединении, держит тот же `Arc`. Раньше
-    /// множество создавалось заново на каждой попытке, и после реконнекта
-    /// защита от дублей пропадала (Т-21).
+    /// "Channel, page" pairs with a history request in flight. Lives with the
+    /// session, not one connection, so duplicate protection survives a reconnect.
     history_inflight: HistoryInflight,
 }
 
-/// Множество запросов истории в полёте. Ключ — канал и страница (`before`).
+/// Set of in-flight history requests, keyed by channel and page (`before`).
 type HistoryInflight =
     std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, Option<String>)>>>;
 
-/// Занять пару (канал, страница) под запрос истории. `false` — такой запрос
-/// уже идёт: повторный клик по каналу не должен слать дубль.
+/// Claim a (channel, page) pair for a history request. `false` means one is
+/// already in flight, so don't send a duplicate.
 async fn claim_history(inflight: &HistoryInflight, key: (String, Option<String>)) -> bool {
     inflight.lock().await.insert(key)
 }
 
-/// Отпустить пару после завершения запроса.
+/// Release the pair once the request finishes.
 async fn release_history(inflight: &HistoryInflight, key: &(String, Option<String>)) {
     inflight.lock().await.remove(key);
 }
 
-/// Сколько сообщений тянуть за один раз. Discord отдаёт до 100, но начинать
-/// надо с меньшего: пока грузится три страницы, пользователь смотрит в пустой
-/// канал, а потом получает столько текста, что всё равно не прочитает. Как в
-/// Discord — первые 50 сообщений сразу, дальше по мере прокрутки вверх.
+/// Messages per history page. Discord allows up to 100, but loading three
+/// pages at once shows an empty channel; 50, then more on scroll.
 pub(crate) const HISTORY_PAGE: usize = 50;
 
-/// Отправить сообщение в канал.
+/// Send a message to a channel.
 ///
-/// Отдельная задача, а не тело цикла гейтвея: пока идёт POST, цикл должен
-/// крутиться — принимать события, heartbeat'ы и следующие команды. Раньше
-/// отправка стояла прямо в цикле, и на всё время запроса клиент не получал
-/// ни новых сообщений, ни кликов по каналам. Таймаут у клиента обязателен
-/// (он задаётся при сборке клиента в `gw_inner`): без него зависший POST
-/// останавливал гейтвей навсегда.
+/// Runs as a separate task so the gateway loop keeps processing events and
+/// commands during the POST. The client timeout is mandatory.
 async fn send_message(
     httpc: reqwest::Client,
     tkn: String,
@@ -319,33 +286,21 @@ async fn send_message(
     send_message_to(httpc, tkn, event_tx, url, content, local_id, channel_id).await;
 }
 
-/// Почему Discord отказал в отправке — словами для пользователя.
-///
-/// Коды и тело ответа показывать нельзя: там HTML-страница на сотни строк, и
-/// она либо не влезает в строку статуса, либо молча обрезается. Пользователю
-/// нужно знать главное — писать сюда нельзя или можно повторить.
+/// Map a send failure to user-facing words. Raw codes and response bodies are
+/// unusable, so only the actionable meaning is shown.
 fn send_failure_reason(status: u16) -> &'static str {
     match status {
         403 => "в этот канал писать нельзя",
         404 => "канал не найден — возможно, прав на него нет",
         429 => "слишком много сообщений подряд, Discord просит подождать",
-        // 413 — текст не влез, 400 — например, больше 2000 символов.
+        // 413 = too large, 400 = e.g. over 2000 characters.
         400 | 413 => "Discord отклонил текст (скорее всего, длиннее 2000 символов)",
         _ => "Discord отклонил сообщение",
     }
 }
 
-/// Клиент для запросов к Discord API.
-///
-/// Таймаут здесь обязателен, а не украшение: `Client::new()` ждёт бесконечно,
-/// и один зависший POST (сеть умерла на полпути, сервер не отвечает) держал
-/// гейтвей в состоянии «подключён» и не давал переподключиться. Раньше это
-/// случалось и без всяких зависаний — пока запрос шёл, цикл гейтвея не
-/// крутился вовсе.
-/// Сколько ждём ответа Discord API. Обрываться надо и с зависшей сетью:
-/// пока запрос не вернулся, гейтвей не может ни переподключиться, ни принять
-/// следующую команду. Проверяется тестом `stalled_post_gives_up_instead_of_
-/// hanging` на настоящем сокете, который не отвечает.
+/// Timeout for Discord API requests. Without it a stalled request leaves the
+/// gateway unable to reconnect or accept commands.
 const API_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn api_client() -> Result<reqwest::Client, String> {
@@ -359,10 +314,8 @@ fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("не собрать HTTP-клиент: {}", e))
 }
 
-/// Отправить сообщение по готовому адресу. URL вынесен отдельным аргументом
-/// ради теста: зависший ответ должен обрываться по таймауту, и проверить это
-/// можно только на настоящем сокете, который не отвечает — а подставить
-/// localhost вместо discord.com иначе нечем.
+/// Send a message to a ready URL. The URL is a parameter so tests can point
+/// at a local socket.
 async fn send_message_to(
     httpc: reqwest::Client,
     tkn: String,
@@ -390,10 +343,8 @@ async fn send_message_to(
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
                 let _ = event_tx.send(ToApp::Debug(format!("Send failed {}: {}", status, body)));
-                // Неудачу показываем пользователю и убираем эхо из чата. Раньше
-                // об этом знал только отладочный лог: сообщение оставалось в
-                // списке навсегда, выглядело как отправленное, а текст из поля
-                // ввода уже очистился — вернуть его было нечем.
+                // Show the failure and drop the echo: otherwise it looks sent
+                // forever.
                 let _ = event_tx.send(ToApp::SendFailed {
                     channel_id,
                     local_id,
@@ -414,8 +365,8 @@ async fn send_message_to(
     }
 }
 
-/// Открыть личный чат с пользователем. Отдельная задача по той же причине,
-/// что и `send_message`: сетевой запрос не должен держать цикл гейтвея.
+/// Open a DM with a user. Separate task, like `send_message`, so the network
+/// request doesn't stall the gateway loop.
 async fn open_dm(
     httpc: reqwest::Client,
     tkn: String,
@@ -460,15 +411,8 @@ async fn open_dm(
     }
 }
 
-/// Забрать список друзей.
-///
-/// Запрос уходит одновременно с пачкой запросов каналов гильдий, и Discord
-/// отвечает 429 (превышен общий лимит). У каналов повтор был, а у друзей —
-/// нет: каналы доезжали, а вкладка «Friends» оставалась с нулём. Повторяем
-/// по `retry-after`, как в `fetch_one`.
-///
-/// URL — параметр, а не константа: так запрос проверяется на локальном
-/// сервере, который сначала отдаёт 429, а потом список.
+/// Fetch the friends list, retrying on 429 via `retry-after` because it races
+/// the guild-channel requests. URL is a parameter for tests.
 async fn fetch_relationships(
     httpc: reqwest::Client,
     tkn: String,
@@ -507,10 +451,8 @@ async fn fetch_relationships(
     Err("rate limited after 3 attempts".into())
 }
 
-/// Оставить из ответа `/users/@me/relationships` только принятых друзей.
-///
-/// Discord кладёт в один массив и друзей (`type` 1), и заявки, и блокировки;
-/// на экран должны попадать только друзья.
+/// Keep only accepted friends (`type` 1) from `/users/@me/relationships`:
+/// the array also holds requests and blocks.
 fn parse_relationships(body: &str) -> Result<Vec<UserProfile>, String> {
     let arr: Vec<Value> = serde_json::from_str(body).map_err(|e| format!("parse: {}", e))?;
     Ok(arr
@@ -528,13 +470,8 @@ fn parse_relationships(body: &str) -> Result<Vec<UserProfile>, String> {
         .collect())
 }
 
-/// Загрузить одну страницу истории и отдать её в UI.
-///
-/// `before` — самый старый id, который уже есть на экране: Discord отдаёт
-/// сообщения от новых к старым, и если просить `before` от самого нового, он
-/// вернёт ту же страницу ещё раз (раньше так и было — в канале на 91 сообщение
-/// приезжало 300 строк с тройными дублями и лишними запросами). `None` — это
-/// первая страница, её мы показываем сразу.
+/// Load one history page and send it to the UI. `before` is the oldest id on
+/// screen; `None` loads the first page.
 async fn fetch_history_page(
     httpc: reqwest::Client,
     tkn: String,
@@ -576,8 +513,8 @@ async fn fetch_history_page(
                 }
                 if !status.is_success() {
                     let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
-                    // 403 — нет прав на канал. Повтор не поможет, и молчать
-                    // об этом нельзя: пользователь видит пустой канал.
+                    // 403 = no channel access; retrying won't help, and the
+                    // user sees an empty channel.
                     reason = if status == 403 {
                         "нет прав на канал".to_string()
                     } else {
@@ -608,10 +545,8 @@ async fn fetch_history_page(
         }
     }
     if failed || !got_page {
-        // Ничего не пришло. Раньше здесь был просто `return`, и это ломало
-        // приложение: тот, кто ждал ответа (спиннер первой страницы в
-        // `history_loading` или догрузки вверх в `history_loading_more`),
-        // ждал вечно. Одна неудача — и канал становился нечитаемым навсегда.
+        // Nothing arrived: report failure so the loading spinner clears
+        // instead of waiting forever.
         if reason.is_empty() {
             reason = "история не пришла".to_string();
         }
@@ -635,8 +570,8 @@ async fn fetch_history_page(
     let _ = event_tx.send(event);
 }
 
-/// Адрес страницы истории. Первая страница — без `before`, дальше — от
-/// самого старого id, который уже получили.
+/// History page URL: no `before` for the first page, else from the oldest
+/// received id.
 pub(crate) fn history_url(channel_id: &str, before: Option<&str>) -> String {
     match before {
         Some(b) => format!(
@@ -647,9 +582,8 @@ pub(crate) fn history_url(channel_id: &str, before: Option<&str>) -> String {
     }
 }
 
-/// Id самого старого сообщения страницы — его просим как `before` у
-/// Discord. Если страницы пошли по кругу (id повторился) или id пустой,
-/// грузить дальше бессмысленно: возвращаем `None`.
+/// Id of the oldest message on the page, used as the next `before`. `None` if
+/// empty or repeating (paging looped).
 pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Option<String> {
     let id = page.last()?.id.clone();
     if id.is_empty() || Some(id.as_str()) == current {
@@ -658,18 +592,14 @@ pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Opt
     Some(id)
 }
 
-/// Есть ли что грузить дальше вверх. Короткая страница = Discord дошёл до
-/// начала канала: там меньше 50 сообщений и следующего запроса не будет.
-/// Повторяющийся id (страницы пошли по кругу) — тоже конец, иначе запросы
-/// не кончатся.
+/// Whether older messages can be loaded: a short page means history is
+/// exhausted.
 pub(crate) fn more_history_available(got: usize) -> bool {
     got >= HISTORY_PAGE
 }
 
-/// Discord не всегда присылает строку там, где мы ждём строку (например,
-/// `content` у системных сообщений может быть числом). Такое поле берём как
-/// есть: раньше `as_str().unwrap_or("")` тихо подставлял пустую строку, и
-/// ронять из-за этого всю страницу истории нельзя.
+/// Deserialize a field that may not be a string (e.g. `content` can be a
+/// number) by stringifying it, instead of dropping the whole page.
 fn de_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<Value>::deserialize(d)?
         .map(|v| match v {
@@ -679,7 +609,7 @@ fn de_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         .unwrap_or_default())
 }
 
-/// То же, но с «пустым» значением: отсутствие поля и не-строка дают `None`.
+/// Like above, but a missing field or non-string yields `None`.
 fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.and_then(|v| match v {
         Value::String(s) => Some(s),
@@ -687,9 +617,8 @@ fn de_opt_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>,
     }))
 }
 
-/// Одно число, пришедшее числом или строкой. Discord в размерах шлёт целое,
-/// но в тексте JSON может прийти и строкой, и нечётное значение не должно
-/// ронять разбор сообщения.
+/// A number that may arrive as a number or a string; a bad value must not
+/// break message parsing.
 fn de_opt_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.and_then(|v| match v {
         Value::Number(n) => n.as_u64().map(|x| x.min(u64::from(u32::MAX)) as u32),
@@ -698,7 +627,7 @@ fn de_opt_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::
     }))
 }
 
-/// Автор сообщения в том виде, в каком его рисует клиент.
+/// Message author as the client renders it.
 #[derive(serde::Deserialize)]
 struct RawAuthor {
     #[serde(default, deserialize_with = "de_text")]
@@ -709,9 +638,8 @@ struct RawAuthor {
     avatar: Option<String>,
 }
 
-/// Вложение: только то, что нужно для показа. Имя файла клиенту не нужно,
-/// `content_type` берём, потому что по нему решаем, грузить ли картинку
-/// вообще, а размеры — по ним мы знаем высоту сообщения, не качая картинку.
+/// Attachment: only what is needed for display. `content_type` decides whether
+/// to load the image; width/height reserve its space.
 #[derive(serde::Deserialize)]
 struct RawAttachment {
     #[serde(default, deserialize_with = "de_opt_text")]
@@ -720,12 +648,8 @@ struct RawAttachment {
     content_type: Option<String>,
     #[serde(default, deserialize_with = "de_opt_text")]
     description: Option<String>,
-    /// Размер картинки в пикселях. Discord шлёт его полями `width`/`height`,
-    /// а `size` у вложения — это размер ФАЙЛА в байтах, он нам не нужен.
-    ///
-    /// Раньше здесь стояло поле `size` с разбором через `image_size_of`, и
-    /// размер не приходил никогда: `image_size_of` ищет ключи `width`/`height`
-    /// внутри значения поля `size`, а там лежит число, ключей в котором нет.
+    /// Image size in pixels, from `width`/`height` (the attachment `size`
+    /// field is file size in bytes).
     #[serde(default, deserialize_with = "de_opt_u32")]
     width: Option<u32>,
     #[serde(default, deserialize_with = "de_opt_u32")]
@@ -736,15 +660,15 @@ struct RawAttachment {
 struct RawImage {
     #[serde(default, deserialize_with = "de_opt_text")]
     url: Option<String>,
-    /// Как и у вложения: пиксели приходят полями `width`/`height`.
+    /// As with attachments: pixels come as `width`/`height`.
     #[serde(default, deserialize_with = "de_opt_u32")]
     width: Option<u32>,
     #[serde(default, deserialize_with = "de_opt_u32")]
     height: Option<u32>,
 }
 
-/// Эмбед: автор, footer, provider, поля и прочее сюда не входят — serde
-/// пропускает неизвестные поля, не выделяя под них памяти.
+/// Embed: only fields the client shows. serde skips unknown fields without
+/// allocating for them.
 #[derive(serde::Deserialize)]
 struct RawEmbed {
     #[serde(default, deserialize_with = "de_opt_text")]
@@ -771,7 +695,7 @@ impl RawEmbed {
                 if trimmed.is_empty() {
                     None
                 } else if trimmed.len() == s.len() {
-                    // Обрезки не было — оставляем уже готовую строку.
+                    // No trimming needed; keep the existing string.
                     Some(s)
                 } else {
                     Some(trimmed.to_string())
@@ -786,7 +710,7 @@ impl RawEmbed {
     }
 }
 
-/// Сообщение в том виде, в каком оно хранится у нас.
+/// Message as stored by the client.
 #[derive(serde::Deserialize)]
 struct RawMessage {
     #[serde(default, deserialize_with = "de_text")]
@@ -804,7 +728,7 @@ struct RawMessage {
 }
 
 impl RawMessage {
-    /// `None` — сообщение без автора, в чат оно не попадает (как и раньше).
+    /// `None` for an authorless message, which is not shown.
     fn into_message(self, channel_id: &str) -> Option<ChatMessage> {
         let author = self.author?;
         Some(ChatMessage {
@@ -828,25 +752,19 @@ impl RawMessage {
                     })
                 })
                 .collect(),
-            // Эмбеды храним только в урезанном виде: полный JSON стоит
-            // в разы дороже двух нужных полей.
+            // Store embeds trimmed: the full JSON costs far more than the two
+            // fields used.
             embeds: self.embeds.into_iter().filter_map(RawEmbed::into_embed).collect(),
             is_own: false,
         })
     }
 }
 
-/// Разобрать страницу истории из JSON Discord в сообщения.
+/// Parse a history page from Discord JSON into messages.
 ///
-/// Страница разбирается сразу в нужные структуры. Если сначала собрать
-/// `serde_json::Value` на всю страницу, а потом вытащить из неё несколько
-/// строк, то на сотне сообщений это десятки тысяч лишних аллокаций и
-/// заметный пик памяти — всё дерево `Value` живёт до конца разбора.
-///
-/// Строгий разбор может упасть, если Discord пришлёт поле не того типа.
-/// Тогда страница разбирается запасным, терпительным способом (см.
-/// [`parse_message_value`]): потерять историю канала из-за одной странной
-/// строки хуже, чем показать её чуть менее подробно.
+/// Deserializes straight into the target structs rather than building a full
+/// `Value` tree. Falls back to a lenient pass on type errors (see
+/// [`parse_message_value`]) instead of losing the page.
 pub(crate) fn parse_history_page_lenient(body: &str, channel_id: &str, warn: &mut dyn FnMut(String)) -> Vec<ChatMessage> {
     match parse_history_page(body, channel_id) {
         Ok(msgs) => msgs,
@@ -863,15 +781,14 @@ pub(crate) fn parse_history_page_lenient(body: &str, channel_id: &str, warn: &mu
     }
 }
 
-/// Строгий разбор страницы: ошибка формата возвращается вызывающему.
+/// Strict page parse: format errors are returned to the caller.
 pub(crate) fn parse_history_page(body: &str, channel_id: &str) -> Result<Vec<ChatMessage>, serde_json::Error> {
     let raw: Vec<RawMessage> = serde_json::from_str(body)?;
     Ok(raw.into_iter().filter_map(|m| m.into_message(channel_id)).collect())
 }
 
-/// Разбор одного сообщения из уже готового дерева `Value` — для живых
-/// событий гейтвея, где дерево уже собрано целиком. `fallback_channel`
-/// нужен на случай, если в событии нет своего `channel_id`.
+/// Parse one message from an existing `Value` tree (live gateway events).
+/// `fallback_channel` is used when the event has no `channel_id`.
 pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<ChatMessage> {
     let author = m.get("author")?;
     Some(ChatMessage {
@@ -910,11 +827,8 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
     })
 }
 
-/// Тело IDENTIFY (op 2) для рукопожатия.
-///
-/// Свойства клиента берём из общего `client_properties`, а не из копии:
-/// раньше здесь лежал свой объект с зашитым «Linux», и отпечаток в
-/// WebSocket расходился с `X-Super-Properties` у REST.
+/// IDENTIFY (op 2) handshake body. Uses the shared `client_properties` so the
+/// WebSocket fingerprint matches `X-Super-Properties`.
 fn identify_payload(token: &str) -> serde_json::Value {
     json!({
         "op": 2,
@@ -991,9 +905,8 @@ async fn gw_inner(
                 Ok(WsMessage::Text(t)) => { let _ = raw_tx.send(t.to_string()); }
                 Ok(WsMessage::Ping(d)) => { let _ = ws_tx.send(WsMessage::Pong(d)); }
                 Ok(WsMessage::Close(c)) => {
-                    // Тащим сам код закрытия, а не отладочный вывод всей
-                    // структуры: по коду решается, повторять подключение или
-                    // нет (см. `close_fatal_reason`).
+                    // Send the close code itself, not the debug-rendered
+                    // struct: `close_fatal_reason` decides whether to retry.
                     let code = c.map(|f| u16::from(f.code)).unwrap_or(0);
                     let _ = raw_tx.send(format!("__CLOSE__{}", code));
                     break;
@@ -1005,18 +918,13 @@ async fn gw_inner(
                 }
             }
         }
-        // Поток от сервера кончился. Если это был close-фрейм, цикл гейтвея
-        // уже ушёл по нему; а вот молчаливый конец (сервер закрыл соединение
-        // без кода) раньше просто обрывал чтение и оставлял гейтвей жить: тот
-        // продолжал слать heartbeat'ы в мёртвый сокет, пока не набирал пять
-        // неудач подряд — это минуты вместо трёх секунд, и всё это время
-        // клиент молчал, ничем не показывая, что связи нет. Метка нужна, чтобы
-        // цикл узнал об этом сразу.
+        // Server stream ended. A silent end (no close frame) must be reported
+        // immediately so the gateway doesn't keep heartbeating a dead socket.
         let _ = raw_tx.send(EOF_MARK.to_string());
     });
 
-    // Клиент обязателен с таймаутом, иначе зависший POST останавливает гейтвей
-    // навсегда (см. `api_client`).
+    // The client must have a timeout, or a stalled POST stops the gateway
+    // forever (see `api_client`).
     let http = api_client()?;
     let tkn = token.to_string();
     let mut heartbeat = time::interval(Duration::from_millis(interval));
@@ -1027,8 +935,8 @@ async fn gw_inner(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                // Предыдущий heartbeat остался без ответа — Discord просит
-                // закрываться сразу, а не ждать пяти неудач подряд.
+                // Previous heartbeat went unanswered: close now rather than
+                // wait through more failures.
                 if let Err(why) = hb.tick() {
                     let _ = event_tx.send(ToApp::Debug(why.into()));
                     return Err("heartbeat ACK timeout".into());
@@ -1045,9 +953,8 @@ async fn gw_inner(
             Some(raw) = raw_rx.recv() => {
                 match classify_raw(&raw) {
                     RawFrame::Closed(code) => match close_fatal_reason(code) {
-                        // Отказ в самом токене: повтор не поможет. Помечаем
-                        // ошибку как фатальную, и `run_gateway` вернёт клиент
-                        // на экран входа вместо бесконечного переподключения.
+                        // Token rejected: mark fatal so `run_gateway` returns
+                        // to the login screen instead of retrying forever.
                         Some(reason) => {
                             let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed {}: {}", code, reason)));
                             return Err(Box::new(GwClosed {
@@ -1055,17 +962,15 @@ async fn gw_inner(
                                 fatal: true,
                             }));
                         }
-                        // Обычный обрыв: сеть, сон компьютера, реконнект со
-                        // стороны Discord — заходим снова.
+                        // Ordinary drop (network, sleep, Discord-side
+                        // reconnect): retry.
                         None => {
                             let _ = event_tx.send(ToApp::Debug(format!("WebSocket closed: {}", code)));
                             return Err("websocket closed".into());
                         }
                     },
-                    // Поток кончился молча. Раньше чтение просто обрывалось,
-                    // гейтвей оставался в живых и слал heartbeat'ы в мёртвый
-                    // сокет, пока не набирал пять неудач подряд, — минуты
-                    // молчания вместо трёх секунд переподключения.
+                    // Stream ended silently: reconnect now instead of
+                    // heartbeating a dead socket.
                     RawFrame::Eof => {
                         let _ = event_tx.send(ToApp::Debug("WebSocket stream ended".into()));
                         return Err("websocket closed".into());
@@ -1277,16 +1182,15 @@ async fn gw_inner(
                                 let _ = event_tx.send(ToApp::Status("Resumed".into()));
                             }
                             "MESSAGE_CREATE" => {
-                                // Тот же разбор, что и у страницы истории, но
-                                // из уже готового дерева события: пересобирать
-                                // его через serde незачем.
+                                // Same parse as a history page, reusing the
+                                // already-built event tree.
                                 if let Some(msg) = parse_message_value(&v["d"], "") {
                                     let _ = event_tx.send(ToApp::Message(msg));
                                 }
                             }
                             "MESSAGE_UPDATE" => {
-                                // Правка приходит полным объектом сообщения —
-                                // тем же разбором, что и создание (Т-8).
+                                // An edit arrives as the full message object;
+                                // parse like create.
                                 if let Some(msg) = parse_message_value(&v["d"], "") {
                                     let _ = event_tx.send(ToApp::MessageUpdated(msg));
                                 }
@@ -1381,8 +1285,8 @@ async fn gw_inner(
                     }
                     1 => {
                         let _ = event_tx.send(ToApp::Debug("Gateway requested heartbeat".into()));
-                        // Сервер сам просит heartbeat: шлём сразу, ожидание ACK
-                        // начинается заново.
+                        // Server requested a heartbeat: send it now and restart
+                        // the ACK wait.
                         hb.ack();
                         let _ = hb.tick();
                         let p = json!({ "op": 1, "d": seq });
@@ -1414,11 +1318,8 @@ async fn gw_inner(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ToGateway::Send { channel_id, content, local_id } => {
-                        // Отправку тоже уводим из цикла в отдельную задачу.
-                        // Пока идёт POST, гейтвей не читает события и не
-                        // берёт команды: сообщение, пришедшее в это время,
-                        // задерживалось на всё время запроса (а без
-                        // таймаута — навсегда).
+                        // Send in a separate task so the gateway keeps reading
+                        // events and commands during the POST.
                         let httpc = http.clone();
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
@@ -1427,23 +1328,17 @@ async fn gw_inner(
                         });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {
-                        // Историю тянем отдельной задачей. Раньше загрузка шла
-                        // прямо в цикле команд и блокировала всё остальное:
-                        // один запрос — это до трёх обращений к API с паузами,
-                        // и клик по следующему каналу «зависал» до его конца.
-                        // Повторный запрос по тому же каналу игнорируем, иначе
-                        // два одинаковых запроса и лишний риск 429.
+                        // Fetch history in a separate task; a request can make
+                        // up to three API calls with backoff and would otherwise
+                        // block the loop. Duplicates are skipped to avoid 429s.
                         let inflight = session.history_inflight.clone();
                         let httpc = http.clone();
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
                         let cid = channel_id.clone();
-                        // Ключ защиты — пара (канал, страница), а не один
-                        // канал. Догрузка вверх и повторное открытие канала —
-                        // это РАЗНЫЕ страницы, и раньше вторая отбрасывалась
-                        // как дубль первой: запрос первой страницы уходил в
-                        // никуда, спиннер не гас, а пришедшая потом догрузка
-                        // ложилась в пустой список (Б-17).
+                        // Key is (channel, page), not just channel: loading
+                        // older messages and reopening the channel are different
+                        // pages and must not dedupe each other.
                         let key = (cid.clone(), before.clone());
                         let cid_short: String = cid.chars().take(14).collect();
                         tokio::spawn(async move {
@@ -1459,8 +1354,8 @@ async fn gw_inner(
                         });
                     }
                     ToGateway::OpenDM { user_id } => {
-                        // Тот же случай, что и с отправкой: запрос в цикле
-                        // гейтвея замораживал его на всё время ожидания.
+                        // Same as sending: the request must not freeze the
+                        // gateway loop.
                         let httpc = http.clone();
                         let tkc = tkn.clone();
                         let ev = event_tx.clone();
@@ -1493,9 +1388,8 @@ mod http_tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// У клиента гейтвея обязан быть разумный таймаут. `Client::new()` ждёт
-    /// бесконечно: один зависший запрос держал гейтвей в состоянии
-    /// «подключён» и не давал переподключиться.
+    /// The gateway client must have a sane timeout; a stalled request would
+    /// otherwise block reconnection.
     #[test]
     fn api_client_has_a_sane_timeout() {
         assert!(API_TIMEOUT > Duration::from_secs(1), "слишком часто обрывать");
@@ -1506,11 +1400,8 @@ mod http_tests {
         assert!(api_client().is_ok(), "клиент должен собираться");
     }
 
-    /// Друзья грузятся одновременно с пачкой запросов каналов гильдий и ловят
-    /// 429. У каналов повтор был, у друзей — нет, поэтому вкладка «Friends»
-    /// оставалась с нулём. Проверяем на настоящем сокете: первый ответ — 429
-    /// с `retry-after: 0`, второй — список. Друг обязан доехать, а блокировка
-    /// (`type` 2) — нет.
+    /// Friends are fetched alongside guild channels and hit 429; verify on a
+    /// real socket that the 429 is retried and only friends are kept.
     #[test]
     fn relationships_fetch_retries_after_429() {
         use std::io::{Read, Write};
@@ -1554,17 +1445,14 @@ mod http_tests {
         assert_eq!(friends[0].username, "friend");
     }
 
-    /// Отправка не должна висеть на сервере, который принял соединение и
-    /// замолчал. Проверяется на настоящем сокете: подменить его конусом
-    /// моков и убедиться, что запрос ушёл, нельзя — а именно тут всё и ломалось.
+    /// A send must not hang on a server that accepts the connection then goes
+    /// silent; verified against a real unanswered socket.
     #[test]
     fn stalled_post_gives_up_instead_of_hanging() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        // Сервер принимает соединение и не отвечает никогда. Сокет держим открытым
-        // всё это время: если его сразу бросить, клиент увидит обрыв и
-        // закончит запрос с ошибкой без всякого таймаута — тест прошёл бы на
-        // сломанном коде.
+        // Server accepts and never responds; keep the socket open, or the
+        // client would see a disconnect and the test would pass on broken code.
         std::thread::spawn(move || {
             if let Ok((_stream, _)) = listener.accept() {
                 std::thread::sleep(Duration::from_secs(10));
@@ -1572,11 +1460,11 @@ mod http_tests {
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // Приёмник оборачиваем в EventTx с единственным поколением: события
-        // оттуда идут прямо в приложение.
+        // Wrap the receiver in an EventTx with a single generation so events
+        // go straight through.
         let gen = Arc::new(Generation::default());
         let event_tx = EventTx::new(tx, gen.next(), gen.clone());
-        // Таймаут уменьшен, чтобы тест не ждал двадцать секунд; смысл тот же.
+        // Shortened timeout so the test doesn't wait twenty seconds.
         let client = client_with_timeout(Duration::from_millis(300)).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let started = std::time::Instant::now();
@@ -1594,8 +1482,7 @@ mod http_tests {
             "зависший POST должен обрываться, а не ждать: {:?}",
             started.elapsed()
         );
-        // Обрыв связи обязан быть виден пользователю: раньше уходила строка
-        // только в отладочный лог, а эхо оставалось в чате навсегда.
+        // Connection loss must surface to the user, not just the debug log.
         let mut seen = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             seen.push(ev);
@@ -1606,9 +1493,7 @@ mod http_tests {
         );
     }
 
-    /// Отказ Discord должен объясняться словами, а не кодом. Пользователю
-    /// важно одно: писать сюда нельзя или можно повторить. Код 403 в строке
-    /// статуса не помогает ничего.
+    /// Send failures are explained in words, not status codes.
     #[test]
     fn send_failure_reasons_are_readable() {
         for (status, must_contain) in [
@@ -1636,17 +1521,14 @@ mod generation_tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    /// Переключение аккаунта не должно оставлять прежний гейтвей живым.
-    /// `Shutdown` кладётся в очередь, а поток может спать между попытками
-    /// переподключения или висеть на запросе — тогда он успевает ещё раз
-    /// подключиться со старым токеном, и Discord видит две сессии. События
-    /// устаревшего поколения приложение слушать не должно.
+    /// Switching accounts must silence the old gateway: it can otherwise
+    /// reconnect with the old token and create two sessions.
     #[test]
     fn superseded_gateway_goes_silent() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let gen = Arc::new(Generation::default());
         let old = EventTx::new(tx.clone(), gen.next(), gen.clone());
-        // Переключили аккаунт.
+        // Account switched.
         let new = EventTx::new(tx, gen.next(), gen.clone());
 
         assert!(!old.alive(), "прежний гейтвей должен понять, что он больше не нужен");
@@ -1661,8 +1543,8 @@ mod generation_tests {
         assert!(matches!(rx.try_recv(), Ok(ToApp::Debug(_))), "новый гейтвей должен говорить");
     }
 
-    /// Поколения должны идти по порядку, иначе «новый» гейтвей решит, что он
-    /// устарел, и замолчит сам.
+    /// Generations must increase monotonically, or a new gateway would think
+    /// it is stale and go silent.
     #[test]
     fn generations_increase_monotonically() {
         let gen = Generation::default();
@@ -1678,13 +1560,8 @@ mod generation_tests {
 mod session_tests {
     use super::{claim_history, release_history, SessionState};
 
-    /// Защита от дублей истории обязана пережить реконнект.
-    ///
-    /// `run_gateway` держит один `SessionState` и передаёт его в каждый новый
-    /// `gw_inner`, а задача прошлого соединения продолжает держать тот же
-    /// `Arc`. Если бы множество запросов создавалось заново на каждое
-    /// подключение, второй клик по каналу после реконнекта ушёл бы в Discord
-    /// ещё раз (Т-21).
+    /// Duplicate-history protection must survive a reconnect: `run_gateway`
+    /// passes one `SessionState` (and its `Arc`) into every `gw_inner`.
     #[tokio::test]
     async fn history_inflight_survives_a_reconnect() {
         let session = SessionState::default();
@@ -1694,13 +1571,13 @@ mod session_tests {
             claim_history(&session.history_inflight, key.clone()).await,
             "первый запрос истории должен пройти"
         );
-        // «Реконнект» — это тот же SessionState в следующем gw_inner.
+        // "Reconnect" is the same SessionState in the next gw_inner.
         assert!(
             !claim_history(&session.history_inflight, key.clone()).await,
             "после реконнекта защита от дублей пропала: запрос уйдёт второй раз"
         );
 
-        // Запрос завершился — пару отпускаем, и следующий клик снова проходит.
+        // Request finished: release the pair so the next click passes.
         release_history(&session.history_inflight, &key).await;
         assert!(
             claim_history(&session.history_inflight, key).await,
@@ -1713,11 +1590,8 @@ mod session_tests {
 mod identify_tests {
     use super::identify_payload;
 
-    /// IDENTIFY обязан нести настоящий отпечаток клиента.
-    ///
-    /// Раньше здесь лежал свой объект свойств с зашитым «Linux»: заголовок
-    /// `X-Super-Properties` чинили, а рукопожатие по WebSocket — нет, и
-    /// Discord видел две разные системы. Теперь оба места берут один объект.
+    /// IDENTIFY must carry the real client fingerprint, the same object as
+    /// `X-Super-Properties`.
     #[test]
     fn identify_carries_the_real_client_fingerprint() {
         let p = identify_payload("tok");
@@ -1739,11 +1613,8 @@ mod identify_tests {
 mod close_tests {
     use super::{close_code_of, close_fatal_reason, classify_raw, RawFrame, EOF_MARK, WS_ERROR_MARK};
 
-    /// Коды, которыми Discord отказывает в самом токене или подписках,
-    /// означают, что повторное подключение ничего не изменит. Их надо
-    /// отличать от обычного обрыва: раньше все закрытия выглядели одинаково,
-    /// и клиент по кругу, каждые 3 секунды, долбился в Discord сутками, не
-    /// говоря пользователю ни слова.
+    /// Token/intent refusal codes mean reconnecting changes nothing; they must
+    /// be distinguished from ordinary drops.
     #[test]
     fn token_refusal_codes_are_fatal() {
         for code in [4004u16, 4007, 4013, 4014] {
@@ -1751,13 +1622,12 @@ mod close_tests {
                 .unwrap_or_else(|| panic!("код {code} должен быть фатальным"));
             assert!(!reason.is_empty(), "причина должна показываться пользователю");
         }
-        // 4004 — самый частый случай: токен невалиден.
+        // 4004 is the most common: invalid token.
         assert!(close_fatal_reason(4004).unwrap().contains("токен"));
     }
 
-    /// Обычные обрывы (сеть, сон, реконнект со стороны Discord)
-    /// переподключаться должны, как раньше: иначе клиент не пережил бы
-    /// обычную потерю связи.
+    /// Ordinary drops (network, sleep, Discord-side reconnect) must still
+    /// reconnect.
     #[test]
     fn ordinary_close_codes_are_not_fatal() {
         for code in [0u16, 1000, 1001, 1006, 1011, 1012, 1013, 4000, 4008, 4011] {
@@ -1765,39 +1635,35 @@ mod close_tests {
         }
     }
 
-    /// Задача чтения отдаёт код закрытия отдельной служебной строкой; если её
-    /// разобрать не удалось, обрыв считаем обычным, но не фатальным.
+    /// The read task reports the close code as a marker; an unparseable one is
+    /// treated as an ordinary drop.
     #[test]
     fn close_code_is_taken_from_the_read_task() {
         assert_eq!(close_code_of("__CLOSE__4004"), Some(4004));
         assert_eq!(close_code_of("__CLOSE__1000"), Some(1000));
         assert_eq!(close_code_of("__WS_ERROR__broken pipe"), None);
         assert_eq!(close_code_of("{\"op\":0}"), None);
-        // Мусор вместо кода не должен превращаться в «фатально».
+        // Garbage instead of a code must not become "fatal".
         assert_eq!(close_code_of("__CLOSE__мусор"), None);
     }
 
-    /// Молчаливый конец потока (сервер закрыл соединение без close-фрейма)
-    /// обязан отличаться от обычного события. Раньше чтение просто обрывалось,
-    /// гейтвей оставался в живых и слал heartbeat'ы в мёртвый сокет, пока не
-    /// набирал пять неудач подряд, — минуты молчания вместо трёх секунд
-    /// переподключения.
+    /// A silent end of stream (no close frame) must be distinguished from an
+    /// event so the gateway reconnects immediately.
     #[test]
     fn silent_end_of_stream_is_recognised() {
         assert!(matches!(classify_raw(EOF_MARK), RawFrame::Eof));
-        // Метка обязана быть ровно такой, какую шлёт задача чтения: опечатка
-        // здесь тихо отключила бы переподключение.
+        // The marker must match what the read task sends; a typo would silently
+        // disable reconnection.
         assert!(matches!(classify_raw(super::EOF_MARK), RawFrame::Eof));
     }
 
-    /// Остальные служебные метки не должны путаться с событиями Discord.
+    /// The other markers must not be confused with Discord events.
     #[test]
     fn other_frames_stay_distinct() {
         assert!(matches!(classify_raw("__CLOSE__4004"), RawFrame::Closed(4004)));
         assert!(matches!(classify_raw("__CLOSE__1000"), RawFrame::Closed(1000)));
         assert!(matches!(classify_raw(&format!("{}broken pipe", WS_ERROR_MARK)), RawFrame::WsError(_)));
-        // Настоящее событие остаётся событием, даже если в нём есть "__CLOSE__"
-        // в поле данных.
+        // A real event stays an event even if its data contains "__CLOSE__".
         assert!(matches!(classify_raw("{\"op\":0,\"t\":\"__CLOSE__4004\"}"), RawFrame::Event));
         assert!(matches!(classify_raw("{\"op\":11,\"d\":null}"), RawFrame::Event));
     }
@@ -1807,8 +1673,7 @@ mod close_tests {
 mod parse_tests {
     use super::{parse_history_page, parse_history_page_lenient, parse_message_value};
 
-    /// Сообщение в том виде, в каком его отдаёт Discord: много полей, которые
-    /// клиенту не нужны (reaction_counts, mentions, flags и прочее).
+    /// A message as Discord sends it, with many fields the client ignores.
     const REAL: &str = r#"[{
         "id": "1200000000000000001",
         "channel_id": "900000000000000000",
@@ -1879,11 +1744,7 @@ mod parse_tests {
         assert_eq!(a.url, "https://cdn.discordapp.com/attachments/1/photo.png");
         assert_eq!(a.content_type.as_deref(), Some("image/png"));
         assert_eq!(a.description.as_deref(), Some("схема из чата"));
-        // Размер в пикселях приходит полями `width`/`height`, а `size` у
-        // вложения — это размер файла в байтах. Раньше поле называлось `size`
-        // и разбиралось как пара пикселей, из-за чего размер не приходил
-        // никогда: по нему резервируется место под картинку, и без него
-        // высота сообщения прыгала на 180 px при загрузке.
+        // Pixels come from `width`/`height`; `size` is file size in bytes.
         assert_eq!(a.size, Some([1600, 1200]), "размер картинки должен доходить из истории");
 
         assert_eq!(m.embeds.len(), 1);
@@ -1895,13 +1756,8 @@ mod parse_tests {
         assert_eq!(m.embeds[0].description, None, "у эмбеда нет description — выкидываем пустое");
     }
 
-    /// История и живое сообщение обязаны разбираться одинаково, иначе
-    /// сообщение, приехавшее в реальном времени, будет выглядеть не так, как
-    /// то же сообщение из истории.
-    ///
-    /// Разница одна и намеренная: страница истории берёт канал, для которого
-    /// её запросили, а живое сообщение — свой `channel_id`. Поэтому здесь
-    /// подставляем запасным именно тот канал, который указан в сообщении.
+    /// History and live messages must parse identically, except the channel:
+    /// a page takes the requested channel, a live message its own `channel_id`.
     #[test]
     fn history_and_live_parse_agree() {
         let from_history = parse_one_in(REAL, "900000000000000000");
@@ -1922,9 +1778,7 @@ mod parse_tests {
         assert_eq!(
             from_history.attachments[0].description, from_live.attachments[0].description
         );
-        // Размер картинки — тоже: раньше именно здесь пути разходились
-        // (история отдавала `None`, живое сообщение — настоящие пиксели), и
-        // тест этого не замечал, потому что размер не сравнивал.
+        // Image size must match too; the two paths used to diverge here.
         assert_eq!(from_history.attachments[0].size, from_live.attachments[0].size);
         assert_eq!(from_history.attachments[0].size, Some([1600, 1200]));
         assert_eq!(from_history.embeds.len(), from_live.embeds.len());
@@ -1932,7 +1786,7 @@ mod parse_tests {
         assert_eq!(from_history.embeds[0].image_size, from_live.embeds[0].image_size);
     }
 
-    /// Живое сообщение знает свой канал сам; если поля нет — берём запасной.
+    /// A live message uses its own channel; fall back if the field is absent.
     #[test]
     fn live_message_uses_own_channel_then_fallback() {
         let v: serde_json::Value =
@@ -1944,7 +1798,7 @@ mod parse_tests {
         assert_eq!(parse_message_value(&v2, "fallback").unwrap().channel_id, "fallback");
     }
 
-    /// Сообщение без автора в чат не попадает — как и раньше.
+    /// A message without an author is not shown.
     #[test]
     fn message_without_author_is_skipped() {
         let body = r#"[{"id":"1","content":"системное","author":{"id":"u","username":"n"}},{"id":"2","content":"без автора"}]"#;
@@ -1953,8 +1807,7 @@ mod parse_tests {
         assert_eq!(msgs[0].id, "1");
     }
 
-    /// Плохое значение в одном поле не должно ронять всю страницу: раньше
-    /// `as_str().unwrap_or("")` тихо подставлял пустую строку.
+    /// A bad value in one field must not drop the whole page.
     #[test]
     fn odd_field_types_do_not_break_the_page() {
         let body = r#"[{"id":7,"content":12345,"timestamp":null,
@@ -1969,7 +1822,7 @@ mod parse_tests {
         assert!(msgs[0].author_avatar.is_none());
     }
 
-    /// Совсем пустой объект не должен ронять страницу.
+    /// A completely empty object must not break the page.
     #[test]
     fn empty_and_missing_fields_survive() {
         let msgs = parse_history_page(r#"[{}]"#, "c").unwrap();
@@ -1979,8 +1832,7 @@ mod parse_tests {
         assert_eq!(parse_history_page("не json", "c").is_err(), true, "битый JSON — ошибка разбора");
     }
 
-    /// Обрезанное описание эмбеда должно уехать без пробелов, а нормальное —
-    /// без лишней копии (содержимое не меняется).
+    /// Embed descriptions are trimmed; untrimmed ones are kept as-is.
     #[test]
     fn embed_description_is_trimmed() {
         let body = r#"[{"id":"1","content":"","author":{"id":"u","username":"n"},
@@ -1990,7 +1842,7 @@ mod parse_tests {
         assert_eq!(msgs[0].embeds[0].description.as_deref(), Some("текст"));
     }
 
-    /// Вложение без url показать нечем — такое отбрасываем, а не ломаем страницу.
+    /// An attachment without a url is dropped, not a page failure.
     #[test]
     fn attachment_without_url_is_dropped() {
         let body = r#"[{"id":"1","content":"","author":{"id":"u","username":"n"},
@@ -2000,10 +1852,8 @@ mod parse_tests {
         assert_eq!(msgs[0].attachments[0].url, "https://cdn.discordapp.com/a/1.png");
     }
 
-    /// Запасной разбор: если формат неожиданный (например, `author` пришёл
-    /// не объектом), история всё равно показывается — пусть с пустыми полями.
-    /// Строгий разбор на этом теле падает, а страница не должна пропадать
-    /// целиком из-за одной строки.
+    /// Fallback parse: an unexpected shape (e.g. non-object `author`) still
+    /// shows the page; the strict pass fails but the page must not vanish.
     #[test]
     fn lenient_parse_survives_unexpected_shape() {
         let body = r#"[{"id":"1","content":"строка вместо объекта","author":"bob"},
@@ -2022,8 +1872,7 @@ mod parse_tests {
         assert!(warns[0].contains("fallback"), "лог должен говорить, что это запасной путь: {}", warns[0]);
     }
 
-    /// Совсем нечитаемый ответ не должен ни паниковать, ни врать: пустой
-    /// список и понятное сообщение в лог.
+    /// Unreadable input must not panic: an empty list and a clear log line.
     #[test]
     fn lenient_parse_reports_garbage() {
         let mut warns = Vec::new();
@@ -2039,21 +1888,19 @@ mod heartbeat_tests {
     use super::{reconnect_delay, reconnect_delay_with_jitter, HeartbeatBook};
     use std::time::Duration;
 
-    /// Хватает одного heartbeat без ACK, чтобы рвать соединение: раньше порог
-    /// был «больше пяти», и на мёртвом сокете клиент молчал минуты.
+    /// One unanswered heartbeat is enough to drop the connection.
     #[test]
     fn one_missed_heartbeat_is_enough_to_reconnect() {
         let mut hb = HeartbeatBook::default();
         assert!(hb.tick().is_ok(), "первый heartbeat уходит");
         assert!(hb.tick().is_err(), "без ACK второй уже рвёт соединение");
-        // ACK снимает ожидание.
+        // ACK clears the wait.
         hb.ack();
         assert!(hb.tick().is_ok());
         assert!(hb.tick().is_err());
     }
 
-    /// Пауза между попытками растёт экспоненциально и упирается в потолок:
-    /// раньше она всегда была 3 секунды.
+    /// Backoff grows exponentially and is capped.
     #[test]
     fn reconnect_backoff_grows_and_is_capped() {
         assert_eq!(reconnect_delay(0), Duration::from_secs(1));
@@ -2061,14 +1908,14 @@ mod heartbeat_tests {
         assert_eq!(reconnect_delay(2), Duration::from_secs(4));
         assert_eq!(reconnect_delay(5), Duration::from_secs(32));
         assert_eq!(reconnect_delay(6), Duration::from_secs(60));
-        // Дальше не растёт и не переполняется.
+        // No growth or overflow beyond this.
         assert_eq!(reconnect_delay(50), Duration::from_secs(60));
     }
 
-    /// Джиттер не больше четверти базы и не ломает формулу на краях.
+    /// Jitter is at most a quarter of the base and clamps at the edges.
     #[test]
     fn reconnect_jitter_stays_within_a_quarter() {
-        let base = reconnect_delay(3); // 8 с
+        let base = reconnect_delay(3); // 8 s
         assert_eq!(reconnect_delay_with_jitter(3, 0.0), base);
         assert_eq!(reconnect_delay_with_jitter(3, 1.0), base + Duration::from_secs(2));
         assert_eq!(reconnect_delay_with_jitter(3, -5.0), base);

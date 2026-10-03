@@ -8,10 +8,7 @@ use crate::app::App;
 use crate::models::StoredAccount;
 use crate::util::{base64_decode, base64_string};
 
-/// Записать хранилище на диск надёжно: во временный файл, с правами только
-/// для владельца (`0600`), со сбросом на диск и атомарной заменой. Так обрыв
-/// или нехватка места не оставляют полузаписанный файл, а токены не читает
-/// чужой пользователь на той же машине.
+/// Write the vault atomically via a 0600 temp file, fsync, and rename.
 fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
@@ -27,7 +24,7 @@ fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
-        // Не оставляем мусор рядом с хранилищем.
+        // Don't leave a stray temp file next to the vault.
         let _ = std::fs::remove_file(&tmp);
     }
     result
@@ -35,7 +32,7 @@ fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
 
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
-        // Переопределение нужно тестам, чтобы не трогать настоящий файл.
+        // Override for tests so the real file isn't touched.
         if let Ok(custom) = std::env::var("WYVERN_ACCOUNTS_PATH") {
             if !custom.is_empty() {
                 return std::path::PathBuf::from(custom);
@@ -90,66 +87,42 @@ impl App {
         let pt = cipher.decrypt(nonce, ct.as_slice()).ok()?;
         serde_json::from_slice::<Vec<StoredAccount>>(&pt).ok()
     }
-    /// Разобрать содержимое файла: `None` — пароль не подошёл (в отличие от
-    /// пустого списка, который означает «аккаунтов пока нет»).
-    ///
-    /// Старый открытый формат здесь намеренно не разбирается: в нём пароля нет
-    /// вовсе, и «подошёл любой» — это не проверка. См. `legacy_accounts` и
-    /// `unlock_vault`.
+    /// Parse the file; `None` means the password didn't match (vs. an empty list).
     pub(crate) fn load_accounts_with(content: &str, password: &str) -> Option<Vec<StoredAccount>> {
         if password.is_empty() {
             return None;
         }
         Self::decrypt_accounts(content, password)
     }
-    /// Старый формат хранилища — обычный список, без шифрования.
-    ///
-    /// Такой файл открывается без пароля (так он и был записан), и раньше это
-    /// считалось «пароль подошёл». Опасность не в том, что файл открыт — он и
-    /// так открыт, — а в том, что происходило следом: `unlock_vault` запоминал
-    /// введённый пароль как пароль хранилища, а первая же запись (добавили
-    /// аккаунт, обновили имя) перешифровывала файл этим паролем. Опечатка при
-    /// вводе — и хранилище молча переезжало на пароль с опечаткой, вернуть
-    /// прежний уже нечем, и никакого «миграция старого формата» никто не видел.
+    /// Legacy vault format: a plain unencrypted list.
+    /// Treating it as a password match would let a typo silently re-encrypt it.
     pub(crate) fn legacy_accounts(content: &str) -> Option<Vec<StoredAccount>> {
         serde_json::from_str::<Vec<StoredAccount>>(content).ok()
     }
     pub(crate) fn save_accounts(&mut self, password: &str) {
-        // Старый открытый файл сам себя не перезаписывает. Пароль в нём не
-        // проверялся, поэтому запись перешифровала бы хранилище тем, что
-        // случайно оказалось в поле ввода, — и доступ к своим аккаунтам был бы
-        // потерян молча. Пока пользователь не подтвердил пароль явно
-        // (`confirm_legacy_migration`), файл не трогаем.
+        // Don't rewrite a legacy file until the password is explicitly confirmed.
         if self.vault_legacy {
             return;
         }
         let Some(encrypted) = Self::encrypt_accounts(&self.saved_accounts, password) else {
             return;
         };
-        // Ошибку записи нельзя глотать: иначе UI показывает «сохранено», а на
-        // диске пусто или прошлая версия. Раньше `rename` уходил в `let _`, а
-        // неудачный `write` просто ничего не делал.
+        // Don't swallow write errors: the UI would claim success while the disk is stale.
         if let Err(e) = write_vault_file(&self.vault_path(), encrypted.as_bytes()) {
             self.status = format!("Не удалось сохранить хранилище: {}", e);
         }
     }
-    /// Файл хранилища конкретного экземпляра. Переопределение живёт в полях
-    /// App, а не в переменной окружения: тесты идут параллельно, и общий
-    /// env приводил к тому, что тест писал в настоящий файл.
+    /// This instance's vault file; the override lives in App fields because
+    /// parallel tests shared one env var and wrote the real file.
     pub(crate) fn vault_path(&self) -> std::path::PathBuf {
         self.vault_path_override.clone().unwrap_or_else(Self::accounts_path)
     }
-    /// Путь к файлу-замку рядом с хранилищем: `~/.wyvern_accounts.lock`.
+    /// Path to the lock file next to the vault: `~/.wyvern_accounts.lock`.
     pub(crate) fn vault_lock_path(&self) -> std::path::PathBuf {
         self.vault_path().with_extension("lock")
     }
-    /// Взять замок на хранилище на всю сессию. Текстом ошибки отвечаем, если
-    /// файл уже занят другим экземпляром клиента. Повторный вызов на этом же
-    /// App — не ошибка: замок уже наш.
-    ///
-    /// Почему на всю сессию, а не только на запись: два клиента с одним
-    /// аккаунтом одновременно держат по гейтвею, и кто из них записал
-    /// последним, решает гонка. Замок на время записи такую пару не разводит.
+    /// Take the vault lock for the whole session; a second instance gets an error.
+    /// A write-only lock wouldn't separate two clients racing on one account.
     pub(crate) fn acquire_vault_lock(&mut self) -> Result<(), String> {
         if self.vault_lock.is_some() {
             return Ok(());
@@ -174,13 +147,8 @@ impl App {
             }
         }
     }
-    /// Показать токен частично: первые и последние четыре символа.
-    ///
-    /// Режем по символам, а не по байтам. Раньше бралось `&token[..4]` и
-    /// `&token[token.len() - 4..]`: токен берётся из поля ввода, и одна
-    /// русская буква (2 байта) сдвигала границу — клиент падал с «byte index
-    /// is not a char boundary». Маску показывают по клику на аккаунт, то есть
-    /// достаточно было вставить токен с опечаткой и нажать на него.
+    /// Show the first and last four chars of the token.
+    /// Slice by chars, not bytes: a multi-byte token would panic on a byte boundary.
     pub(crate) fn mask_token(&self, token: &str) -> String {
         let chars: Vec<char> = token.chars().collect();
         if chars.len() <= 8 {
@@ -209,10 +177,7 @@ impl App {
             changed = true;
         }
         self.refresh_active_index();
-        // Т-10: если список не изменился, сохранять нечего. Раньше файл
-        // перешифровывался безусловно, и вход в уже сохранённый аккаунт стоил
-        // второго полного прогона PBKDF2 (100 000 итераций) впустую — только
-        // чтобы записать то же самое.
+        // Only save when the list changed; unconditional saves wasted a full PBKDF2 run.
         if changed {
             let pw = self.master_password.clone();
             self.save_accounts(&pw);
@@ -221,7 +186,7 @@ impl App {
     pub(crate) fn refresh_active_index(&mut self) {
         self.active_index = self.saved_accounts.iter().position(|a| a.token == self.token_input);
     }
-    /// Имя для показа: username, если известен, иначе замаскированный токен.
+    /// Display name: username if known, otherwise the masked token.
     pub(crate) fn account_label(&self, acc: &StoredAccount) -> String {
         if acc.username.is_empty() {
             self.mask_token(&acc.token)
@@ -229,7 +194,7 @@ impl App {
             acc.username.clone()
         }
     }
-    /// «изменён N мин назад» для файла хранилища, если он есть.
+    /// "modified N ago" text for the vault file, if present.
     pub(crate) fn vault_age_text(&self) -> Option<String> {
         let meta = std::fs::metadata(self.vault_path()).ok()?;
         let secs = meta.modified().ok()?.elapsed().ok()?.as_secs();
@@ -241,24 +206,18 @@ impl App {
             format!("изменён {} ч назад", secs / 3600)
         })
     }
-    /// Открыть хранилище паролем. Возвращает `Ok(None)` если всё чисто,
-    /// `Ok(Some(подсказка))` если пароль подошёл после угадывания пробелов,
-    /// `Err` если файл есть, а пароль не подошёл.
-    ///
-    /// Раньше здесь была ошибка: если аккаунтов в хранилище 0, но файл
-    /// существует, `load_accounts` возвращал пустой вектор и мы показывали
-    /// «Неверный пароль» даже с верным паролем.
+    /// Unlock the vault. `Ok(Some(hint))` if a whitespace-guessed variant matched.
+    /// An empty stored account list must still count as a successful unlock.
     pub(crate) fn unlock_vault(&mut self, password: &str) -> Result<Option<String>, String> {
         if password.is_empty() {
             return Err("Введите пароль хранилища".to_string());
         }
-        // Замок берём до чтения файла: пока он у нас, второй экземпляр не
-        // откроет то же хранилище и не начнёт писать поверх.
+        // Take the lock before reading so no second instance can write over it.
         self.acquire_vault_lock()?;
         let content = match std::fs::read_to_string(self.vault_path()) {
             Ok(s) => s,
             Err(_) => {
-                // Файла нет — это первый вход, создаём новое хранилище.
+                // No file: first run, create a new vault.
                 self.saved_accounts = Vec::new();
                 self.master_password = password.to_string();
                 self.accounts_unlocked = true;
@@ -268,10 +227,8 @@ impl App {
             }
         };
 
-        // Старый открытый формат: пароля в файле нет, поэтому «подошёл» любой
-        // ввод. Впускаем (данные и так открыты), но помечаем хранилище как
-        // требующее подтверждения: до него файл не перезаписывается, иначе
-        // опечатка в пароле молча закрыла бы хранилище не тем паролем.
+        // Legacy plaintext format: admit the data, but require confirmation before
+        // rewriting, or a mistyped password would silently lock the vault.
         if let Some(accounts) = Self::legacy_accounts(&content) {
             self.saved_accounts = accounts;
             self.master_password = password.to_string();
@@ -285,8 +242,7 @@ impl App {
             ));
         }
 
-        // Под пробелы/невидимые символы: их легко принести из буфера обмена
-        // или случайно нажать пробел, а потом не вспомнить.
+        // Try whitespace variants: they're easy to paste or press by accident.
         let variants = Self::password_variants(password);
         if let Some((idx, accounts)) = Self::try_variants(&content, &variants) {
             let candidate = variants[idx].clone();
@@ -307,13 +263,8 @@ impl App {
             self.vault_path().display()
         ))
     }
-    /// Набор вариантов пароля, которые пробуем: как ввёл, без окружающих
-    /// пробелов, и с лишним пробелом или переводом строки с любой стороны.
-    /// Ошибка в один символ — самая частая причина «неверного пароля».
-    ///
-    /// Считаются они не подряд, а одновременно — см. `try_variants`. Сам список
-    /// трогать нельзя: лишний пробел в пароле хранилища, с которым человек уже
-    /// работает, обязан продолжать подходить.
+    /// Password variants to try: as typed, trimmed, and with stray whitespace
+    /// on either side. The list is fixed; `try_variants` runs them in parallel.
     fn password_variants(password: &str) -> Vec<String> {
         let mut out = vec![password.to_string()];
         let trimmed = password.trim();
@@ -326,27 +277,10 @@ impl App {
         }
         out
     }
-    /// Подобрать вариант пароля по содержимому файла.
-    ///
-    /// Каждый вариант — это отдельный ключ, то есть 100 000 итераций PBKDF2:
-    /// на этой машине 8.6 мс, на слабом компьютере в разы больше. Варианты
-    /// считали подряд, и неверный пароль — а это самый частый случай неудачного
-    /// входа — стоил восьми таких вычислений подряд: 71 мс здесь и сотни
-    /// миллисекунд на слабом компьютере, всё это время в потоке интерфейса, где
-    /// окно не отвечает. Повторялось на каждое нажатие «Войти».
-    ///
-    /// Теперь первый вариант — как ввёл — считается на месте (в подавляющем
-    /// большинстве случаев он и есть верный, и потоки не нужны вовсе), а
-    /// остальные разом, каждый в своём потоке: варианты друг от друга не
-    /// зависят, и ждать приходится самый долгий, а не сумму. Работы столько же,
-    /// но окно отвечает.
-    ///
-    /// Дёшево отвергнуть варианты нельзя: что-нибудь вроде быстрого хеша пароля
-    /// рядом с данными превратило бы файл в то, что перебирается со скоростью
-    /// SHA-256 вместо PBKDF2. Пусть лучше подождёт.
-    ///
-    /// Возвращает номер подошедшего варианта: он нужен, чтобы положить в
-    /// хранилище именно тот пароль, которым файл на самом деле открылся.
+    /// Find the password variant that matches the file contents.
+    /// The first (as-typed) variant is tried inline; the rest run in parallel,
+    /// since each costs a full PBKDF2 pass and a wrong password is common.
+    /// Returns the matching variant index so the exact password is stored.
     fn try_variants(content: &str, variants: &[String]) -> Option<(usize, Vec<StoredAccount>)> {
         #[cfg(test)]
         set_last_search_width(0);
@@ -368,8 +302,7 @@ impl App {
                 .collect();
             #[cfg(test)]
             set_last_search_width(handles.len());
-            // Из подошедших берём вариант с наименьшим номером, иначе выбор
-            // зависел бы от того, кто из потоков успел раньше.
+            // Take the lowest-index match so the result doesn't depend on thread timing.
             let mut best: Option<(usize, Vec<StoredAccount>)> = None;
             for handle in handles {
                 if let Ok(Some(found)) = handle.join() {
@@ -381,11 +314,8 @@ impl App {
             best
         })
     }
-    /// Закрепить пароль за старым открытым хранилищем.
-    ///
-    /// Вызывается только по явному нажатию: до него файл не перезаписывается
-    /// (см. `save_accounts`), потому что пароль в старом формате никак не
-    /// проверялся и опечатка в нём закрыла бы хранилище не тем паролем молча.
+    /// Pin the password to a legacy plaintext vault.
+    /// Only called on explicit confirmation; until then the file isn't rewritten.
     pub(crate) fn confirm_legacy_migration(&mut self) {
         if !self.vault_legacy {
             return;
@@ -394,7 +324,7 @@ impl App {
         let pw = self.master_password.clone();
         self.save_accounts(&pw);
     }
-    /// ЛКМ по аккаунту в нижней ленте: выбрать его и спросить пароль.
+    /// Left-click an account in the bottom bar: select it and ask for the password.
     pub(crate) fn select_account(&mut self, token: String) {
         self.login_selected = Some(token);
         self.status.clear();
@@ -409,8 +339,8 @@ impl App {
         self.login_password.clear();
         self.status.clear();
     }
-    /// Войти в сохранённый аккаунт: пароль должен открыть хранилище,
-    /// а токен — лежать в нём.
+    /// Log into a saved account: the password must unlock the vault and the
+    /// token must be stored in it.
     pub(crate) fn login_with_password(&mut self, token: &str) {
         let pw = self.login_password.clone();
         self.login_notice.clear();
@@ -429,8 +359,7 @@ impl App {
             self.status = "Аккаунт не найден в хранилище".to_string();
             return;
         }
-        // Как и при входе по токену: убираем выбор, чтобы при возврате на
-        // экран входа показывалась обычная форма, а не форма аккаунта.
+        // Clear the selection so returning to the login screen shows the plain form.
         self.login_selected = None;
         self.login_password.clear();
         self.switch_account(token.to_string());
@@ -447,23 +376,19 @@ mod mask_tests {
         App::new(rx)
     }
 
-    /// Токен берётся из поля ввода, а маска резала строку по БАЙТАМ:
-    /// `&token[..4]` и `&token[token.len() - 4..]`. Одна русская буква (2
-    /// байта) сдвигает границу, и клиент падал с «byte index is not a char
-    /// boundary». Падение происходило при клике на аккаунт, то есть
-    /// достаточно было вставить токен с опечаткой и не заметить.
+    /// The mask used to slice by bytes and panicked on multi-byte tokens.
     #[test]
     fn mask_survives_non_ascii_token() {
         let a = app();
         let tokens = [
-            "MTIzNDU2Nzg5MDEyMzQ1Njc4",       // обычный ASCII
-            "ёаbсдеёфгhijклм",                   // кириллица в начале и в середине
-            "abcdefghijКЛМНОП",                  // кириллица в конце
-            "ЁЖЗИЙКЛМНОПРСТ",                    // только кириллица
+            "MTIzNDU2Nzg5MDEyMzQ1Njc4",       // plain ASCII
+            "ёаbсдеёфгhijклм",                   // Cyrillic at the start and middle
+            "abcdefghijКЛМНОП",                  // Cyrillic at the end
+            "ЁЖЗИЙКЛМНОПРСТ",                    // Cyrillic only
             "токен-с-русскими-буквами-1234",
-            // Три байта в начале: граница 4 байта попадает внутрь символа.
+            // Three bytes at the start: the 4-byte boundary lands inside a char.
             "abc☺defghij",
-            // Трёхбайтовые символы в конце: граница len-4 тоже попадает внутрь.
+            // Three-byte chars at the end: the len-4 boundary lands inside one too.
             "abcdefghабв",
         ];
         for t in tokens {
@@ -479,14 +404,12 @@ mod mask_tests {
             };
             assert_eq!(a.mask_token(t), expected, "токен {t:?}");
         }
-        // Короткий токен не показываем ни в каком виде, даже с русскими
-        // буквами: маскировать нечего, а длина в символах, не в байтах.
+        // Short tokens are never shown, even with Cyrillic; length counts chars, not bytes.
         assert_eq!(a.mask_token("ёжик"), "••••••••");
         assert_eq!(a.mask_token(""), "••••••••");
     }
 
-    /// То же через подпись аккаунта — это то место, где паника случалась на
-    /// настоящем клике пользователя.
+    /// Same check through the account label, where the panic hit a real click.
     #[test]
     fn account_label_survives_non_ascii_token() {
         let a = app();
@@ -496,8 +419,7 @@ mod mask_tests {
         };
         let label = a.account_label(&acc);
         assert!(label.contains('…'), "подпись должна быть замаскирована: {label:?}");
-        // С известным именем токен не показывается вовсе — и это тоже должно
-        // быть безопасно.
+        // With a known username the token isn't shown at all; that must be safe too.
         let named = StoredAccount {
             token: "ёаbсдеёфгhijклм".to_string(),
             username: "Вася".to_string(),
@@ -506,29 +428,19 @@ mod mask_tests {
     }
 }
 
-/// Замок на тесты, которые много считают ключи.
-///
-/// Перебор вариантов пароля — это сотни тысяч итераций PBKDF2 на вариант, и
-/// тесты идут параллельно. Без замка тяжёлые тесты мешают друг другу.
+/// Serializes key-heavy tests; parallel password sweeps would interfere.
 #[cfg(test)]
 pub(crate) static VAULT_COST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-// Сколько потоков поднял перебор вариантов пароля в последний раз — только для
-// тестов. Потоковый, а не общий: тесты идут параллельно, и общий счётчик
-// показывал бы чужой перебор — тогда проверка верного пароля падала бы из-за
-// соседнего теста. Значение ставит тот поток, который вызвал `try_variants`,
-// поэтому потокового и достаточно.
+// Thread count of the last password sweep, for tests. Thread-local so parallel
+// tests don't observe each other's sweeps.
 #[cfg(test)]
 thread_local! {
     static LAST_SEARCH_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Сколько потоков поднял перебор вариантов пароля в последний раз.
-///
-/// По секундомеру параллельность проверить нельзя: на загруженной машине
-/// (а машина разработчика вполне может быть занята игрой) запас между
-/// последовательным перебором и параллельным слишком мал, и проверка мигала бы
-/// то так, то этак. Счётчик потоков отвечает на тот же вопрос точно.
+/// Thread count of the last password sweep.
+/// Counts threads instead of timing, since wall-clock deltas are too noisy.
 #[cfg(test)]
 pub(crate) fn last_search_width() -> usize {
     LAST_SEARCH_WIDTH.with(|n| n.get())
@@ -545,7 +457,7 @@ mod vault_cost_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
-    /// Каждый тест хранилища — свой файл: тесты идут параллельно.
+    /// Each vault test uses its own file since tests run in parallel.
     static TAG: AtomicU64 = AtomicU64::new(0);
 
     fn vaulted() -> (App, std::path::PathBuf) {
@@ -559,8 +471,7 @@ mod vault_cost_tests {
         (app, p)
     }
 
-    /// Перебрать варианты подряд — ровно как было. Нужен как эталон для
-    /// проверки, что перебор действительно распараллелен.
+    /// Sequential variant sweep, as a baseline to check the parallel one.
     fn sweep_sequentially(content: &str, variants: &[String]) -> Option<(usize, Vec<StoredAccount>)> {
         for (i, candidate) in variants.iter().enumerate() {
             if let Some(accounts) = App::load_accounts_with(content, candidate) {
@@ -570,18 +481,8 @@ mod vault_cost_tests {
         None
     }
 
-    /// Неверный пароль не должен заставлять ждать все варианты подряд.
-    ///
-    /// Сценарий самый частый: человек ошибся в пароле хранилища. Каждый
-    /// вариант — отдельный ключ, то есть 100 000 итераций PBKDF2 (здесь 8.6 мс,
-    /// на слабом компьютере в разы больше), а вариантов восемь. Считали их
-    /// подряд, и всё это время окно интерфейса не отвечало — 71 мс на этой
-    /// машине и сотни миллисекунд на слабом, на каждое нажатие «Войти».
-    ///
-    /// Проверяем не по секундомеру, а по числу поднятых потоков: время на
-    /// загруженной машине шумит так, что запас между последовательным и
-    /// параллельным перебором уходит в разброс. Потоки же говорят прямо:
-    /// варианты считаются разом.
+    /// A wrong password must search all variants in parallel, not sequentially.
+    /// Verified by thread count rather than timing.
     #[test]
     fn wrong_password_searches_the_variants_in_parallel() {
         let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -604,8 +505,7 @@ mod vault_cost_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Верный пароль — самый частый случай — не должен поднимать ни одного
-    /// потока: он подходит с первого варианта, и лишняя работа тут не нужна.
+    /// A correct password (the common case) must spawn no threads.
     #[test]
     fn correct_password_needs_no_threads() {
         let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -620,12 +520,7 @@ mod vault_cost_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Повторное добавление уже сохранённого аккаунта не должно
-    /// перешифровывать хранилище: это лишние 100 000 итераций PBKDF2 на вход.
-    ///
-    /// Раньше `add_saved_account` звал `save_accounts` безусловно, поэтому вход
-    /// в уже сохранённый аккаунт стоил второго полного прогона PBKDF2 (после
-    /// `unlock_vault`) — только чтобы записать в файл то же самое.
+    /// Re-adding an existing account must not re-encrypt the vault.
     #[test]
     fn adding_an_existing_account_does_not_rewrite_the_vault() {
         let _guard = super::VAULT_COST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -638,7 +533,7 @@ mod vault_cost_tests {
         app.save_accounts("правильный");
         let before = std::fs::read_to_string(&tmp).expect("файл хранилища не записался");
 
-        // Вход в уже сохранённый аккаунт: имя пустое, менять нечего.
+        // Logging into an existing account: empty name, nothing to change.
         app.add_saved_account("токен", "");
 
         let after = std::fs::read_to_string(&tmp).unwrap();
@@ -649,10 +544,7 @@ mod vault_cost_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Перебор не должен терять то, ради чего он и есть: пароль хранилища с
-    /// лишним пробелом должен открываться по обрезанному варианту, а с
-    /// пробелом спереди — по варианту «пробел + как ввёл», который теперь
-    /// считается не первым, а в отдельном потоке.
+    /// Stray whitespace in the stored password must still open the vault.
     #[test]
     fn stray_whitespace_still_opens_the_vault() {
         for saved in ["правильный", "правильный ", " правильный", "правильный\n"] {
@@ -676,9 +568,7 @@ mod vault_cost_tests {
         }
     }
 
-    /// Введённый с пробелами пароль обязан подойти: человек лишний раз нажал
-    /// пробел, а хранилище должно открыться, а не отшивать его «неверным
-    /// паролем».
+    /// A password typed with extra spaces must still open the vault.
     #[test]
     fn typed_with_spaces_opens_the_vault() {
         let (mut app, tmp) = vaulted();
@@ -689,10 +579,7 @@ mod vault_cost_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Перебор состоит из семи-восьми вариантов: обрезанный добавляется только
-    /// когда он отличается от введённого. Сокращать список нельзя: лишний
-    /// пробел в пароле, с которым человек уже работает, обязан продолжать
-    /// подходить.
+    /// Sweep has 7-8 variants; the trimmed one is added only when it differs.
     #[test]
     fn variants_keep_the_whitespace_guesses() {
         let variants = App::password_variants("пароль");
@@ -701,15 +588,14 @@ mod vault_cost_tests {
             variants,
             vec!["пароль", "пароль ", " пароль", "пароль\n", "\nпароль", "пароль\r\n", "\r\nпароль"]
         );
-        // С пробелами по краям добавляется обрезанный вариант.
+        // With surrounding spaces, the trimmed variant is added.
         let padded = App::password_variants(" пароль ");
         assert_eq!(padded[1], "пароль", "обрезанный идёт вторым");
         assert_eq!(padded.len(), variants.len() + 1);
     }
 }
 
-/// Старый открытый формат хранилища: пароля в файле нет, и это не значит, что
-/// «подошёл любой пароль».
+/// Legacy plaintext vault: no password in the file, so any input isn't a match.
 #[cfg(test)]
 mod legacy_vault_tests {
     use super::*;
@@ -718,7 +604,7 @@ mod legacy_vault_tests {
 
     static TAG: AtomicU64 = AtomicU64::new(0);
 
-    /// Экземпляр клиента со своим файлом хранилища: тесты идут параллельно.
+    /// A client instance with its own vault file since tests run in parallel.
     fn app_with_file(contents: Option<&str>) -> (App, std::path::PathBuf) {
         let tag = TAG.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
@@ -733,19 +619,13 @@ mod legacy_vault_tests {
         (app, p)
     }
 
-    /// Содержимое старого формата: обычный список без шифрования.
+    /// Legacy format contents: a plain unencrypted list.
     fn legacy_contents() -> String {
         let accounts = vec![StoredAccount { token: "старый-токен".into(), username: "вася".into() }];
         serde_json::to_string(&accounts).unwrap()
     }
 
-    /// Открытый список — это не «пароль подошёл».
-    ///
-    /// Раньше `load_accounts_with` разбирал его до всякой проверки пароля и
-    /// отдавал аккаунты. Дальше `unlock_vault` запоминал введённый пароль как
-    /// пароль хранилища, и первая же запись перешифровывала файл этим паролем:
-    /// опечатка при вводе — и доступ к своим аккаунтам потерян молча, без
-    /// всякого «миграция старого формата».
+    /// A plaintext list must not be treated as a password match.
     #[test]
     fn plaintext_list_is_not_a_password_check() {
         let contents = legacy_contents();
@@ -755,13 +635,12 @@ mod legacy_vault_tests {
                 "открытый список не должен открываться паролем {password:?}: пароля в нём нет"
             );
         }
-        // Но разобрать его как старый формат можно — и это отдельный ответ.
+        // But it can be parsed as legacy format, which is a separate answer.
         assert_eq!(App::legacy_accounts(&contents).map(|a| a.len()), Some(1));
         assert!(App::legacy_accounts("{\"salt\":\"x\"}").is_none());
     }
 
-    /// До подтверждения старый файл не перезаписывается: иначе опечатка в
-    /// пароле молча закрыла бы хранилище не тем паролем.
+    /// A legacy file isn't rewritten before confirmation.
     #[test]
     fn legacy_vault_is_not_rewritten_before_confirmation() {
         let contents = legacy_contents();
@@ -772,7 +651,7 @@ mod legacy_vault_tests {
         assert!(app.vault_legacy, "хранилище должно быть помечено как требующее подтверждения");
         assert_eq!(app.saved_accounts.len(), 1, "аккаунты из старого файла должны быть видны");
 
-        // Любая обычная запись (добавили аккаунт, обновили имя) файл не трогает.
+        // Ordinary writes (add account, update name) leave the legacy file alone.
         app.add_saved_account("новый-токен", "петя");
         app.save_accounts("опечатка");
         assert_eq!(
@@ -781,7 +660,7 @@ mod legacy_vault_tests {
             "старый открытый файл нельзя перешифровывать, пока пароль не подтверждён"
         );
 
-        // Явное подтверждение — и файл переезжает в зашифрованный формат.
+        // Explicit confirmation migrates the file to the encrypted format.
         app.confirm_legacy_migration();
         assert!(!app.vault_legacy, "после подтверждения ждать больше нечего");
         let after = std::fs::read_to_string(&tmp).unwrap();
@@ -795,8 +674,7 @@ mod legacy_vault_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Обычное зашифрованное хранилище миграция не задевает: флаг не встаёт, и
-    /// запись идёт как раньше.
+    /// An encrypted vault is untouched by the legacy path.
     #[test]
     fn encrypted_vault_is_untouched_by_the_legacy_path() {
         let (mut app, tmp) = app_with_file(None);
@@ -815,8 +693,7 @@ mod legacy_vault_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Неверный пароль к зашифрованному файлу по-прежнему отклоняется, и это не
-    /// путается со старым форматом.
+    /// A wrong password on an encrypted file is still rejected, not misread as legacy.
     #[test]
     fn encrypted_vault_still_rejects_a_wrong_password() {
         let (mut app, tmp) = app_with_file(None);
@@ -836,7 +713,7 @@ mod vault_write_tests {
 
     static TAG: AtomicU64 = AtomicU64::new(0);
 
-    /// Свой файл на каждый тест: тесты идут параллельно.
+    /// Own file per test since tests run in parallel.
     fn vaulted() -> (App, std::path::PathBuf) {
         let tag = TAG.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
@@ -853,9 +730,7 @@ mod vault_write_tests {
         app.saved_accounts = vec![StoredAccount { token: "секрет".into(), username: "вася".into() }];
     }
 
-    /// Файл хранилища не должен быть доступен никому, кроме владельца: внутри
-    /// токены. Раньше `std::fs::write` создавал его с обычными правами (0644
-    /// под umask), и содержимое читал любой пользователь машины.
+    /// The vault file must be owner-only since it holds tokens.
     #[cfg(unix)]
     #[test]
     fn vault_file_is_private() {
@@ -876,8 +751,7 @@ mod vault_write_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Если запись не удалась, UI обязан сказать, а не делать вид, что
-    /// сохранил. Родителя нет — временный файл создать нельзя.
+    /// A failed write must surface in the status, not silently pretend success.
     #[test]
     fn vault_write_error_is_reported_in_status() {
         let (mut app, tmp) = vaulted();
@@ -896,9 +770,7 @@ mod vault_write_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    /// Отдельно — замена файла: временный файл записался, а `rename` не прошёл
-    /// (на месте хранилища уже каталог). Раньше эта ошибка глоталась через
-    /// `let _`, и о неудаче никто не узнавал.
+    /// A failed rename (a directory at the vault path) must also be reported.
     #[test]
     fn vault_rename_error_is_reported_and_tmp_is_cleaned() {
         let (mut app, dir) = vaulted();
@@ -918,7 +790,7 @@ mod vault_write_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Ещё один экземпляр клиента, смотрящий в тот же файл хранилища.
+    /// Another client instance pointing at the same vault file.
     fn app_at(path: &std::path::Path) -> App {
         let (_, rx) = mpsc::unbounded_channel();
         let mut app = App::new(rx);
@@ -926,9 +798,8 @@ mod vault_write_tests {
         app
     }
 
-    /// Второй экземпляр не должен открывать то же хранилище: иначе два гейтвея
-    /// работают с одним аккаунтом и перетирают записи. Замок берётся на всю
-    /// сессию, поэтому после закрытия первого экземпляра он освобождается.
+    /// A second instance must not open the same vault, or two gateways clobber
+    /// one account's writes; the lock releases when the first instance drops.
     #[test]
     fn second_instance_cannot_open_the_same_vault() {
         let (mut first, tmp) = vaulted();
@@ -948,7 +819,7 @@ mod vault_write_tests {
             "нужен понятный отказ, а не {err:?}"
         );
 
-        // Первый экземпляр закрылся — замок освобождён, вход снова возможен.
+        // First instance dropped, lock released, access possible again.
         drop(first);
         let mut third = app_at(&tmp);
         assert!(

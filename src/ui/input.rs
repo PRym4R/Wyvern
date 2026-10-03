@@ -6,61 +6,31 @@ use crate::messages::ToGateway;
 use crate::models::{ChatChannel, ChatMessage, LOCAL_ID_PREFIX};
 use crate::ui::ERROR_RED;
 
-/// Префикс отладочных команд. Всё, что не начинается с него, — обычный текст
-/// для канала, даже если похоже на команду.
-///
-/// Раньше отладочные команды висели прямо в поле сообщения: `/quit` закрывал
-/// клиент (то есть пользователь, который хотел написать в канал «/quit»,
-/// терял окно без предупреждения), а `/add <id>` молча создавал канал, которого
-/// нет ни в одном списке и который тем не менее открывался.
+/// Debug-command prefix; anything else is plain channel text, even if command-like.
 const DEBUG_PREFIX: &str = "/debug ";
-/// Сколько ждёт подтверждения, прежде чем команда забудется.
+/// How long a command waits for confirmation before being forgotten.
 const DEBUG_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Уже́с самой узкой полосы под поле ввода. Меньше не полезно ни печатать, ни
-/// читать, но вернуться к нулю поле тоже не должно.
+/// Narrowest usable input-field width; it must not collapse to zero.
 const MIN_INPUT_WIDTH: f32 = 60.0;
-/// Сколько места в строке ввода уходит на отступ, название канала, кнопку
-/// «Send» и зазоры.
+/// Row space taken by padding, channel name, "Send" button and gaps.
 const INPUT_CHROME: f32 = 110.0;
-/// Ширина места под счётчик «n/2000» перед полем.
-///
-/// Место держим всегда, даже когда счётчика не видно: иначе поле ввода
-/// прыгает по ширине на первом же набранном (или стёртом) символе.
+/// Width reserved for the "n/2000" counter; always kept so the field doesn't jump.
 const COUNTER_WIDTH: f32 = 60.0;
-/// Лимит Discord на длину сообщения в символах Unicode.
-///
-/// Именно символы, а не байты: 2000 кириллических букв весят 4000 байт, но
-/// Discord их принимает. Считаем кодпоинты, как и он.
+/// Discord message-length limit in Unicode characters (code points, not bytes).
 pub(crate) const MAX_MESSAGE_CHARS: usize = 2000;
 
-/// Помещается ли текст в лимит Discord.
-///
-/// Сообщение длиннее лимита Discord отвергает кодом 400, а клиент потом
-/// показывает его в чате как отправленное и не убирает — человек думает, что
-/// всё в порядке. Поэтому проверяем ДО отправки.
+/// Whether text fits Discord's limit; checked before sending.
 pub(crate) fn within_message_limit(text: &str) -> bool {
     text.chars().count() <= MAX_MESSAGE_CHARS
 }
 
-/// Ширина поля ввода по свободному месту в строке.
-///
-/// Раньше здесь было голое `available_width() - 110`, и панель каналов могла
-/// оставить строке 28 пикселей: ширина уходила в минус, egui в релизной
-/// сборке тихо рисует такой прямоугольник пустым, и поле ввода просто
-/// исчезало — печатать можно, не видно ничего. Панели каналов теперь ограничена
-/// сверху, но и без неё отрицательной ширины быть не должно.
+/// Input-field width from the row's free space, clamped to a minimum.
 pub(crate) fn input_width(available: f32) -> f32 {
     (available - INPUT_CHROME).max(MIN_INPUT_WIDTH)
 }
 
-/// Обрезать пробелы и невидимые символы.
-///
-/// Обычный `trim()` не трогает неразрывный пробел, zero-width space и
-/// byte-order mark: они не относятся к `White_Space` по Unicode. А человек,
-/// у которого прилип невидимый символ с конца сообщения (буфер обмена,
-/// расширение браузера, автозамена), отправляет «пустое» сообщение и потом
-/// удивляется, откуда взялось сообщение из одного пробела.
+/// Trim whitespace plus invisible characters that plain `trim()` misses.
 pub(crate) fn trim_input(text: &str) -> &str {
     text.trim_matches(|c: char| {
         c.is_whitespace() || matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}' | '\u{2060}')
@@ -90,13 +60,7 @@ impl App {
                         ui.label(RichText::new("← select a channel on the left").italics()
                             .size(12.0).color(self.theme.text_secondary));
                     } else {
-                        // Счётчик «n/2000» показываем, только когда есть что
-                        // считать: «0/2000» на пустом поле ничего не сообщает
-                        // и выглядит как застывший индикатор. Место под него
-                        // при этом зарезервировано всегда, чтобы поле не
-                        // прыгало по ширине на первом же символе, а строка
-                        // считалась уже с учётом счётчика — длинное число не
-                        // вытолкнет кнопку Send за край.
+                        // Show the counter only when there is text; its space stays reserved.
                         let typed = trim_input(&self.input);
                         let count = typed.chars().count();
                         let fits = within_message_limit(typed);
@@ -122,16 +86,11 @@ impl App {
                                 .hint_text("Type a message and press Enter, or click Send...")
                                 .margin(egui::Margin::symmetric(12, 8)),
                         );
-                        // Т-9: любая правка поля снимает защиту от повторной
-                        // отправки того же текста зажатым Enter. Ставим это до
-                        // проверки Enter, чтобы набор и Enter в одном кадре не
-                        // блокировали друг друга.
+                        // Any edit clears the held-Enter resend guard; set before the Enter check.
                         if resp.changed() {
                             self.input_dirty = true;
                         }
-                        // Отправка заблокирована, пока текст не влезает в
-                        // лимит Discord: иначе он отвергнет сообщение кодом
-                        // 400, а в чате останется «отправленное» навсегда.
+                        // Block sending while text exceeds the limit, so Discord won't reject it.
                         let send_btn = ui.add_enabled(
                             fits,
                             egui::Button::new(RichText::new("Send").size(14.0).color(Color32::WHITE))
@@ -155,9 +114,7 @@ impl App {
             });
     }
     pub(crate) fn handle_input(&mut self, text: &str) {
-        // Отладочные команды — только под своим префиксом и только с
-        // подтверждением: добавлять канал, которого не видно в списках, одной
-        // опечаткой нельзя.
+        // Debug commands are prefix-gated and confirmed, so a typo can't add a hidden channel.
         if let Some(rest) = text.strip_prefix(DEBUG_PREFIX) {
             self.handle_debug_command(rest.trim());
             return;
@@ -165,16 +122,10 @@ impl App {
 
         if let Some(idx) = self.selected_channel {
             let cid = self.channels[idx].id.clone();
-            // Показываем своё сообщение сразу, не дожидаясь Discord. Настоящий
-            // id у него ещё нет, поэтому даём заведомо ненастоящий, помеченный
-            // префиксом: когда придёт MESSAGE_CREATE, клиент заменит эту
-            // строку на присланную, а не добавит вторую копию. Раньше id был
-            // пустой, проверка дубля по id его не видела, и каждое отправленное
-            // сообщение показывалось дважды.
+            // Optimistic echo with a fake local id; MESSAGE_CREATE replaces it by id.
             let local_id = format!("{}{}", LOCAL_ID_PREFIX, self.next_local_id);
             self.next_local_id += 1;
-            // Прежняя неудача погасла: пользователь пишет заново, значит
-            // сообщение о старом отказе уже не в тему.
+            // The user is typing again, so the old send error is stale.
             self.send_error = None;
             self.messages.entry(cid.clone()).or_default().push(std::sync::Arc::new(ChatMessage {
                 id: local_id.clone(),
@@ -193,17 +144,10 @@ impl App {
         }
     }
 
-    /// Enter или кнопка «Send»: отправляем, если есть что, и очищаем поле.
-    ///
-    /// Очистка стоит вне проверки «есть ли что отправить» намеренно. Раньше
-    /// она была внутри, и пробелы (или невидимые символы) оставались в поле
-    /// навсегда: следующий настоящий Enter выглядел как «ничего не
-    /// отправилось», хотя предыдущее сообщение ушло. Сбивает ровно в тот
-    /// момент, когда человек проверяет, дошло ли сообщение.
+    /// Enter or "Send": send if there's text, then always clear the field so whitespace doesn't linger.
     pub(crate) fn submit_input(&mut self) {
         let text = trim_input(&self.input).to_string();
-        // Слишком длинное не отправляем и поле не чистим: Discord отверг бы
-        // его кодом 400, а набранное потерялось бы. Пусть человек сократит.
+        // Too long: don't send and don't clear, so the text can be shortened.
         if !within_message_limit(&text) {
             self.push_debug(format!(
                 "Message over limit: {} chars > {}",
@@ -214,22 +158,14 @@ impl App {
         }
         if !text.is_empty() {
             self.handle_input(&text);
-            // Запоминаем, что ушло, и сбрасываем признак правки: повторная
-            // отправка того же текста без правок теперь блокируется (Т-9).
+            // Remember what was sent and clear the edit flag to block duplicate sends.
             self.last_submitted = Some(text);
             self.input_dirty = false;
         }
         self.input.clear();
     }
 
-    /// Enter: то же, что `submit_input`, но зажатая клавиша (автоповтор) не
-    /// должна слать одно и то же повторно.
-    ///
-    /// Текст, вернувшийся в поле после неудачной отправки, при зажатом Enter
-    /// уходил бы снова и снова: каждая попытка заканчивалась отказом, текст
-    /// возвращался, и в лог Discord летела пачка одинаковых сообщений. Пока
-    /// поле не изменили, повтор не отправляем — и НЕ чистим поле, иначе
-    /// человек потерял бы восстановленный текст.
+    /// Like `submit_input`, but held Enter (auto-repeat) must not resend the same text.
     pub(crate) fn submit_from_enter(&mut self) {
         let text = trim_input(&self.input).to_string();
         if !text.is_empty()
@@ -241,16 +177,14 @@ impl App {
         self.submit_input();
     }
 
-    /// Отладочная команда из поля сообщения. Первое нажатие только спрашивает
-    /// подтверждение: команда добавляет канал, которого нет ни в одном списке,
-    /// и ошибиться в id легко.
+    /// Debug command from the message field; the first press only asks for confirmation.
     fn handle_debug_command(&mut self, rest: &str) {
         if let Some(id) = rest.strip_prefix("add ").map(str::trim) {
             if id.is_empty() {
                 self.status = "нужен id канала: /debug add <id>".to_string();
                 return;
             }
-            // Повтор той же команды в пределах окна — подтверждение.
+            // Repeating the same command within the window confirms it.
             let confirmed = match &self.pending_debug_add {
                 Some((prev, when)) => prev == id && when.elapsed() < DEBUG_CONFIRM_WINDOW,
                 None => false,
@@ -269,8 +203,7 @@ impl App {
         self.push_debug(format!("Unknown debug command: {rest}"));
     }
 
-    /// Добавить канал напрямую, мимо списков Discord. Такой канал виден только
-    /// если знать его id, поэтому и нужен лишь для отладки.
+    /// Add a channel directly, bypassing Discord's lists; only reachable by id.
     fn add_debug_channel(&mut self, id: &str) {
         self.channels.push(ChatChannel {
             id: id.to_string(),
@@ -295,11 +228,7 @@ mod tests {
     use crate::app::App;
     use crate::models::ChatChannel;
 
-    /// Пробелы в поле не должны переживать отправку. Раньше очистка стояла
-    /// внутри «есть ли что отправить», поэтому `trim()` давал пустую строку,
-    /// очистки не происходило, и в поле навсегда оставалось «   ». Следующий
-    /// настоящий Enter после этого выглядит как «ничего не отправилось» —
-    /// а сообщение-то ушло.
+    /// Whitespace-only input must not survive submit: the field clears even when nothing is sent.
     #[test]
     fn whitespace_only_input_is_cleared_on_submit() {
         let (mut app, _ctx) = narrow_app();
@@ -318,8 +247,7 @@ mod tests {
         );
     }
 
-    /// Обычный текст отправляется без краевых пробелов, а поле после этого
-    /// пустое — иначе следующий Enter отправит пробелы вместо сообщения.
+    /// Plain text is sent trimmed, and the field is empty afterwards.
     #[test]
     fn submit_sends_trimmed_text_and_clears_the_field() {
         let (mut app, _ctx) = narrow_app();
@@ -329,25 +257,22 @@ mod tests {
 
         assert_eq!(app.input, "");
         assert_eq!(app.messages["c1"][0].content, "привет");
-        // Сразу после отправки поле чистое: второй Enter ничего не отправит.
+        // The field is clear right after sending, so a second Enter sends nothing.
         let sent_before = app.messages["c1"].len();
         app.submit_input();
         assert_eq!(app.messages["c1"].len(), sent_before, "пустое поле не должно ничего слать");
     }
 
-    /// Зажатый Enter не должен слать один и тот же текст пачками: после
-    /// неудачной отправки текст возвращается в поле, и автоповтор отправлял бы
-    /// его снова и снова. Пока поле не изменили, повтор игнорируется, а текст
-    /// из поля при этом не пропадает.
+    /// Held Enter must not resend the same text, while keeping the restored text in the field.
     #[test]
     fn held_enter_does_not_resend_restored_text() {
         let (mut app, _ctx) = narrow_app();
         app.input = "привет".to_string();
-        app.input_dirty = true; // пользователь набрал текст
+        app.input_dirty = true; // user typed text
         app.submit_from_enter();
         assert_eq!(app.messages["c1"].len(), 1, "первый Enter должен отправить");
 
-        // Неудачная отправка вернула тот же текст, клавиша всё ещё зажата.
+        // Failed send restored the same text; the key is still held.
         app.input = "привет".to_string();
         app.input_dirty = false;
         app.submit_from_enter();
@@ -358,14 +283,14 @@ mod tests {
         );
         assert_eq!(app.input, "привет", "заблокированный Enter не должен стирать поле");
 
-        // Пользователь поправил текст — отправка снова работает.
+        // The user edited the text, so sending works again.
         app.input = "привет!".to_string();
         app.input_dirty = true;
         app.submit_from_enter();
         assert_eq!(app.messages["c1"].len(), 2);
     }
 
-    /// Приложение с открытым каналом в самом узком поддерживаемом окне.
+    /// App with an open channel in the narrowest supported window.
     fn narrow_app() -> (App, egui::Context) {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(rx);
@@ -391,10 +316,7 @@ mod tests {
         }
     }
 
-    /// Ширина поля не должна уходить в минус ни при какой свободной ширине
-    /// строки. Отрицательный прямоугольник egui рисует пустым, то есть поле
-    /// исчезает, а панель каналов к тому же ещё и не вернуть обратно, пока не
-    /// расширишь окно.
+    /// Field width must never go negative: egui draws negative rects empty, hiding the field.
     #[test]
     fn input_width_never_goes_negative() {
         assert_eq!(input_width(0.0), MIN_INPUT_WIDTH);
@@ -407,23 +329,18 @@ mod tests {
         }
     }
 
-    /// Панель каналов растянута мышью на всё окно, как это делает пользователь:
-    /// поле ввода обязано остаться видимым. Раньше верхней границы у панели не
-    /// было, и на 700-пиксельном окне строка ввода получала 28 px, из которых
-    /// кнопка с отступами забирала больше, чем оставалось.
+    /// A mouse-stretched channel panel must still leave the input field visible.
     #[test]
     fn stretched_channel_panel_leaves_the_input_visible() {
         let (mut app, ctx) = narrow_app();
 
-        // Один кадр, чтобы egui записал состояние панели, затем подкладываем
-        // ему ту ширину, до которой пользователь может её растянуть.
+        // One frame records panel state, then drag to the widest the user can reach.
         let _ = ctx.run(frame(), |ctx| {
             app.draw_server_list(ctx);
             app.draw_channel_list(ctx);
             app.draw_input_bar(ctx);
         });
-        // Тянем правый край панели мышью вправо, как это делает пользователь.
-        // Край панели — это рельс серверов (72) плюс её собственная ширина.
+        // Drag the panel's right edge right; edge = server rail (72) + panel width.
         let edge = 72.0 + 240.0;
         let y = 300.0;
         for step in 0..24 {
@@ -481,9 +398,7 @@ mod tests {
         );
     }
 
-    /// Сообщение длиннее лимита Discord не должно уходить: Discord отвергнет
-    /// его кодом 400, а клиент покажет текст как отправленный и не уберёт.
-    /// Поле при этом не чистим, чтобы набранное можно было сократить.
+    /// Over-limit messages aren't sent and don't clear the field.
     #[test]
     fn over_limit_message_is_not_sent() {
         let (mut app, _ctx) = narrow_app();
@@ -500,14 +415,13 @@ mod tests {
             "заблокированная отправка не должна стирать набранное"
         );
 
-        // Ровно лимит — это ещё можно.
+        // Exactly at the limit is still allowed.
         app.input = "я".repeat(MAX_MESSAGE_CHARS);
         app.submit_input();
         assert_eq!(app.messages["c1"].len(), 1, "2000 символов должны отправляться");
         assert_eq!(app.input, "", "успешная отправка очищает поле");
 
-        // Лимит считается в символах Unicode, а не в байтах: 2000 кириллических
-        // букв — это 4000 байт, но Discord их принимает.
+        // The limit counts Unicode chars, not bytes.
         assert_eq!(
             "я".repeat(MAX_MESSAGE_CHARS).len(),
             MAX_MESSAGE_CHARS * 2,
@@ -515,8 +429,7 @@ mod tests {
         );
     }
 
-    /// На пустом поле счётчик «0/2000» не рисуется: он ничего не сообщает и
-    /// выглядит как застывший индикатор. Прежний код показывал его всегда.
+    /// The "0/2000" counter isn't drawn on an empty field.
     #[test]
     fn empty_input_has_no_character_counter() {
         let (mut app, ctx) = narrow_app();
@@ -527,8 +440,7 @@ mod tests {
         );
     }
 
-    /// Как только текст набран, счётчик появляется: именно он показывает,
-    /// сколько символов из лимита Discord уже занято.
+    /// Once text is typed, the counter shows how much of the limit is used.
     #[test]
     fn typed_input_shows_character_counter() {
         let (mut app, ctx) = narrow_app();
@@ -540,7 +452,7 @@ mod tests {
         );
     }
 
-    /// Найти в нарисованном кадре текст вида «n/2000».
+    /// Find "n/2000"-style text in the drawn frame.
     fn has_counter_text(out: &egui::FullOutput) -> bool {
         out.shapes.iter().any(|cs| match &cs.shape {
             egui::Shape::Text(t) => t.galley.text().contains("/2000"),

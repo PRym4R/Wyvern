@@ -4,17 +4,12 @@ use crate::app::App;
 use crate::messages::ToGateway;
 
 impl App {
-    /// Клик по кнопке «@»: только снимок выделения сервера и канала.
-    ///
-    /// Раньше здесь же переключался вид «Друзья / личные сообщения», то есть
-    /// подпись «домой» не соответствовала действию: нажал «домой», чтобы
-    /// вернуться к списку личных сообщений, а попал в «Друзей», и обратное
-    /// нажатие увело в третий экран.
+    /// Clicking "@": clears the server and channel selection only.
     pub(crate) fn go_home(&mut self) {
         self.selected_guild = None;
         self.selected_channel = None;
     }
-    /// Переключение вида в боковой панели: отдельная кнопка «Friends / DMs».
+    /// Toggle the sidebar view: separate "Friends / DMs" button.
     pub(crate) fn set_friends_view(&mut self, show_friends: bool) {
         self.show_friends = show_friends;
     }
@@ -42,13 +37,9 @@ impl App {
                 ui.separator();
                 ui.add_space(4.0);
 
-                // Список серверов уезжает из self на время отрисовки, чтобы не
-                // копировать его целиком каждый кадр (Т-4): на двухстах серверах
-                // это четыре тысячи копий `Guild` в секунду, в каждой по три
-                // `String`. Обратно список кладём сразу после прокрутки.
+                // Move the guild list out of self to avoid cloning it every frame.
                 let guilds = std::mem::take(&mut self.guilds);
-                // Только для тестов: сколько серверов осталось в self в момент
-                // отрисовки. Копия списка оставила бы его нетронутым (Т-4).
+                // Test-only probe: how many guilds were left in self during render.
                 #[cfg(test)]
                 {
                     self.probe_guilds_in_render = self.guilds.len();
@@ -85,8 +76,7 @@ impl App {
                         ui.add_space(6.0);
                     }
                 });
-                // Возвращаем список серверов на место: на время кадра он был
-                // у нас.
+                // Put the guild list back after the frame.
                 self.guilds = guilds;
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -119,13 +109,11 @@ impl App {
                         ui.add_space(4.0);
                         ui.separator();
                         let mut switch_to: Option<String> = None;
-                        // Идём по индексам, а не по копии списка аккаунтов:
-                        // копия на каждом кадре тащила в кучу ещё и все токены.
-                        // Токен копируется только у нажатой строки (Т-19).
+                        // Iterate by index; only the clicked row's token gets cloned.
                         let account_count = self.saved_accounts.len();
                         #[cfg(test)]
                         {
-                            // Только для тестов: сколько раз список склонировали.
+                            // Test-only probe: how many times the list was cloned.
                             self.probe_accounts_cloned = 0;
                         }
                         for i in 0..account_count {
@@ -164,13 +152,7 @@ impl App {
             .resizable(true)
             .default_width(240.0)
             .min_width(180.0)
-            // Верхней границы не было вовсе, и панель растягивалась мышью на
-            // всю ширину окна. В самом узком окне (минимум 700 px, минус рельс
-            // серверов — 628) на строку ввода оставалось 28 px, из которых
-            // кнопка «Send» и отступы забирали больше, чем оставалось: ширина
-            // поля уходила в минус. В релизной сборке поле схлопывалось в ноль
-            // и печатать было нечем, в отладочной egui паниковала на отрицательном
-            // прямоугольнике.
+            // Cap the panel width; otherwise it stretches to the window and crushes the input field.
             .max_width(360.0)
             .frame(egui::Frame::new().fill(self.theme.panel_bg));
         let resp = panel.show(ctx, |ui| {
@@ -178,10 +160,7 @@ impl App {
 
                 match self.selected_guild {
                     Some(guild_idx) => {
-                        // Гильдию берём по ссылке, а не копией: список каналов
-                        // перерисовывается 20 раз в секунду, и полная копия
-                        // `Guild` (три `String`) на кадр — лишние аллокации
-                        // (Т-19). Ссылка живёт только до сбора индексов каналов.
+                        // Borrow the guild by reference instead of cloning it each frame.
                         let Some(guild) = self.guilds.get(guild_idx) else {
                             self.selected_guild = None;
                             return;
@@ -192,10 +171,7 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
 
-                        // Собираем только индексы каналов гильдии, а не копии
-                        // самих каналов: список перерисовывается 20 раз в
-                        // секунду, и полное клонирование на кадр съедало
-                        // тысячи аллокаций.
+                        // Collect only channel indices, not channel clones, each frame.
                         let ch_idx: Vec<usize> = self.channels.iter()
                             .enumerate()
                             .filter(|(_, ch)| {
@@ -205,7 +181,7 @@ impl App {
                             .collect();
                         #[cfg(test)]
                         {
-                            // Только для тестов: сколько раз гильдию склонировали.
+                            // Test-only probe: how many times the guild was cloned.
                             self.probe_channel_guild_cloned = 0;
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -231,10 +207,7 @@ impl App {
                         });
                     }
                     None => {
-                        // Переключатель «Друзья / Личные сообщения». Раньше он
-                        // был спрятан в кнопке «@»: тот по клику сбрасывал
-                        // выделение сервера И переключал вид, так что два
-                        // нажатия «домой» уводили не туда, куда человек шёл.
+                        // "Friends / DMs" toggle, separate from the "@" home button.
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             for (label, want_friends) in [("Friends", true), ("DMs", false)] {
@@ -260,10 +233,7 @@ impl App {
                                 .size(12.0).color(self.theme.text_secondary));
                             ui.add_space(4.0);
                             ui.separator();
-                            // Список друзей и список DM перебираем по индексам и
-                            // копируем только нужные строки: раньше тут на
-                            // каждом кадре клонировался весь список целиком
-                            // (сотни аллокаций 20 раз в секунду).
+                            // Iterate by index; clone only the rows actually needed.
                             let friend_count = self.friends.len();
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 for i in 0..friend_count {
@@ -329,8 +299,7 @@ impl App {
                     }
                 }
             });
-        // Ширину панели запоминаем и пишем в лог только когда она изменилась:
-        // панель тянут мышью, и по этой строке видно, до чего её растянули.
+        // Remember and log the panel width only when it changes.
         let panel_w = resp.response.rect.width();
         if (panel_w - self.channel_panel_w).abs() > 0.5 {
             self.channel_panel_w = panel_w;
@@ -343,10 +312,7 @@ impl App {
 mod tests {
     use super::*;
 
-    /// Кнопка «@» подписана «домой»: клик должен только снимать выделение
-    /// сервера. Раньше она заодно переключала вид «Друзья / личные
-    /// сообщения», и человек, нажавший «домой» дважды подряд, оказывался
-    /// в другом экране, чем собирался.
+    /// The "@" home button only clears the server selection.
     #[test]
     fn home_button_only_drops_the_server_selection() {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -362,7 +328,7 @@ mod tests {
         assert!(!app.show_friends, "«@» не должен переключать вид «Друзья / личные сообщения»");
     }
 
-    /// Вид переключается отдельной кнопкой — и только им.
+    /// The view is toggled by its own dedicated button.
     #[test]
     fn friends_view_has_its_own_switch() {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -374,16 +340,11 @@ mod tests {
         assert!(app.show_friends);
         app.set_friends_view(false);
         assert!(!app.show_friends);
-        // Переключение вида не выкидывает пользователя из открытого канала.
+        // Toggling the view doesn't drop the open channel.
         assert_eq!(app.selected_channel, Some(1), "переключатель вида не должен сбрасывать выбор");
     }
 
-    /// Панель серверов не должна копировать список `guilds` на каждом кадре.
-    ///
-    /// Раньше отрисовка начиналась с `self.guilds.clone()` — на двухстах
-    /// серверах это тысячи копий `Guild` в секунду. Теперь список уезжает из
-    /// `self` на время кадра, и пробник фиксирует, что в момент отрисовки в
-    /// `self.guilds` пусто.
+    /// The server panel must not clone the guild list every frame.
     #[test]
     fn drawing_the_server_list_does_not_clone_the_guilds() {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -414,9 +375,7 @@ mod tests {
         assert_eq!(app.guilds.len(), 200, "список серверов должен вернуться на место");
     }
 
-    /// Панель аккаунтов не должна копировать весь список на каждом кадре:
-    /// копия тащила в кучу ещё и токены, а нужно всего лишь перебрать строки.
-    /// Пробник выставляется только в новом коде; на старом остаётся MAX.
+    /// The account switcher must not clone the whole account list every frame.
     #[test]
     fn drawing_the_account_switcher_does_not_clone_the_accounts() {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -437,7 +396,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
-        // Открываем выпадающий список аккаунтов, иначе он не рисуется.
+        // Open the account popup, otherwise it isn't drawn.
         ctx.memory_mut(|m| m.toggle_popup(egui::Id::new("account_switcher")));
         let _ = ctx.run(input, |ctx| app.draw_server_list(ctx));
 
@@ -449,8 +408,7 @@ mod tests {
         assert_eq!(app.saved_accounts.len(), 50, "список аккаунтов должен остаться на месте");
     }
 
-    /// Список каналов не должен копировать выбранную гильдию на каждом кадре:
-    /// от неё нужны только имя и id. Пробник выставляется только в новом коде.
+    /// The channel list must not clone the selected guild every frame.
     #[test]
     fn drawing_the_channel_list_does_not_clone_the_guild() {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();

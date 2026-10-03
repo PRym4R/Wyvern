@@ -9,48 +9,26 @@ use crate::models::{ImagePayload, LoadedImage};
 
 const CDN_BASE: &str = "https://cdn.discordapp.com";
 const MAX_CONCURRENT_AVATAR_DOWNLOADS: usize = 4;
-/// Сколько картинок качается одновременно. Без потолка канал с полсотней
-/// картинок порождает полсотню потоков, и все они одновременно держат в
-/// памяти декодированные пиксели — это сотни мегабайт на ровном месте.
+/// Caps concurrent image downloads so decoded pixels don't pile up in memory.
 const MAX_CONCURRENT_IMAGE_DOWNLOADS: usize = 3;
 static AVATAR_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// Большую картинку нет смысла хранить в полном разрешении: в чате она
-/// рисуется максимум 360x360, то есть даже на HiDPI-экране (2x) 768 пикселей
-/// хватает ровно. 1536 превращали одну фотку в 9 МБ текстуры.
+/// Chat renders images at most 360x360, so 768px covers even HiDPI (2x) screens.
 const MAX_IMAGE_DIM: u32 = 768;
-/// Гифка — это сразу много кадров, поэтому кадры мельче. 16 кадров по 448
-/// пикселей — это 9 МБ на анимацию вместо 28.
+/// GIFs hold many frames, so frames are smaller to stay within budget.
 const MAX_GIF_DIM: u32 = 448;
-/// До какого размера ужимаем кадр, если кадров очень много: лучше мыльная
-/// гифка целиком, чем красивая, обрывающаяся на середине.
+/// Floor for long GIFs: downscaled frames beat a truncated animation.
 const MIN_GIF_DIM: u32 = 64;
-/// Сколько памяти готовы отдать под кадры ОДНОЙ гифки. Раньше здесь стоял
-/// потолок в 16 кадров, и любая гифка длиннее шестнадцати «заканчивалась» на
-/// одном и том же месте. Считаем по памяти, а не по штукам: у гифок разное
-/// число кадров, а бюджет у клиента один.
+/// Memory budget for one GIF's frames; frame counts vary, so budget in bytes.
 const MAX_GIF_BYTES: usize = 32 * 1024 * 1024;
-/// Страховка от абсурдной гифки: по памяти такая может и пройти, но тысячи
-/// текстур — это уже перебор.
+/// Hard frame-count cap; thousands of textures are unacceptable.
 const MAX_GIF_FRAMES: usize = 2000;
-/// Сколько пикселей в исходной картинке мы готовы распаковать. В чате она
-/// всё равно ужимается до 768 px, но распаковка идёт по исходнику: Discord
-/// принимает картинки до 10000×10000, а это 400 МБ в один момент, и на
-/// трёх параллельных загрузках клиент на этом умирает. Обычное фото
-/// (12–24 Мпикс) проходит без проблем.
+/// Max source pixels to decode; decoding uses the original, not the display size.
 const MAX_SOURCE_PIXELS: u64 = 40_000_000;
-/// Сколько байт ответа вообще готовы принять. Распаковщик проверяет размер
-/// пикселей ПОСЛЕ чтения тела, а ссылку на картинку в эмбеде задаёт чужой
-/// сайт (models.rs) — он мог бы отдать гигабайты и занять память ещё до
-/// проверки. Потолок с запасом покрывает MAX_SOURCE_PIXELS пикселей даже в
-/// несжатом виде (4 байта на пиксель) плюс запас на контейнер.
+/// Cap on response bytes; pixel size is only checked after the body is read.
 const MAX_DOWNLOAD_BYTES: u64 = MAX_SOURCE_PIXELS * 8;
 
-/// Прочитать тело ответа, но не больше `max` байт.
-///
-/// `None` — тело больше лимита (или чтение сорвалось): распаковывать такое
-/// нельзя. Читаем по кускам через `Read::take`, поэтому лишнее не оседает в
-/// памяти целиком.
+/// Read the response body, at most `max` bytes; `None` if it exceeds that.
 fn read_limited(resp: reqwest::blocking::Response, max: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -61,19 +39,14 @@ fn read_limited(resp: reqwest::blocking::Response, max: u64) -> Option<Vec<u8>> 
     Some(buf)
 }
 
-/// Регистронезависимый поиск подстроки без создания новой строки.
-///
-/// `download_image` вызывается на каждом кадре для каждой видимой картинки, а
-/// раньше тут делался `url.to_lowercase()` — при двадцати картинках на экране
-/// это сотни аллокаций в секунду ради проверки «не аватарка ли это».
+/// Case-insensitive substring search without allocating a lowercased copy.
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     let h = haystack.as_bytes();
     let n = needle.as_bytes();
     !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
-/// это новый пул соединений и TLS-сессия на каждый запрос.
+/// One shared client; per-image clients would create a new pool and TLS session.
 fn http() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -85,7 +58,7 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
-/// Уменьшить картинку, если она заметно больше нужного.
+/// Shrink the image if it exceeds the target dimension.
 fn shrink(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
     if img.width() > max_dim || img.height() > max_dim {
         img.thumbnail(max_dim, max_dim)
@@ -94,14 +67,12 @@ fn shrink(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
     }
 }
 
-/// Помещается ли исходник такого размера в лимит: распаковка идёт по
-/// исходным пикселям, а не по тем, что останутся на экране.
+/// Whether the source dimensions fit the limit; decoding uses source pixels.
 pub(crate) fn source_size_allowed(w: u32, h: u32) -> bool {
     u64::from(w) * u64::from(h) <= MAX_SOURCE_PIXELS
 }
 
-/// Пропустить цепочку под-блоков GIF (длина + данные, пока не ноль) и вернуть
-/// позицию сразу за терминатором.
+/// Skip a GIF sub-block chain and return the position past its terminator.
 fn skip_gif_sub_blocks(bytes: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *bytes.get(pos)? as usize;
@@ -116,17 +87,13 @@ fn skip_gif_sub_blocks(bytes: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// Сколько кадров в GIF — по структуре файла, без распаковки пикселей.
-///
-/// Нужно заранее: по числу кадров выбирается их размер, чтобы все кадры
-/// влезли в `MAX_GIF_BYTES` и гифка играла целиком, а не обрывалась. Разбор
-/// идёт по блокам и стоит копейки: заголовок, глобальная таблица цветов,
-/// затем расширения (`0x21`), кадры (`0x2C`) и конец (`0x3B`).
+/// Count GIF frames from the file structure without decoding pixels.
+/// Needed up front to pick a frame size that keeps the whole GIF in budget.
 pub(crate) fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
     if bytes.len() < 13 || (&bytes[..6] != b"GIF89a" && &bytes[..6] != b"GIF87a") {
         return None;
     }
-    // Биты 0–2 упакованного поля — размер глобальной таблицы цветов (2^(n+1)).
+    // Bits 0–2 of the packed field encode the global color table size (2^(n+1)).
     let packed = bytes[10];
     let mut pos = 13usize;
     if packed & 0x80 != 0 {
@@ -135,14 +102,13 @@ pub(crate) fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
     let mut count = 0usize;
     while pos < bytes.len() {
         match bytes[pos] {
-            // Конец файла.
+            // End of file.
             0x3B => break,
-            // Расширение: 0x21 + метка + под-блоки.
+            // Extension: 0x21 + label + sub-blocks.
             0x21 => {
                 pos = skip_gif_sub_blocks(bytes, pos.checked_add(2)?)?;
             }
-            // Кадр: 0x2C + 9 байт дескриптора; за ним, возможно, локальная
-            // таблица цветов, размер кода LZW и сжатые данные.
+            // Frame: 0x2C + 9-byte descriptor, then optional local color table and LZW data.
             0x2C => {
                 count += 1;
                 if pos + 10 > bytes.len() {
@@ -153,27 +119,24 @@ pub(crate) fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
                 if ipacked & 0x80 != 0 {
                     pos = pos.checked_add(3usize * (1usize << ((ipacked & 0x07) + 1)))?;
                 }
-                pos = pos.checked_add(1)?; // размер минимального кода LZW
+                pos = pos.checked_add(1)?; // LZW minimum code size
                 pos = skip_gif_sub_blocks(bytes, pos)?;
             }
-            // Нулевой байт-заполнитель между блоками.
+            // Zero-byte padding between blocks.
             0x00 => pos += 1,
-            // Что-то незнакомое — считаем, что структуру не поняли.
+            // Unknown byte: treat the structure as not understood.
             _ => return None,
         }
     }
     Some(count)
 }
 
-/// Размер кадра, при котором все кадры гифки влезают в `MAX_GIF_BYTES`.
-///
-/// Типичная гифка на 30–60 кадров остаётся на `MAX_GIF_DIM`; очень длинную
-/// ужимаем сильнее, но она играет целиком.
+/// Frame dimension that keeps all a GIF's frames within `MAX_GIF_BYTES`.
 fn gif_frame_dim(frames: usize) -> u32 {
     let frames = frames.clamp(1, MAX_GIF_FRAMES);
     let per_frame = (MAX_GIF_BYTES / 4) / frames;
     let mut dim = (per_frame as f64).sqrt().floor() as u32;
-    // sqrt на целых может дать на пиксель больше, чем влезает; подстрахуемся.
+    // Integer sqrt may overshoot by a pixel; step down until it fits.
     while dim > MIN_GIF_DIM
         && (dim as usize) * (dim as usize) * 4 * frames > MAX_GIF_BYTES
     {
@@ -182,13 +145,7 @@ fn gif_frame_dim(frames: usize) -> u32 {
     dim.clamp(MIN_GIF_DIM, MAX_GIF_DIM)
 }
 
-/// Запомнить неудачу, не раздувая список.
-///
-/// При переполнении вытесняется ОДНА запись, а не весь список: полный сброс
-/// приходился ровно на момент, когда сбои пошли потоком (сеть легла, CDN
-/// отдал 429), и клиент тут же забывал всё, что уже признано нерабочим, и
-/// начинал качать это заново. Какую именно запись потерять — неважно; важно,
-/// что теряется одна, а не 512.
+/// Record a failure, evicting one entry on overflow rather than clearing all.
 fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) {
     if failed.len() >= MAX_FAILED_IMAGES {
         if let Some(victim) = failed.iter().next().cloned() {
@@ -198,14 +155,8 @@ fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) 
     failed.insert(key);
 }
 
-/// Занять место в лимите одновременных загрузок картинок. `false` — лимит
-/// исчерпан, тогда загрузку лучше отложить до следующего кадра (картинка
-/// попадёт в кэш и больше не будет качаться заново).
-///
-/// Счётчик трогаем только если слот реально достался: простое `fetch_add`
-/// с последующей проверкой увеличивало счётчик на единицу даже при отказе,
-/// и через несколько кадров он уезжал за любой предел навсегда — картинки
-/// переставали грузиться вообще.
+/// Reserve an image download slot; `false` means the limit is reached.
+/// Only increments the counter when a slot is actually granted.
 fn take_image_slot() -> bool {
     IMAGE_DOWNLOADS_IN_FLIGHT
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
@@ -219,15 +170,13 @@ fn take_image_slot() -> bool {
 }
 
 fn release_image_slot() {
-    // saturating: если счётчик когда-то уйдёт в ноль, лучше он останется
-    // нулём, чем завертится и больше не ограничит ничего.
+    // saturating: keep the counter at zero instead of wrapping around.
     let _ = IMAGE_DOWNLOADS_IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
         Some(v.saturating_sub(1))
     });
 }
 
-/// Слот, который освобождается сам — в том числе если поток упал на
-/// распаковке. Иначе падение в одном кадре тихо съедало слот навсегда.
+/// A slot that releases itself, even if the decoding thread panics.
 struct ImageSlot;
 
 impl Drop for ImageSlot {
@@ -236,15 +185,13 @@ impl Drop for ImageSlot {
     }
 }
 
-/// Ответ потока загрузки аватара. Различать надо: отказ CDN стоит запомнить,
-/// а занятость загрузочного слота — нет (слот освободится через мгновение, и
-/// запомнив «битый аватар», мы не показали бы его никогда).
+/// Avatar fetch result; a CDN failure is remembered, a busy slot is not.
 #[derive(Debug, PartialEq)]
 pub(crate) enum AvatarFetch {
     Ready(egui::ColorImage),
-    /// Не вышло: сеть, битый хеш, 404. Пробовать больше не надо.
+    /// Failed: network error, bad hash, or 404. Do not retry.
     Failed,
-    /// Мест в очереди загрузки не было. Повторить можно сразу же.
+    /// No free download slot; retry immediately.
     Busy,
 }
 
@@ -253,19 +200,8 @@ impl App {
         let url = format!("{}/avatars/{}/{}.png?size=64", CDN_BASE, user_id, avatar_hash);
         self.fetch_avatar(ctx, format!("{}_{}", user_id, avatar_hash), url)
     }
-    /// Забрать аватар или иконку сервера.
-    ///
-    /// Отказ запоминается: раньше его нигде не хранили, и список `pending`
-    /// очищался по ответу потока, поэтому на следующем же кадре ключ снова
-    /// не находился в кэше, не находился в списке загрузок — и порождался
-    /// новый поток с новым HTTP-запросом. Двадцать раз в секунду на каждый
-    /// невидимый аватар (удалённый аккаунт, битый хеш, 429 от CDN), а эти
-    /// запросы сами съедали лимит CDN, на который клиент упирался, и
-    /// порождали следующую волну.
-    ///
-    /// Отличать «не вышло» от «ещё не готово» нельзя было и раньше — оба
-    /// ответа это `None`. Теперь запоминаем ключ и больше не пробуем, пока
-    /// канал не откроется заново.
+    /// Fetch an avatar or guild icon.
+    /// Failures are remembered so a missing image isn't re-requested every frame.
     fn fetch_avatar(&mut self, ctx: &egui::Context, cache_key: String, url: String) -> Option<TextureHandle> {
         if let Some(tex) = self.avatar_cache.get(&cache_key) {
             return Some(tex.clone());
@@ -283,9 +219,7 @@ impl App {
             std::thread::spawn(move || {
                 if AVATAR_DOWNLOADS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_AVATAR_DOWNLOADS {
                     AVATAR_DOWNLOADS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-                    // Слоты заняты — это не «аватар битый», и запоминать такой
-                    // отказ нельзя: иначе аватар не появился бы никогда, хотя
-                    // слоты освободились бы уже на следующем кадре.
+                    // All slots busy isn't a real failure; don't remember it.
                     let _ = result_tx.send(AvatarFetch::Busy);
                     return;
                 }
@@ -310,17 +244,15 @@ impl App {
         });
 
         if let Ok(result) = pending.try_recv() {
-            // Запись убираем всегда: поток отработал, и держать мёртвый
-            // приёмник в таблице незачем. Дальше всё решает память об отказе.
+            // Always drop the entry: the thread finished; failure memory decides.
             self.pending_avatars.remove(&key);
             return self.store_avatar(ctx2, key, result);
         }
         None
     }
 
-    /// Принять ответ загрузки аватара. Отдельная функция, а не часть
-    /// `fetch_avatar`, потому что именно тут решается судьба отказа, и
-    /// проверять это правило нужно без похода в сеть.
+    /// Handle an avatar fetch result; split out so failure rules are testable
+    /// without the network.
     fn store_avatar(
         &mut self,
         ctx: egui::Context,
@@ -335,14 +267,11 @@ impl App {
                 Some(handle)
             }
             AvatarFetch::Failed => {
-                // Отказ по-настоящему: запоминаем ключ, иначе следующий кадр
-                // снова не найдёт его ни в кэше, ни в загрузках и породит новый
-                // поток с новым запросом (Б-18).
+                // Real failure: remember the key, else the next frame refetches.
                 remember_failed(&mut self.failed_avatars, key);
                 None
             }
-            // Занятость слота отказом не считается: слот освободится через
-            // мгновение, а запомнив ключ, мы не показали бы аватар никогда.
+            // A busy slot isn't a failure; remembering it would hide the avatar.
             AvatarFetch::Busy => None,
         }
     }
@@ -350,9 +279,7 @@ impl App {
         let url = format!("{}/icons/{}/{}.png?size=64", CDN_BASE, guild_id, icon_hash);
         self.fetch_avatar(ctx, format!("guild_icon_{}_{}", guild_id, icon_hash), url)
     }
-    /// Распаковать статичную картинку с ограничением по размеру. `Limits`
-    /// проверяется до выделения буфера пикселей, поэтому недопустимо
-    /// большая картинка отсекается, а не съедает память.
+    /// Decode a static image with size limits checked before pixel allocation.
     fn decode_static(bytes: &[u8]) -> Option<image::DynamicImage> {
         use image::ImageReader;
         let mut limits = image::Limits::default();
@@ -372,18 +299,13 @@ impl App {
     if is_gif {
         if let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) {
             use image::{AnimationDecoder, ImageDecoder};
-            // Холст проверяем до распаковки: у гифки на 500 кадров по
-            // 1000x1000 кадр — это 4 МБ, а все кадры разом (так было
-            // раньше, через collect_frames) — 2 ГБ.
+            // Check the canvas before decoding so frame pixels aren't allocated.
             let (cw, ch) = decoder.dimensions();
             if !source_size_allowed(cw, ch) {
                 return None;
             }
             let mut frames = decoder.into_frames();
-            // Размер кадра выбираем по числу кадров: длинную гифку ужимаем
-            // сильнее, но показываем целиком. Раньше потолок был по штукам,
-            // и любая гифка длиннее 16 кадров обрывалась на одном и том же
-            // месте — при живом оригинале в обычном Discord.
+            // Pick frame size by frame count so long GIFs shrink but play fully.
             let frame_dim = gif_frame_count(bytes)
                 .map(gif_frame_dim)
                 .unwrap_or(MAX_GIF_DIM);
@@ -408,8 +330,7 @@ impl App {
                 if fw == 0 || fh == 0 {
                     break;
                 }
-                // Подстраховка на случай, если число кадров по какой-то
-                // причине определено неверно: дальше бюджета не пускаем.
+                // Safety net if the frame count was wrong: stop at the budget.
                 let frame_bytes = fw as usize * fh as usize * 4;
                 if out.len() > 1 && bytes_used + frame_bytes > MAX_GIF_BYTES {
                     break;
@@ -422,8 +343,7 @@ impl App {
                 );
                 out.push((ci, secs.max(0.02) as f32));
             }
-            // Один кадр — это просто статичная картинка, её разберёт общий
-            // путь ниже.
+            // A single frame is a static image; the common path below decodes it.
             if out.len() > 1 {
                 return Some(ImagePayload::Animated { frames: out });
             }
@@ -462,8 +382,7 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         return None;
     }
 
-    // Не начинаем новую загрузку, если лимит уже выбран: лишний поток только
-    // зря съест память на декодирование. На следующем кадре попробуем снова.
+    // Skip new downloads when the limit is full; retry on a later frame.
     if !self.pending_images.contains_key(&cache_key) && !take_image_slot() {
         return None;
     }
@@ -472,7 +391,7 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let url_moved = url.to_string();
         std::thread::spawn(move || {
-            // Слот отпускается на любом выходе, включая падение.
+            // The slot is released on any exit, including a panic.
             let _slot = ImageSlot;
             if let Ok(resp) = http().get(&url_moved).send() {
                 if let Some(bytes) = read_limited(resp, MAX_DOWNLOAD_BYTES) {
@@ -496,11 +415,9 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
             self.pending_images.remove(&key);
             remember_failed(&mut self.failed_images, key);
         }
-        // Поток ещё работает — подождём следующего кадра.
+        // Thread still running; wait for the next frame.
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        // Поток умер, не ответив. Слот он уже отпустил сам (в том числе при
-        // падении), а запись из карты убираем, иначе картинка больше никогда
-        // не попробует скачаться, и память под этот ключ утекает.
+        // Thread died without replying; drop the entry to avoid a permanent leak.
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             self.pending_images.remove(&key);
         }
@@ -509,10 +426,8 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
     None
 }
 
-/// Превратить готовые пиксели в текстуры и положить в кэш.
-///
-/// Отдельно от `download_image`, потому что результат нужно уметь забрать и
-/// без отрисовки этой картинки: см. `reap_pending_images`.
+/// Turn decoded pixels into textures and store them in the cache.
+/// Separate from `download_image` so results can be reaped without rendering.
 fn store_image_payload(
     &mut self,
     ctx: &egui::Context,
@@ -564,19 +479,13 @@ fn store_image_payload(
     }
 }
 
-/// Забрать готовые загрузки, даже если их картинок сейчас не видно.
-///
-/// Раньше готовый результат забирался только при отрисовке этой картинки.
-/// Если картинка успевала прокрутиться за экран, её распакованные пиксели
-/// навсегда оставались в `pending_images`: загрузок одновременно мало, но
-/// каждая гифка — это мегабайты, и на длинном чате набегали сотни мегабайт.
-/// Забираем всё готовое в кэш, где память ограничена бюджетом и LRU.
+/// Reap finished downloads even for images no longer on screen.
+/// Otherwise decoded pixels linger in `pending_images`; the cache bounds memory.
 pub(crate) fn reap_pending_images(&mut self, ctx: &egui::Context) {
     if self.pending_images.is_empty() {
         return;
     }
-    // Забираем карту целиком, чтобы не копировать ключи на каждом кадре;
-    // незавершённые загрузки возвращаем на место.
+    // Take the whole map to avoid copying keys each frame; put unfinished back.
     for (key, rx) in std::mem::take(&mut self.pending_images) {
         match rx.try_recv() {
             Ok(Some(payload)) => {
@@ -599,8 +508,7 @@ mod tests {
     use super::*;
     use image::{ImageEncoder, Rgb, RgbImage, Rgba, RgbaImage};
 
-    /// Тесты, которые трогают счётчик загрузок, идут по очереди: он общий
-    /// на процесс, и параллельный прогон сломал бы проверки.
+    /// Serializes tests that touch the process-wide download counter.
     static SLOTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn plain_app() -> App {
@@ -608,8 +516,7 @@ mod tests {
         App::new(rx)
     }
 
-    /// Собрать настоящий GIF заданного размера и числа кадров — так же, как
-    /// его собрал бы Discord, чтобы проверять распаковку на живых данных.
+    /// Build a real GIF of the given size and frame count for decoding tests.
     fn encode_test_gif(w: u32, h: u32, n: usize) -> Vec<u8> {
         let mut out = Vec::new();
         {
@@ -628,14 +535,7 @@ mod tests {
         out
     }
 
-    /// Отказ по аватару не должен приводить к новому запросу на каждом кадре.
-    ///
-    /// Сценарий: аккаунт удалён, хеш битый или CDN отдал 429. Прежде ответ
-    /// потока означал только «не вышло», запись убиралась из списка загрузок —
-    /// и на следующем кадре ключ снова не находился ни в кэше, ни в загрузках,
-    /// поэтому порождался новый поток с новым HTTP-запросом. Двадцать раз в
-    /// секунду на каждый невидимый аватар, а эти запросы сами съедали лимит
-    /// CDN, на который клиент упирался, и порождали следующую волну отказов.
+    /// A failed avatar must not spawn a new request on every frame.
     #[test]
     fn failed_avatar_is_not_requested_again_on_every_frame() {
         let ctx = egui::Context::default();
@@ -644,14 +544,13 @@ mod tests {
         tx.send(AvatarFetch::Failed).unwrap();
         app.pending_avatars.insert("u1_deadbeef".into(), rx);
 
-        // Кадр, на котором поток отработал отказом: запись из загрузок ушла...
+        // Frame where the thread failed: the pending entry is gone...
         let answer = app.pending_avatars["u1_deadbeef"].try_recv();
         assert_eq!(answer, Ok(AvatarFetch::Failed));
         app.pending_avatars.remove("u1_deadbeef");
         assert!(app.store_avatar(ctx.clone(), "u1_deadbeef".into(), AvatarFetch::Failed).is_none());
 
-        // ...и больше нигде key не лежит: не в кэше, не в загрузках. Единственное,
-        // что остановит новый поток на следующем кадре, — память об отказе.
+        // ...and the key is nowhere; only the failure memory stops a new thread.
         assert!(app.avatar_cache.get("u1_deadbeef").is_none());
         assert!(!app.pending_avatars.contains_key("u1_deadbeef"));
         assert!(
@@ -661,9 +560,7 @@ mod tests {
         );
     }
 
-    /// Занятость загрузочного слота отказом считаться не должна. Если
-    /// запомнить и её, то аватар, не поместившийся в лимит однажды, не
-    /// появился бы уже никогда — а слот освобождается через мгновение.
+    /// A busy download slot must not be remembered as a failure.
     #[test]
     fn busy_avatar_slot_is_not_remembered_as_failure() {
         let ctx = egui::Context::default();
@@ -677,8 +574,7 @@ mod tests {
         assert!(!app.pending_avatars.contains_key("u1_cafe"));
     }
 
-    /// Успех должен класть текстуру в кэш: иначе следующий кадр запросил бы
-    /// тот же аватар заново, уже скачав его.
+    /// Success must cache the texture so the next frame doesn't refetch it.
     #[test]
     fn ready_avatar_goes_to_cache_and_is_forgotten_as_pending() {
         let ctx = egui::Context::default();
@@ -689,9 +585,7 @@ mod tests {
         assert!(!app.failed_avatars.contains("u1_ok"), "удавшийся аватар не в списке отказов");
     }
 
-    /// Иконки серверов берутся по тому же пути, значит и отказ у них должен
-    /// запоминаться. Раньше у аватарок и иконок не было ничего общего: две
-    /// копии одной и той же функции, и починка одной другой не касалась бы.
+    /// Guild icons use the same path, so their failures must be remembered too.
     #[test]
     fn guild_icon_failure_is_remembered_too() {
         let ctx = egui::Context::default();
@@ -705,9 +599,7 @@ mod tests {
         );
     }
 
-    /// Память об отказах не должна расти без предела: аватары приходят с
-    /// новыми хешами, и ключи никогда не повторяются. При достижении предела
-    /// вытесняется одна запись — старые ключи постепенно уходят.
+    /// Failure memory must stay bounded; avatar hashes never repeat.
     #[test]
     fn failed_avatars_are_bounded() {
         let ctx = egui::Context::default();
@@ -722,13 +614,11 @@ mod tests {
             "память об отказах выросла без предела: {}",
             app.failed_avatars.len()
         );
-        // Старые ключи постепенно вытесняются — но свежие запомнены.
+        // Old keys are evicted gradually, but recent ones are remembered.
         assert!(app.failed_avatars.len() > 0, "список отказов не должен опустеть");
     }
 
-    /// Переполнение памяти об отказах не должно стирать всё разом: иначе в
-    /// самый разгар массового сбоя (сеть легла, CDN отдал 429) клиент забывает
-    /// всё, что уже признано нерабочим, и начинает качать это заново.
+    /// Overflow must evict one entry, not clear everything during a failure storm.
     #[test]
     fn failed_avatars_are_evicted_one_by_one() {
         let ctx = egui::Context::default();
@@ -737,7 +627,7 @@ mod tests {
         for i in 0..max {
             app.store_avatar(ctx.clone(), format!("u{i}_h"), AvatarFetch::Failed);
         }
-        // Переполняем ровно на одну запись.
+        // Overflow by exactly one entry.
         app.store_avatar(ctx.clone(), "overflow_hash".into(), AvatarFetch::Failed);
 
         let survivors = (0..max)
@@ -749,9 +639,7 @@ mod tests {
         );
     }
 
-    /// «Это аватарка?» должно опознаваться независимо от регистра — как
-    /// раньше через `to_lowercase().contains(...)` — но без создания строки
-    /// на каждый кадр и каждую картинку.
+    /// Avatar URL detection must be case-insensitive without allocating per frame.
     #[test]
     fn avatar_url_detection_is_case_insensitive() {
         let is_avatar =
@@ -772,9 +660,7 @@ mod tests {
         assert!(!is_avatar("https://example.com/pic.png"), "обычная картинка — не аватарка");
     }
 
-    /// Отказ занять слот не должен увеличивать счётчик: иначе он уезжает
-    /// вверх на единицу за каждый отказ, за пару кадров уходит за любой
-    /// предел и картинки не грузятся больше никогда.
+    /// A refused slot must not increment the counter, or it drifts up forever.
     #[test]
     fn refused_download_does_not_eat_slot() {
         let _guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -790,12 +676,11 @@ mod tests {
         );
         release_image_slot();
         assert!(take_image_slot(), "освобождённый слот не вернулся");
-        // Тест не должен влиять на остальные: возвращаем счётчик в ноль.
+        // Don't affect other tests: reset the counter to zero.
         IMAGE_DOWNLOADS_IN_FLIGHT.store(0, Ordering::SeqCst);
     }
 
-    /// Локальный сервер, отдающий картинку с задержкой: видно, что загрузок
-    /// идёт больше, чем одновременных слотов.
+    /// Local server serving an image with a delay to test slot limiting.
     fn slow_png_server(bytes: Vec<u8>) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("не занять порт");
@@ -822,10 +707,7 @@ mod tests {
         addr
     }
 
-    /// Настоящий путь загрузки целиком: HTTP → распаковка → кэш. Картинок
-    /// специально больше, чем лимит одновременных загрузок: когда отказ
-    /// занимал слот, счётчик уезжал вверх и после первой тройки не
-    /// грузилось вообще ничего.
+    /// Full download path HTTP -> decode -> cache with more images than slots.
     #[test]
     fn more_images_than_slots_all_load() {
         let _guard = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -870,13 +752,7 @@ mod tests {
         );
     }
 
-    /// Готовая загрузка не должна висеть в очереди, если её картинку
-    /// прокрутили за экран и больше не рисуют.
-    ///
-    /// Раньше результат забирался только при отрисовке. Картинка, которую
-    /// успели пролистать, оставалась в `pending_images` вместе с
-    /// распакованными пикселями: загрузок одновременно мало, но каждая гифка
-    /// — это мегабайты, и на длинном чате набегали сотни мегабайт.
+    /// A finished download must be reaped even if its image was scrolled away.
     #[test]
     fn completed_download_for_scrolled_away_image_is_reaped() {
         let ctx = egui::Context::default();
@@ -890,7 +766,7 @@ mod tests {
         .unwrap();
         app.pending_images.insert(key.clone(), rx);
 
-        // Кадр, на котором эту картинку никто не рисует (канал не открыт).
+        // Frame where nothing draws this image (channel not open).
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -910,8 +786,7 @@ mod tests {
         );
     }
 
-    /// Большая картинка должна уменьшаться до лимита, иначе одна фотка
-    /// в 12 МБ съедает столько же VRAM/RAM.
+    /// Large images must be shrunk to the dimension limit.
     #[test]
     fn big_image_is_shrunk() {
         let img = RgbImage::from_pixel(3000, 2000, Rgb([10, 20, 30]));
@@ -928,7 +803,7 @@ mod tests {
                     "картинка не ужата: {:?}",
                     ci.size
                 );
-                // Пропорции сохранены.
+                // Aspect ratio preserved.
                 let ratio = ci.size[0] as f32 / ci.size[1] as f32;
                 assert!((ratio - 1.5).abs() < 0.05, "пропорции сломаны: {}", ratio);
                 eprintln!("[TEST] после ужатия: {:?}", ci.size);
@@ -937,7 +812,7 @@ mod tests {
         }
     }
 
-    /// Маленькую картинку трогать не надо.
+    /// Small images keep their size.
     #[test]
     fn small_image_keeps_size() {
         let img = RgbImage::new(64, 48);
@@ -951,12 +826,7 @@ mod tests {
         }
     }
 
-    /// Гифка играет все свои кадры, а не обрывается на середине.
-    ///
-    /// Раньше был жёсткий потолок в 16 кадров, и любая гифка длиннее
-    /// шестнадцати обрывалась на одном и том же месте, хотя оригинал в
-    /// Discord доигрывал до конца. Границей должна быть память, а не число
-    /// кадров: 30 кадров 240x160 — это меньше 5 МБ.
+    /// A GIF plays all its frames instead of truncating midway.
     #[test]
     fn gif_plays_all_its_frames() {
         let (w, h, n) = (240u32, 160u32, 30usize);
@@ -981,8 +851,7 @@ mod tests {
         }
     }
 
-    /// Длинная гифка ужимается, но доигрывает до последнего кадра и остаётся
-    /// в бюджете памяти.
+    /// A long GIF is downscaled but still plays fully within the memory budget.
     #[test]
     fn long_gif_is_downscaled_but_complete() {
         let (w, h, n) = (400u32, 400u32, 120usize);
@@ -1006,8 +875,7 @@ mod tests {
         );
     }
 
-    /// Размер кадра из формулы всегда держит все кадры в бюджете и не
-    /// выходит за границы разумного.
+    /// The frame-size formula keeps all frames in budget and within bounds.
     #[test]
     fn gif_frame_dim_stays_within_budget() {
         for n in [1usize, 10, 30, 60, 120, 300, 512, 1000, 2000, 100_000] {
@@ -1018,7 +886,7 @@ mod tests {
                 dim,
                 n
             );
-            // Пока не упёрлись в минимум, в бюджет обязаны влезать.
+            // Until clamped to the minimum, frames must fit the budget.
             if dim > MIN_GIF_DIM {
                 let effective = n.clamp(1, MAX_GIF_FRAMES);
                 assert!(
@@ -1029,19 +897,18 @@ mod tests {
                 );
             }
         }
-        // Обычные гифки не трогаем: полное разрешение.
+        // Ordinary GIFs keep full resolution.
         assert_eq!(gif_frame_dim(30), MAX_GIF_DIM);
     }
 
-    /// Разбор структуры GIF не должен ломаться на не-GIF данных.
+    /// GIF structure parsing must not break on non-GIF data.
     #[test]
     fn gif_frame_count_rejects_garbage() {
         assert_eq!(gif_frame_count(b""), None);
         assert_eq!(gif_frame_count(b"not a gif at all"), None);
     }
 
-    /// Гифка с одним кадром — это просто картинка, анимацией она не
-    /// считается.
+    /// A single-frame GIF is static, not an animation.
     #[test]
     fn single_frame_gif_is_static() {
         let mut out = Vec::new();
@@ -1060,36 +927,34 @@ mod tests {
         }
     }
 
-    /// Гифка, холст которой больше лимита, не распаковывается вовсе: кадры
-    /// читаются по одному, но и один кадр такой — это сотни мегабайт.
+    /// A GIF whose canvas exceeds the limit is refused before decoding.
     #[test]
     fn oversized_gif_is_refused() {
-        // Заголовок 10000x10000 = 100 Мпикс, больше MAX_SOURCE_PIXELS.
+        // Header claims 10000x10000, above MAX_SOURCE_PIXELS.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GIF89a");
         bytes.extend_from_slice(&10000u16.to_le_bytes());
         bytes.extend_from_slice(&10000u16.to_le_bytes());
-        bytes.push(0); // без глобальной таблицы
-        bytes.push(0x21); // расширение
+        bytes.push(0); // no global color table
+        bytes.push(0x21); // extension
         bytes.push(0xF9); // Graphic Control
         bytes.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0]);
-        bytes.push(0x3B); // конец
+        bytes.push(0x3B); // end
         assert!(
             App::decode_image_payload(&bytes).is_none(),
             "гифка неподходящего размера не должна распаковываться"
         );
     }
 
-    /// Слишком большая статичная картинка отсекается до выделения памяти.
+    /// An oversized static image is rejected before pixel allocation.
     #[test]
     fn static_size_limit_is_respected() {
-        // Граница лимита: 39.9 Мпикс ещё можно, 42 — уже нет.
+        // Limit boundary: 39.9 Mpx allowed, 42 Mpx not.
         assert!(source_size_allowed(7000, 5700), "39.9 Мпикс должны помещаться");
         assert!(!source_size_allowed(7000, 6000), "42 Мпикс уже не помещаются");
         assert!(source_size_allowed(64, 64));
 
-        // PNG, который только заголовком обещает 10000x10000: распаковывать
-        // его нельзя, лимит проверяется до выделения буфера пикселей.
+        // PNG claiming 10000x10000 in its header; rejected before allocation.
         let mut png = Vec::new();
         png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
         let mut ihdr = Vec::new();
@@ -1109,13 +974,11 @@ mod tests {
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
         out.extend_from_slice(kind);
         out.extend_from_slice(data);
-        // CRC считать не нужно: до данных дело не дойдёт, лимит отсечёт
-        // картинку по заголовку.
+        // No CRC needed: the limit rejects the image from its header.
         out.extend_from_slice(&[0, 0, 0, 0]);
     }
 
-    /// Сервер, отдающий тело заданного размера. Нужен, чтобы проверить
-    /// потолок на чтение ответа, не скачивая настоящие гигабайты.
+    /// Server returning a body of a given size to test the read cap cheaply.
     fn body_server(total: usize) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1147,9 +1010,7 @@ mod tests {
         addr
     }
 
-    /// Тело ответа читается с потолком: ссылку на картинку в эмбеде задаёт
-    /// чужой сайт, и без потолка его «картинка» на полгигабайта оседала бы в
-    /// памяти ещё до того, как распаковщик проверит размер.
+    /// The response body is read with a cap; embed URLs come from foreign sites.
     #[test]
     fn oversized_response_body_is_refused() {
         let addr = body_server(200);
@@ -1168,8 +1029,7 @@ mod tests {
 
 #[cfg(test)]
 impl App {
-    /// Тот же путь, что и в `download_image` после получения ответа, только
-    /// без сети: декодируем байты и кладём результат в кэш по его политике.
+    /// Same path as `download_image` after the response, but without the network.
     pub(crate) fn cache_image_bytes(&mut self, ctx: &egui::Context, key: &str, bytes: &[u8]) -> bool {
         match Self::decode_image_payload(bytes) {
             Some(ImagePayload::Static(color_image)) => {
