@@ -72,44 +72,6 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Заканчивается ли строка на суффикс без учёта регистра. Отдельно от
-/// `contains_ignore_case`, потому что расширение — это именно конец пути:
-/// «gif» в середине имени файла ничего не значит.
-fn ends_with_ignore_case(s: &str, suffix: &str) -> bool {
-    let (s, suffix) = (s.as_bytes(), suffix.as_bytes());
-    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-}
-
-/// Ссылка на уменьшенную копию картинки на прокси Discord.
-///
-/// В чате картинка рисуется максимум 360 точек (на HiDPI — 720), а во
-/// вложении легко лежит оригинал на 12 МБ. Просить его целиком и ужимать у
-/// себя — лишний трафик, лишняя распаковка и лишняя память; прокси Discord
-/// отдаёт готовую уменьшенную копию.
-///
-/// Гифки не трогаем: через прокси они приходят без анимации, а гифка должна
-/// играть. Чужие ссылки (вложения с других сайтов, локальный сервер в тестах)
-/// тоже не трогаем — там своего прокси нет.
-fn resized_url(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://cdn.discordapp.com/")?;
-    let (path, query) = match rest.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (rest, None),
-    };
-    if ends_with_ignore_case(path, ".gif") {
-        return None;
-    }
-    let mut out = format!(
-        "https://media.discordapp.net/{}?width={}&height={}",
-        path, MAX_IMAGE_DIM, MAX_IMAGE_DIM
-    );
-    if let Some(q) = query {
-        out.push('&');
-        out.push_str(q);
-    }
-    Some(out)
-}
-
 /// Один общий клиент на всё приложение: свой `Client` на каждую картинку —
 /// это новый пул соединений и TLS-сессия на каждый запрос.
 fn http() -> &'static reqwest::blocking::Client {
@@ -508,13 +470,11 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
 
     let pending = self.pending_images.entry(cache_key.clone()).or_insert_with(|| {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
-        // Просим у CDN уменьшенную копию: в чате картинка всё равно мельче.
-        // Кэш и ключ остаются по исходной ссылке.
-        let request_url = resized_url(url).unwrap_or_else(|| url.to_string());
+        let url_moved = url.to_string();
         std::thread::spawn(move || {
             // Слот отпускается на любом выходе, включая падение.
             let _slot = ImageSlot;
-            if let Ok(resp) = http().get(&request_url).send() {
+            if let Ok(resp) = http().get(&url_moved).send() {
                 if let Some(bytes) = read_limited(resp, MAX_DOWNLOAD_BYTES) {
                     if let Some(payload) = Self::decode_image_payload(&bytes) {
                         let _ = result_tx.send(Some(payload));
@@ -989,38 +949,6 @@ mod tests {
             Some(ImagePayload::Static(ci)) => assert_eq!(ci.size, [64, 48]),
             other => panic!("ожидалась статичная картинка, получено {:?}", other.is_some()),
         }
-    }
-
-    /// Вложение Discord должно запрашиваться уменьшенным: в чате оно рисуется
-    /// максимум 360 точек, а оригинал бывает на 12 МБ. Гифки и чужие ссылки
-    /// не трогаем — прокси отдал бы статичный первый кадр, а чужие ссылки
-    /// ужимать негде.
-    #[test]
-    fn discord_attachments_are_requested_resized() {
-        let resized = resized_url("https://cdn.discordapp.com/attachments/1/2/photo.png")
-            .expect("вложение Discord должно ужиматься на прокси");
-        assert!(
-            resized.starts_with(
-                "https://media.discordapp.net/attachments/1/2/photo.png?width=768&height=768"
-            ),
-            "неверная ссылка на уменьшенную копию: {resized}"
-        );
-
-        // Подписанная ссылка: параметры подписи сохраняются.
-        let signed = resized_url("https://cdn.discordapp.com/attachments/1/2/p.png?ex=1&is=2&hm=3")
-            .expect("подписанное вложение тоже ужимаем");
-        assert!(
-            signed.contains("width=768") && signed.ends_with("&ex=1&is=2&hm=3"),
-            "{signed}"
-        );
-
-        // Гифку уменьшать нельзя — потеряется анимация.
-        assert!(resized_url("https://cdn.discordapp.com/attachments/1/2/anim.gif").is_none());
-        assert!(resized_url("https://cdn.discordapp.com/attachments/1/2/anim.GIF").is_none());
-
-        // Чужие ссылки не трогаем: своего прокси у них нет.
-        assert!(resized_url("https://example.com/pic.png").is_none());
-        assert!(resized_url("http://127.0.0.1:9/pic.png").is_none());
     }
 
     /// Гифка играет все свои кадры, а не обрывается на середине.
