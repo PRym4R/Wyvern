@@ -79,6 +79,8 @@ pub(crate) struct App {
     pub(crate) selected_channel: Option<usize>,
     pub(crate) messages: HashMap<String, Vec<Arc<ChatMessage>>>,
     pub(crate) input: String,
+    /// Natural height of the multiline composer, measured last frame; drives the panel height.
+    pub(crate) composer_h: f32,
     /// Message the composer is replying to; cleared on send, cancel, or channel switch.
     pub(crate) reply_to: Option<ReplyTarget>,
     /// Message the composer is editing; cleared on save, cancel, or channel switch.
@@ -199,6 +201,7 @@ impl App {
             selected_channel: None,
             messages: HashMap::new(),
             input: String::new(),
+            composer_h: 0.0,
             reply_to: None,
             edit_target: None,
             token_input: String::new(),

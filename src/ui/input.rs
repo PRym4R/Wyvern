@@ -13,6 +13,10 @@ const DEBUG_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs
 
 /// Narrowest usable input-field width; it must not collapse to zero.
 const MIN_INPUT_WIDTH: f32 = 60.0;
+/// Tallest the composer grows before it scrolls instead (about six rows).
+const COMPOSER_MAX_H: f32 = 120.0;
+/// Space around the composer field inside its panel (top/bottom gaps + frame).
+const COMPOSER_CHROME: f32 = 20.0;
 /// Row space taken by padding, channel name, "Send" button and gaps.
 const INPUT_CHROME: f32 = 110.0;
 /// Width reserved for the "n/2000" counter; always kept so the field doesn't jump.
@@ -46,7 +50,7 @@ impl App {
             .unwrap_or_else(|| "No channel selected".into());
 
         let _input_resp = egui::TopBottomPanel::bottom("input_panel")
-            .min_height(56.0)
+            .min_height((self.composer_h.clamp(0.0, COMPOSER_MAX_H) + COMPOSER_CHROME).max(56.0))
             .show(ctx, |ui| {
                 let ir = ui.min_rect();
                 self.push_debug(format!("INPUT_BAR: h={:.0} y={:.0}", ir.height(), ir.min.y));
@@ -128,12 +132,39 @@ impl App {
                         ui.add_space(6.0);
                         let field_w = input_width(ui.available_width());
                         self.push_debug(format!("INPUT_FIELD: w={:.0}", field_w));
-                        let resp = ui.add_sized(
-                            [field_w, 36.0],
-                            egui::TextEdit::singleline(&mut self.input)
-                                .hint_text("Type a message and press Enter, or click Send...")
-                                .margin(egui::Margin::symmetric(12, 8)),
-                        );
+                        // Multiline composer: grows with the text up to
+                        // COMPOSER_MAX_H, then scrolls. Enter sends;
+                        // Shift+Enter inserts a newline (see `return_key`).
+                        let field_id = egui::Id::new("message_input");
+                        let focused = ui.memory(|m| m.has_focus(field_id));
+                        let enter_sends = focused
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        let resp = egui::ScrollArea::vertical()
+                            .id_salt("message_input_scroll")
+                            .max_height(COMPOSER_MAX_H)
+                            .max_width(field_w)
+                            // Let a one-line composer stay one line tall instead of
+                            // the ScrollArea's default 64 px minimum.
+                            .min_scrolled_height(0.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.input)
+                                        .id(field_id)
+                                        .desired_width(field_w)
+                                        .desired_rows(1)
+                                        .return_key(Some(egui::KeyboardShortcut::new(
+                                            egui::Modifiers::SHIFT,
+                                            egui::Key::Enter,
+                                        )))
+                                        .hint_text(
+                                            "Type a message; Enter sends, Shift+Enter makes a new line",
+                                        )
+                                        .margin(egui::Margin::symmetric(12, 8)),
+                                )
+                            })
+                            .inner;
+                        // Remember the field's natural height so the panel can grow to fit it.
+                        self.composer_h = resp.rect.height();
                         // Any edit clears the held-Enter resend guard; set before the Enter check.
                         if resp.changed() {
                             self.input_dirty = true;
@@ -146,10 +177,9 @@ impl App {
                                 .min_size(egui::vec2(84.0, 36.0)),
                         ).on_hover_text(if fits { "" } else { "сообщение длиннее 2000 символов" });
 
-                        let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let send_clicked = send_btn.clicked();
 
-                        if enter_pressed {
+                        if enter_sends {
                             self.submit_from_enter();
                             resp.request_focus();
                         } else if send_clicked {
@@ -725,6 +755,89 @@ mod tests {
             "нет пометки правки"
         );
         assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены правки");
+    }
+
+    /// Enter sends, while Shift+Enter keeps the field and inserts a newline.
+    #[test]
+    fn enter_sends_but_shift_enter_adds_a_newline() {
+        let (mut app, ctx) = narrow_app();
+        let field_id = egui::Id::new("message_input");
+        ctx.memory_mut(|m| m.request_focus(field_id));
+        app.input = "привет".to_string();
+        app.input_dirty = true;
+
+        let mut raw = frame();
+        raw.events.push(key_event(egui::Key::Enter, egui::Modifiers::NONE));
+        let _ = ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+
+        assert_eq!(app.messages["c1"].len(), 1, "Enter должен отправить сообщение");
+        assert_eq!(app.input, "", "после отправки поле должно очиститься");
+
+        // Shift+Enter is a newline, not a send: the field keeps the typed text.
+        ctx.memory_mut(|m| m.request_focus(field_id));
+        app.input = "первая".to_string();
+        app.input_dirty = true;
+        let sent_before = app.messages["c1"].len();
+        let mut raw = frame();
+        raw.modifiers = egui::Modifiers::SHIFT;
+        raw.events.push(key_event(egui::Key::Enter, egui::Modifiers::SHIFT));
+        let _ = ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+
+        assert_eq!(
+            app.messages["c1"].len(),
+            sent_before,
+            "Shift+Enter не должен отправлять"
+        );
+        assert!(
+            app.input.contains('\n'),
+            "Shift+Enter должен оставить перенос строки: {:?}",
+            app.input
+        );
+    }
+
+    /// The composer grows with added lines, then stops at COMPOSER_MAX_H.
+    #[test]
+    fn composer_grows_with_lines_and_is_capped() {
+        let (mut app, ctx) = narrow_app();
+        let _ = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        let one_line = input_panel_height(&ctx);
+
+        app.input = (0..4).map(|i| format!("строка {i}")).collect::<Vec<_>>().join("\n");
+        for _ in 0..3 {
+            let _ = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        }
+        let four_lines = input_panel_height(&ctx);
+        assert!(
+            four_lines > one_line + 10.0,
+            "поле должно расти с числом строк: {one_line} -> {four_lines}"
+        );
+
+        app.input = (0..40).map(|i| format!("строка {i}")).collect::<Vec<_>>().join("\n");
+        for _ in 0..3 {
+            let _ = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        }
+        let many_lines = input_panel_height(&ctx);
+        assert!(
+            many_lines <= COMPOSER_MAX_H + 60.0,
+            "поле должно упереться в потолок {COMPOSER_MAX_H}, а не расти безгранично: {many_lines}"
+        );
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn input_panel_height(ctx: &egui::Context) -> f32 {
+        use egui::containers::panel::PanelState;
+        ctx.data_mut(|d| d.get_persisted::<PanelState>(egui::Id::new("input_panel")))
+            .map(|s| s.rect.height())
+            .unwrap_or(0.0)
     }
 
     /// Find a text fragment in the drawn frame.
