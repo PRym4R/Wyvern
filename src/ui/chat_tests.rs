@@ -1100,9 +1100,18 @@ mod menu_tests {
         assert!(other.reply && other.copy, "other reply/copy: {other:?}");
         assert!(!other.edit && !other.delete, "other edit/delete: {other:?}");
 
-        let unconfirmed = app.message_menu(&message("", "текст", true));
-        assert!(!unconfirmed.reply && !unconfirmed.edit && !unconfirmed.delete);
-        assert!(unconfirmed.copy, "unconfirmed copy: {unconfirmed:?}");
+        // A pending local echo carries a `local:` id, not a real Discord id:
+        // id-based actions must stay off even though the id is non-empty.
+        let pending = app.message_menu(&message("local:0", "текст", true));
+        assert!(
+            !pending.reply && !pending.edit && !pending.delete,
+            "pending: {pending:?}"
+        );
+        assert!(pending.copy, "pending copy: {pending:?}");
+
+        // No id at all is the same: nothing to reference.
+        let no_id = app.message_menu(&message("", "текст", true));
+        assert!(!no_id.reply && !no_id.edit && !no_id.delete);
 
         let empty = app.message_menu(&message("m1", "", false));
         assert!(!empty.copy, "empty copy: {empty:?}");

@@ -134,9 +134,10 @@ impl App {
         msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id)
     }
     /// Which context-menu actions apply to `msg`. Reply/Edit/Delete need a
-    /// confirmed id; only our own messages can be edited or deleted.
+    /// confirmed id; only our own messages can be edited or deleted. A pending
+    /// local echo has a `local:` id, which is not a real Discord id.
     pub(crate) fn message_menu(&self, msg: &ChatMessage) -> MessageMenu {
-        let confirmed = !msg.id.is_empty();
+        let confirmed = !msg.id.is_empty() && !msg.is_local_echo();
         let own = self.is_own_msg(msg);
         MessageMenu {
             reply: confirmed,
