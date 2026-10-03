@@ -18,6 +18,16 @@ fn ends_with_ci(hay: &str, needle: &str) -> bool {
     h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n)
 }
 
+/// Подсказка с URL строится только при наведении. `on_hover_text` принимает
+/// уже готовый текст, поэтому `url.to_string()` вызывался каждый кадр на
+/// каждую картинку; здесь строка создаётся внутри замыкания, а egui дёргает
+/// его только для той картинки, над которой курсор.
+fn hover_text_lazy(response: egui::Response, make: impl FnOnce() -> String) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.label(make());
+    })
+}
+
 const VIDEO_EXTS: [&str; 5] = [".mp4", ".webm", ".ogg", ".m4v", ".mov"];
 
 /// Во сколько картинку в чате можно показывать. От этого зависит и размер
@@ -112,8 +122,8 @@ impl App {
                 if disp.x <= 0.0 || disp.y <= 0.0 {
                     return;
                 }
-                ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)))
-                    .on_hover_text(url.to_string());
+                let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                hover_text_lazy(resp, || url.to_string());
             } else if self.failed_images.contains(url) {
                 // Картинка не загрузится уже никогда (битая или слишком
                 // большая) — не крутим вечный спиннер, а говорим об этом.
@@ -145,7 +155,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_ci, embed_image_url, ends_with_ci};
+    use super::{contains_ci, embed_image_url, ends_with_ci, hover_text_lazy};
+    use eframe::egui;
 
     /// Поведение `embed_image_url` должно совпадать с прежней версией на
     /// `to_lowercase()`: регистр в URL не должен ничего менять.
@@ -177,6 +188,37 @@ mod tests {
         assert!(ends_with_ci("clip.MOV", ".mov"));
         assert!(!ends_with_ci("mov", ".mov"));
         assert!(ends_with_ci("anything", ""));
+    }
+
+    /// Текст подсказки строится только при наведении: иначе `url.to_string()`
+    /// аллоцировался на каждую картинку каждый кадр.
+    #[test]
+    fn tooltip_text_is_built_only_on_hover() {
+        use std::cell::Cell;
+        let ctx = egui::Context::default();
+        let calls = Cell::new(0u32);
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(80.0, 20.0));
+
+        let frame = |pointer: egui::Pos2| {
+            let input = egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let resp = ui.put(rect, egui::Label::new("картинка"));
+                    hover_text_lazy(resp, || {
+                        calls.set(calls.get() + 1);
+                        "https://cdn.discordapp.com/x.png".to_string()
+                    });
+                });
+            });
+        };
+
+        frame(egui::pos2(500.0, 500.0));
+        assert_eq!(calls.get(), 0, "без наведения текст подсказки не строится");
+        frame(rect.center());
+        assert_eq!(calls.get(), 1, "под курсором подсказка строится");
     }
 }
 
