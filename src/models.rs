@@ -357,6 +357,16 @@ impl LoadedImage {
     }
 }
 
+/// Измеренная высота строки и ширина чата, при которой её измерили. Ширина
+/// здесь не для красоты: после изменения размера окна высоты, снятые при
+/// прежней ширине, врут, и без неё список плыл, пока все строки не измерятся
+/// заново.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MsgHeight {
+    pub(crate) height: f32,
+    pub(crate) width: u32,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Theme {
     pub(crate) bg: Color32,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
-use crate::models::ChatMessage;
+use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 use crate::ui::ERROR_RED;
 
@@ -66,6 +66,12 @@ fn estimate_lines(chars: usize, text_w: f32) -> f32 {
     ((chars as f32 * CHAR_W) / text_w).ceil().max(1.0)
 }
 
+/// Ширина чата, округлённая до пикселя — ключ кэша высот. Доли пикселя
+/// игнорируем: иначе дрожание ширины сбрасывало бы кэш каждый кадр.
+fn width_key(width: f32) -> u32 {
+    width.round().max(0.0) as u32
+}
+
 impl App {
     pub(crate) fn draw_chat(&mut self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
@@ -118,7 +124,11 @@ impl App {
         // отправку) не кэшируем: id у таких пустой, ключ бы совпал.
         if !msg.id.is_empty() {
             if let Some(h) = self.msg_heights.get(&msg.id) {
-                return *h;
+                // Высота годится, только если её мерили при той же ширине:
+                // после ресайза окна старые значения врут, и список плывёт.
+                if h.width == width_key(width) {
+                    return h.height;
+                }
             }
         }
         self.estimate_msg_height(msg, width)
@@ -416,11 +426,18 @@ impl App {
                                         // считается изменением: даже если
                                         // оценка угадала, измеренная высота в
                                         // кэше нужна — на неё опирается якорь.
-                                        if !msg.id.is_empty() && self.msg_heights.get(&msg.id) != Some(&h) {
+                                        let key = width_key(width);
+                                        let stored = self.msg_heights.get(&msg.id).copied();
+                                        if !msg.id.is_empty()
+                                            && stored.map(|m| (m.height, m.width)) != Some((h, key))
+                                        {
                                             if self.msg_heights.len() > MAX_HEIGHT_CACHE {
                                                 self.msg_heights.clear();
                                             }
-                                            self.msg_heights.insert(msg.id.clone(), h);
+                                            self.msg_heights.insert(
+                                                msg.id.clone(),
+                                                MsgHeight { height: h, width: key },
+                                            );
                                         }
                                     }
                                     // Хвост докладываем до расчётной высоты,
@@ -795,6 +812,25 @@ mod geometry_tests {
         );
     }
 
+    /// Высота, снятая при одной ширине, не должна переиспользоваться после
+    /// ресайза окна: раньше кэш знал только id, и после смены ширины список
+    /// рисовался по старым (неверным) высотам, пока строки не перемерятся.
+    #[test]
+    fn cached_height_is_dropped_when_the_width_changes() {
+        let mut h = app_with_messages(1);
+        let m = message(0);
+        h.app
+            .msg_heights
+            .insert(m.id.clone(), MsgHeight { height: 999.0, width: 400 });
+        // Та же ширина — берём из кэша.
+        assert_eq!(h.app.msg_height(&m, 400.0), 999.0);
+        // Другая ширина — прежнее число не годится, высота считается заново.
+        let fresh = h.app.msg_height(&m, 800.0);
+        let estimate = h.app.estimate_msg_height(&m, 800.0);
+        assert_ne!(fresh, 999.0, "после ресайза старые высоты не годятся");
+        assert_eq!(fresh, estimate, "на новой ширине высота берётся из оценки");
+    }
+
     /// Колесо должно листать чат в обе стороны. Проверяем именно то, что
     /// нарисовано: кадр рисуется на смещении, которое мы попросили, а колесо
     /// egui применяет уже после отрисовки. Поэтому «счётчик смещения уехал»
@@ -933,7 +969,7 @@ mod geometry_tests {
                 .app
                 .msg_heights
                 .get(&last.id)
-                .copied()
+                .map(|mh| mh.height)
                 .expect("последнее сообщение должно быть нарисовано");
             let bottom = h.app.msg_offsets[n - 1] + h_last;
             assert!(
@@ -997,7 +1033,7 @@ mod geometry_tests {
             scroll_to(&mut h.app, 0.0);
             frame(&mut h.app, &ctx);
             frame(&mut h.app, &ctx);
-            let real = h.app.msg_heights.get(&m.id).copied().unwrap_or(0.0);
+            let real = h.app.msg_heights.get(&m.id).map(|mh| mh.height).unwrap_or(0.0);
             assert!(
                 (est - real).abs() <= real * 0.15 + 12.0,
                 "{name}: оценка {est:.0} против настоящих {real:.0}"
@@ -1082,9 +1118,9 @@ mod geometry_tests {
             .msg_heights
             .values_mut()
             .next()
-            .map(|h| {
-                *h += 40.0;
-                *h
+            .map(|mh| {
+                mh.height += 40.0;
+                mh.height
             })
             .expect("кэш высот не пуст после кадров");
         frame(&mut h.app, &ctx);
@@ -1141,7 +1177,7 @@ mod geometry_tests {
             .app
             .msg_heights
             .get("m9999")
-            .copied()
+            .map(|mh| mh.height)
             .expect("новое сообщение должно быть измерено");
         assert!(
             new_h > 40.0,

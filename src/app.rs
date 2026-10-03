@@ -9,8 +9,8 @@ use crate::gateway::{run_gateway, EventTx, Generation};
 use crate::media::AvatarFetch;
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{
-    BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, StoredAccount,
-    Theme, UserProfile,
+    BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, MsgHeight,
+    StoredAccount, Theme, UserProfile,
 };
 
 /// Больше этого сообщений на канал не держим в памяти. История теперь
@@ -213,7 +213,7 @@ pub(crate) struct App {
     /// неизвестно, какие сообщения попадают в окно, а рисовать все — это
     /// десятки тысяч аллокаций на кадр. Ключ — id, а не индекс, поэтому
     /// подгрузка истории в начало списка кэш не портит.
-    pub(crate) msg_heights: HashMap<String, f32>,
+    pub(crate) msg_heights: HashMap<String, MsgHeight>,
     /// Префиксные суммы высот: буфер кадра, переиспользуется между кадрами.
     pub(crate) msg_offsets: Vec<f32>,
     /// Счётчик для id неподтверждённых собственных сообщений. Он общий на всё
@@ -2997,7 +2997,7 @@ mod layout_tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(rx);
         app.messages.insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "до правки"))]);
-        app.msg_heights.insert("m1".into(), 40.0);
+        app.msg_heights.insert("m1".into(), MsgHeight { height: 40.0, width: 0 });
 
         let mut edited = test_msg("m1", "c1", "после правки");
         edited.author_name = String::new();
@@ -3049,7 +3049,7 @@ mod layout_tests {
                 Arc::new(test_msg("m2", "c1", "второе")),
             ],
         );
-        app.msg_heights.insert("m1".into(), 30.0);
+        app.msg_heights.insert("m1".into(), MsgHeight { height: 30.0, width: 0 });
 
         tx.send(ToApp::MessageDeleted {
             channel_id: "c1".into(),
