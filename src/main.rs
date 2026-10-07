@@ -22,16 +22,13 @@ use tokio::sync::mpsc;
 
 use crate::app::App;
 
-/// Путь к логу паники с номером: `/tmp/wyvern_panic_N.log`.
-///
-/// Номер нужен, потому что один и тот же файл затирал предыдущее падение, а
-/// серия падений подряд — как раз то, ради чего лог и открывают. Имя с
-/// «wyvern»: по нему должно находиться, когда ищешь следы этого клиента.
+/// Numbered panic log path: `/tmp/wyvern_panic_N.log`. Numbering keeps a
+/// series of panics instead of overwriting the previous one.
 fn panic_log_path(n: usize) -> String {
     format!("/tmp/wyvern_panic_{}.log", n)
 }
 
-/// Первый свободный номер для лога паники (до 99).
+/// First free panic log number (up to 99).
 fn next_panic_log_path() -> String {
     (1..=99)
         .map(panic_log_path)
@@ -40,11 +37,9 @@ fn next_panic_log_path() -> String {
 }
 
 fn main() -> eframe::Result<()> {
-    // Панику пишем в /tmp/wyvern_panic_N.log (N — первый свободный): серия
-    // падений подряд не должна оставлять только последнее. Имя с «wyvern»,
-    // а не «discord»: лог паники ищут вместе с остальными следами клиента.
-    // Стандартный хук сохраняем — он печатает привычную подсказку, а бэктрейс
-    // кладём в файл сами, чтобы он был независимо от RUST_BACKTRACE.
+    // Panics go to /tmp/wyvern_panic_N.log (first free N) so a series is not
+    // reduced to the last one. Keep the default hook for the usual hint and
+    // write the backtrace ourselves, independent of RUST_BACKTRACE.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
@@ -54,8 +49,7 @@ fn main() -> eframe::Result<()> {
         eprintln!("[PANIC] записано в {}", path);
     }));
 
-    // Версия в заголовке: бинарник в корне репозитория пересобирают не
-    // всегда, и по заголовку сразу видно, какой именно запущен.
+    // Version in the title: the repo-root binary is not always rebuilt.
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_min_inner_size([700.0, 500.0])
@@ -77,8 +71,7 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{next_panic_log_path, panic_log_path};
 
-    /// Имя лога паники — «wyvern», а не «discord», и с номером: иначе серия
-    /// падений подряд оставляет только последнее.
+    /// Panic log name must be project-specific and numbered.
     #[test]
     fn panic_log_is_named_and_numbered() {
         let first = panic_log_path(1);

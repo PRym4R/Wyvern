@@ -15,16 +15,11 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
-/// Отпечаток клиента для Discord.
-///
-/// Один и тот же объект уходит и в IDENTIFY по WebSocket, и (в base64) в
-/// заголовок `X-Super-Properties` у REST. Раньше оба места держали свою
-/// копию зашитых значений, и правка одного не чинила другое: в IDENTIFY
-/// так и осталось «Linux». Держим один источник, чтобы отпечаток не разъезжался.
+/// Client fingerprint sent both in WebSocket IDENTIFY and (base64) in the
+/// REST `X-Super-Properties` header. One source so the two cannot diverge.
 pub(crate) fn client_properties() -> serde_json::Value {
     json!({
-        // Раньше здесь было зашито «Linux»; Discord сверяет отпечаток клиента,
-        // и подмена системы на чужой машине — лишний повод не поверить.
+        // Real OS, not a hardcoded "Linux": Discord checks the fingerprint.
         "os": std::env::consts::OS,
         "browser": "Discord Client",
         "device": "",
@@ -42,8 +37,7 @@ pub(crate) fn super_props() -> String {
 mod tests {
     use super::{base64_decode, client_properties, super_props};
 
-    /// super_props должен честно называть систему клиента: `std::env::consts::OS`
-    /// даёт «linux»/«windows»/«macos», ровно те строки, что ждёт Discord.
+    /// `super_props` must report the real OS (`std::env::consts::OS`).
     #[test]
     fn super_props_reports_the_real_os() {
         let decoded = base64_decode(&super_props()).expect("super_props — валидный base64");
@@ -56,8 +50,7 @@ mod tests {
         );
     }
 
-    /// Заголовок REST и IDENTIFY по WebSocket должны нести один отпечаток:
-    /// раньше это были две копии, и в IDENTIFY так и осталось зашитое «Linux».
+    /// REST header and WebSocket IDENTIFY must carry one fingerprint.
     #[test]
     fn super_props_and_client_properties_are_the_same_fingerprint() {
         let decoded = base64_decode(&super_props()).expect("super_props — валидный base64");

@@ -3,9 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use eframe::egui::{self, Color32, TextureHandle};
 use serde_json::Value;
 
-/// Сколько памяти занимает значение в кэше. Нужно, чтобы ограничивать кэш
-/// не по числу элементов, а по байтам: 200 аватарок — это 3 МБ, а 200 картинок
-/// — это 800 МБ, и само число элементов ни о чём не говорит.
+/// Memory a cached value occupies, so the cache can be limited by bytes, not item count.
 pub(crate) trait CacheCost {
     fn cache_bytes(&self) -> usize;
 }
@@ -17,28 +15,16 @@ impl CacheCost for TextureHandle {
     }
 }
 
-/// Кеш с ограничением размера: при переполнении вытесняется самый старый
-/// элемент. Ограничение сразу по двум параметрам — по количеству и по
-/// памяти, — поэтому кэш не раздуется ни от числа элементов, ни от одной
-/// большой картинки.
+/// Size-bounded cache evicting the oldest entries, capped by count and bytes.
 ///
-/// Для текстур это ещё и настоящий расход: `TextureHandle` освобождает
-/// текстуру в egui, как только уничтожается последняя ссылка на неё, а
-/// вытеснение из кэша ссылку и уничтожает. Отдельной копии, которую кэш не
-/// считает, в egui не остаётся — см. тест `evicting_a_texture_frees_it_in_egui_too`.
+/// Eviction drops the last `TextureHandle` reference, freeing the texture in egui too.
 pub(crate) struct BoundedCache<V> {
     map: HashMap<String, V>,
     order: VecDeque<String>,
     cap: usize,
     budget: usize,
     bytes: usize,
-    /// Ключи, которые рисовались в этом и прошлом кадре: то, что сейчас на
-    /// экране. Их не вытесняем. Иначе картинка, которую человек в эту секунду
-    /// смотрит, вылетает из-за той, что только что догрузилась, в следующем
-    /// кадре её качают заново — гифка мигает, а высота сообщения скачет.
-    /// Прошлый кадр в паре нужен, потому что рисование идёт сверху вниз: у
-    /// картинки ниже по списку `mark_visible` в этом кадре ещё впереди, а
-    /// вытеснение может случиться раньше.
+    /// Keys drawn this or the previous frame; never evicted, so on-screen images don't flicker.
     used_now: HashSet<String>,
     used_prev: HashSet<String>,
 }
@@ -55,32 +41,26 @@ impl<V: CacheCost> BoundedCache<V> {
             used_prev: HashSet::new(),
         }
     }
-    /// Начать кадр. Прошлый набор «использованных» становится позапрошлым:
-    /// так картинка защищена от вытеснения ещё один кадр после того, как её
-    /// перестали рисовать.
+    /// Begin a frame, keeping the previous visible set for one more frame of protection.
     pub(crate) fn begin_frame(&mut self) {
         self.used_prev = std::mem::take(&mut self.used_now);
     }
-    /// Показывалась ли картинка в этом или прошлом кадре.
+    /// Whether the image was visible this or the previous frame.
     fn is_visible(&self, key: &str) -> bool {
         self.used_now.contains(key) || self.used_prev.contains(key)
     }
-    /// Отметить картинку как нарисованную в этом кадре: до конца следующего
-    /// кадра её не вытесняем.
+    /// Mark an image as drawn this frame; protected from eviction through next frame.
     pub(crate) fn mark_visible(&mut self, key: &str) {
         if !self.used_now.contains(key) {
             self.used_now.insert(key.to_string());
         }
     }
-    /// Взять значение из кэша. Обращение считается использованием: ключ
-    /// уезжает в хвост очереди, поэтому вытесняется то, к чему давно не
-    /// обращались (LRU), а не то, что давно положили (FIFO, как было).
+    /// Get from the cache; access moves the key to the back (LRU).
     pub(crate) fn get(&mut self, key: &str) -> Option<&V> {
         self.touch(key);
         self.map.get(key)
     }
-    /// Отметить ключ как использованный: перенести его в хвост очереди.
-    /// Очередь короткая (десятки элементов), поэтому O(n) здесь не страшен.
+    /// Move a key to the back of the order queue; O(n) is fine for its small size.
     fn touch(&mut self, key: &str) {
         if let Some(pos) = self.order.iter().position(|k| k == key) {
             if let Some(k) = self.order.remove(pos) {
@@ -88,11 +68,11 @@ impl<V: CacheCost> BoundedCache<V> {
             }
         }
     }
-    /// Сколько памяти кэш держит прямо сейчас.
+    /// Memory the cache currently holds.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
-    // Хелперы для тестов и отладки — в самом клиенте не вызываются.
+    // Test/debug helpers, not used by the client itself.
     #[allow(dead_code)]
     pub(crate) fn contains_key(&self, key: &str) -> bool {
         self.map.contains_key(key)
@@ -103,23 +83,18 @@ impl<V: CacheCost> BoundedCache<V> {
     }
     pub(crate) fn insert(&mut self, key: String, value: V) {
         if let Some(old) = self.map.insert(key.clone(), value) {
-            // Тот же ключ перезаписан: снимаем вес старого значения, иначе
-            // память посчитается дважды.
+            // Same key overwritten: subtract the old weight to avoid double counting.
             self.bytes = self.bytes.saturating_sub(old.cache_bytes());
         } else {
             self.order.push_back(key.clone());
         }
         let added = self.map[&key].cache_bytes();
         self.bytes = self.bytes.saturating_add(added);
-        // Последний элемент не выкидываем: иначе одна картинка крупнее всего
-        // бюджета не показалась бы вообще. Видимые не выкидываем тоже.
+        // Keep the last entry (even if over budget) and visible ones.
         while self.order.len() > self.cap || (self.bytes > self.budget && self.order.len() > 1) {
-            // Только что вставленную картинку не вытесняем ею же: она вот-вот
-            // появится на экране.
+            // Don't evict the just-inserted image; it's about to appear.
             let Some(pos) = self.order.iter().position(|k| k != &key && !self.is_visible(k)) else {
-                // Всё, что в кэше, сейчас на экране. Пусть временно будет
-                // больше бюджета: мигающая картинка хуже лишней памяти. Как
-                // только она уйдёт с экрана, следующий кадр её вытеснит.
+                // Everything is on screen; exceeding the budget is better than flicker.
                 break;
             };
             if let Some(old) = self.order.remove(pos) {
@@ -131,7 +106,7 @@ impl<V: CacheCost> BoundedCache<V> {
             }
         }
     }
-    /// Полный сброс (смена аккаунта): и карта, и очередь, и счётчик байт.
+    /// Full reset (account switch): map, queue and byte count.
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
@@ -141,21 +116,17 @@ impl<V: CacheCost> BoundedCache<V> {
     }
 }
 
-/// Эмбед в том виде, в каком его умеет показать клиент: картинка и текст.
-/// Discord присылает с ними author, footer, provider, fields и прочее, но
-/// клиенту это не нужно, а в памяти такой JSON стоит в разы дороже двух строк.
+/// Embed as the client can render it: image and text; other JSON fields are dropped.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Embed {
     pub(crate) image_url: Option<String>,
-    /// Размер картинки, который Discord прислал рядом со ссылкой. По нему
-    /// высоту сообщения можно посчитать, не качая саму картинку.
+    /// Image size sent by Discord, used to compute message height without downloading.
     pub(crate) image_size: Option<[u32; 2]>,
     pub(crate) description: Option<String>,
 }
 
 impl Embed {
-    /// Достать из эмбеда Discord только то, что клиент рисует. Если рисуть
-    /// нечего — `None`, и эмбед не хранится вовсе.
+    /// Extract only what the client draws; `None` if there is nothing to draw.
     pub(crate) fn from_json(e: &Value) -> Option<Self> {
         let image = ["image", "thumbnail", "video"]
             .iter()
@@ -177,10 +148,7 @@ impl Embed {
     }
 }
 
-/// Размер в пикселях из отдельных полей `width`/`height`. Discord шлёт их
-/// целыми, но приводим из строки в том же духе, как `de_opt_text`: поле может
-/// оказаться числом с точкой или строкой, и ронять из-за этого сообщение
-/// нельзя.
+/// Pixel size from `width`/`height`, tolerant of string or float-encoded numbers.
 pub(crate) fn size_from(width: Option<u32>, height: Option<u32>) -> Option<[u32; 2]> {
     match (width, height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => Some([w, h]),
@@ -188,10 +156,7 @@ pub(crate) fn size_from(width: Option<u32>, height: Option<u32>) -> Option<[u32;
     }
 }
 
-/// То же, но размер вычитывается из готового дерева `Value` — так разбираются
-/// живые события гейтвея, где дерево уже собрано целиком. Оба пути обязаны
-/// звать `size_from`, иначе они разойдутся: раньше история и живое сообщение
-/// давали разный размер одной и той же картинки.
+/// Like `size_from`, but reading from a built `Value` tree; both paths must agree.
 pub(crate) fn image_size_of(v: &Value) -> Option<[u32; 2]> {
     let num = |k: &str| -> Option<u32> {
         match v.get(k) {
@@ -218,15 +183,11 @@ pub(crate) struct ChatMessage {
     pub(crate) is_own: bool,
 }
 
-/// Префикс id сообщения, которое клиент показал сам, ещё до ответа Discord.
-/// Такой id ненастоящий: его нельзя ни искать в переписке, ни отправлять в
-/// API как `before` для пагинации.
+/// Prefix for locally echoed message ids; never valid for lookups or pagination.
 pub(crate) const LOCAL_ID_PREFIX: &str = "local:";
 
 impl ChatMessage {
-    /// Сообщение нарисовано нами самим, а не пришло от Discord. Такое живёт в
-    /// списке, пока Discord не подтвердит отправку: показывать сразу приятно,
-    /// но id у него нет и вместо него — счётчик.
+    /// Whether this is our own optimistic echo, not yet confirmed by Discord.
     pub(crate) fn is_local_echo(&self) -> bool {
         self.id.starts_with(LOCAL_ID_PREFIX)
     }
@@ -237,8 +198,7 @@ pub(crate) struct Attachment {
     pub(crate) url: String,
     pub(crate) content_type: Option<String>,
     pub(crate) description: Option<String>,
-    /// Размер картинки, который Discord прислал рядом со ссылкой. По нему
-    /// высоту сообщения можно посчитать, не качая саму картинку.
+    /// Image size sent by Discord, used to compute message height without downloading.
     pub(crate) size: Option<[u32; 2]>,
 }
 
@@ -265,10 +225,20 @@ pub(crate) struct UserProfile {
     pub(crate) username: String,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StoredAccount {
     pub(crate) token: String,
     pub(crate) username: String,
+}
+
+/// Redacts the token in `{:?}` output so debug logs and panics can't leak it.
+impl std::fmt::Debug for StoredAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredAccount")
+            .field("token", &"…")
+            .field("username", &self.username)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -285,7 +255,7 @@ impl CacheCost for LoadedImage {
     fn cache_bytes(&self) -> usize {
         match self {
             LoadedImage::Static(t) => t.cache_bytes(),
-            // Анимированная картинка — это все её кадры, а не один.
+            // An animated image is all its frames, not just one.
             LoadedImage::Animated { frames, .. } => frames.iter().map(|f| f.cache_bytes()).sum(),
         }
     }
@@ -309,8 +279,7 @@ impl LoadedImage {
         self.display_texture().id()
     }
 
-    /// Двигается ли картинка сама по себе. Статичную достаточно нарисовать
-    /// один раз, а анимированной нужны кадры, пока она на экране (Т-7).
+    /// Whether the image animates; still images need no per-frame redraw.
     pub(crate) fn is_animated(&self) -> bool {
         match self {
             LoadedImage::Static(_) => false,
@@ -343,6 +312,13 @@ impl LoadedImage {
             }
         }
     }
+}
+
+/// Measured row height plus the chat width it was measured at; stale after resize.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MsgHeight {
+    pub(crate) height: f32,
+    pub(crate) width: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -406,8 +382,7 @@ impl Theme {
     }
 }
 
-/// Фикстуры для замера памяти (`src/memcheck.rs`): у базовой версии структуры
-/// устроены иначе, а код замера должен быть один и тот же.
+/// Fixtures for `src/memcheck.rs`; keep the measurement code identical across versions.
 #[cfg(test)]
 pub(crate) fn test_guild(id: &str, name: &str) -> Guild {
     Guild { id: id.into(), name: name.into(), icon: None }
@@ -423,8 +398,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Из эмбеда берём только картинку и текст — остальное клиент не рисует,
-    /// а места занимает много.
+    /// The token must not leak through debug output.
+    #[test]
+    fn stored_account_debug_hides_the_token() {
+        let acc = StoredAccount {
+            token: "секретный-токен-1234567890".into(),
+            username: "вася".into(),
+        };
+        let shown = format!("{:?}", acc);
+        assert!(
+            !shown.contains("секретный-токен-1234567890"),
+            "отладочный вывод напечатал токен: {shown}"
+        );
+        assert!(
+            shown.contains("вася"),
+            "имя в выводе оставить полезно: {shown}"
+        );
+    }
+
+    /// Only the image and text are kept from an embed.
     #[test]
     fn embed_keeps_only_what_is_drawn() {
         let raw = json!({
@@ -444,7 +436,7 @@ mod tests {
         assert_eq!(e.description.as_deref(), Some("текст"));
     }
 
-    /// Картинка приоритетнее превью: если есть и image, и thumbnail, берём image.
+    /// `image` is preferred over `thumbnail`.
     #[test]
     fn embed_prefers_image_over_thumbnail() {
         let raw = json!({
@@ -456,7 +448,7 @@ mod tests {
         assert!(e.description.is_none());
     }
 
-    /// Эмбед, в котором рисуть нечего, в памяти не хранится вовсе.
+    /// An embed with nothing to draw isn't stored at all.
     #[test]
     fn embed_without_drawable_content_is_dropped() {
         let raw = json!({
@@ -467,8 +459,7 @@ mod tests {
         assert!(Embed::from_json(&raw).is_none());
     }
 
-    /// Урезанный эмбед должен быть заметно дешевле полного JSON-дерева:
-    /// именно на этом держится экономия памяти в шумном канале.
+    /// The compact embed must be much cheaper than the raw JSON tree.
     #[test]
     fn compact_embed_is_cheaper_than_raw_json() {
         let raw = json!({
@@ -488,7 +479,7 @@ mod tests {
             "timestamp": "2026-09-26T12:00:00.000Z"
         });
         let compact = Embed::from_json(&raw).expect("эмбед должен остаться");
-        // Что клиент реально держит: две строки плюс два Option<String>.
+        // What the client actually retains: two strings plus two Options.
         let retained = compact.image_url.as_ref().map_or(0, |s| s.len())
             + compact.description.as_ref().map_or(0, |s| s.len())
             + 2 * std::mem::size_of::<Option<String>>();
@@ -499,17 +490,10 @@ mod tests {
             retained,
             raw_text.len()
         );
-        // Дерево serde_json::Value при этом ещё дороже самого текста: каждая
-        // строка и каждый ключ в нём — отдельная аллокация.
+        // A serde_json::Value tree costs even more: every string/key is a separate allocation.
     }
 
-    /// Вытеснение текстуры из кэша освобождает её и в egui.
-    ///
-    /// `TextureHandle` освобождает текстуру, когда уничтожается последняя
-    /// ссылка на неё. Значит «48 МБ» клиентского кэша — это и есть память
-    /// текстур, а не только собственная прикидка: неучтённой копии в egui не
-    /// остаётся. Тест держит это поведение — если кэш начнёт хранить лишнюю
-    /// ссылку, вытесненные текстуры перестанут освобождаться.
+    /// Evicting a texture frees it in egui too, so the cache's bytes are real texture memory.
     #[test]
     fn evicting_a_texture_frees_it_in_egui_too() {
         let ctx = egui::Context::default();

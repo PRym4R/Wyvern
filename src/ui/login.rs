@@ -9,9 +9,7 @@ fn initial_of(name: &str) -> String {
     name.chars().next().unwrap_or('?').to_ascii_uppercase().to_string()
 }
 
-/// Ширина строки в 13-м шрифте. Нужна, чтобы разложить чипы аккаунтов по
-/// строкам самим: `horizontal_wrapped` внутри нижней панели ширину получает
-/// неверную и уносит содержимое за её пределы.
+/// Width of text at size 13, for laying out account chips manually.
 fn text_width(ctx: &egui::Context, text: &str) -> f32 {
     ctx.fonts(|f| {
         f.layout_no_wrap(text.to_string(), egui::FontId::proportional(13.0), Color32::WHITE)
@@ -28,14 +26,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Годится ли отладочная строка на подпись экрана входа.
-///
-/// `push_debug` несёт две очень разные вещи: человеческие сообщения
-/// («Auth failed: …», «Switched account…») и поток геометрии, который пишется
-/// каждый кадр (FRAME:, RENDER:, SCROLL:, PANEL:, INPUT_BAR: …). Второе —
-/// внутреннее измерение, пользователю оно ни о чём не говорит, но именно оно
-/// почти всегда и оказывается последним. Раньше подпись показывала
-/// «Last: SCROLL: inner_h=…» — то есть отладку в лицо.
+/// Whether a debug line is human-facing, not per-frame geometry output.
 fn is_human_debug(line: &str) -> bool {
     const GEOMETRY_PREFIXES: [&str; 7] = [
         "FRAME:",
@@ -49,14 +40,7 @@ fn is_human_debug(line: &str) -> bool {
     !GEOMETRY_PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
-/// Состояние соединения, а не ошибка ввода.
-///
-/// Гейтвей кладёт в `status` и то, и другое: настоящие отказы (отклонённый
-/// токен, «Аккаунт не найден в хранилище») и сетевые сообщения («Connecting…»,
-/// «Reconnecting: …», «Disconnected», «Resumed»). Красный цвет на экране входа
-/// оставлен ошибкам; состояние соединения показывается нейтрально. Раньше
-/// пользователь видел красное «Reconnecting: websocket closed» и не понимал,
-/// что это не его вина и что вообще делать (Т-12).
+/// Whether status is a connection state rather than a login error; shown neutral.
 fn is_connection_status(s: &str) -> bool {
     s.starts_with("Connecting")
         || s.starts_with("Reconnecting")
@@ -107,8 +91,7 @@ impl App {
             });
     }
 
-    /// Лента сохранённых аккаунтов внизу слева.
-    /// ЛКМ — выбрать аккаунт (форма спросит пароль), ✕ — удалить из хранилища.
+    /// Saved-account strip at bottom-left: left-click selects, ✕ removes.
     fn draw_account_strip(&mut self, ctx: &egui::Context) {
         if self.saved_accounts.is_empty() {
             return;
@@ -117,15 +100,8 @@ impl App {
         let mut pick: Option<String> = None;
         let mut remove: Option<usize> = None;
 
-        // Сетка с переносом вместо горизонтальной прокрутки: при десятке
-        // аккаунтов полоса уезжала за край, и до дальних можно было
-        // добраться только прокруткой, о которой ничего не говорило.
-        //
-        // Строки раскладываем сами и по ширине окна, а не внутри панели:
-        // `available_width()` там на первом проходе ещё не определён, строки
-        // выходят другие, и панель получает неверную высоту — содержимое
-        // уезжает за нижний край экрана. По той же причине не годится и
-        // `horizontal_wrapped`.
+        // Wrapping grid laid out by window width; `horizontal_wrapped` mis-measures
+        // inside the panel.
         let names: Vec<String> = self
             .saved_accounts
             .iter()
@@ -230,11 +206,7 @@ impl App {
                                         .stroke(egui::Stroke::NONE)
                                         .min_size(egui::vec2(0.0, 22.0)),
                                     );
-                                    // Крестик — только у выбранного или под
-                                    // наведением: десять крестиков подряд
-                                    // перекрывали сами аккаунты. Место под
-                                    // него держим всегда, иначе чип прыгал
-                                    // бы, стоило навести мышь.
+                                    // ✕ shows only when selected/hovered, but its space is always kept.
                                     let x_at = ui.next_widget_position();
                                     let x_rect =
                                         egui::Rect::from_min_size(x_at, egui::vec2(20.0, 22.0));
@@ -296,12 +268,12 @@ impl App {
                 }
             }
             self.refresh_active_index();
-            self.save_accounts(&self.master_password);
+            let pw = self.master_password.clone();
+            self.save_accounts(&pw);
         }
     }
 
-    /// Форма входа по свежему токену: токен и пароль хранилища рядом,
-    /// галка "запомнить" — под ними.
+    /// Login form for a fresh token: token and vault password side by side.
     fn login_token_form(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("НОВЫЙ ВХОД").size(10.0).color(self.theme.text_secondary));
         ui.add_space(10.0);
@@ -373,7 +345,7 @@ impl App {
         }
     }
 
-    /// Форма входа в уже сохранённый аккаунт: нужен только пароль хранилища.
+    /// Login form for a saved account: only the vault password is needed.
     fn login_account_form(&mut self, ui: &mut egui::Ui) {
         let Some(token) = self.login_selected.clone() else { return };
         let name = self
@@ -442,10 +414,7 @@ impl App {
 
     fn login_footer(&self, ui: &mut egui::Ui) {
         if !self.status.is_empty() {
-            // Т-12: состояние соединения — не ошибка входа. Красный оставлен
-            // отказам (неверный токен, пароль хранилища), а «Connecting…» /
-            // «Reconnecting…» показываются нейтрально, иначе пользователь
-            // читает красное «Reconnecting: websocket closed» как свою ошибку.
+            // Connection states aren't login errors; red is reserved for real failures.
             let color = if is_connection_status(&self.status) {
                 self.theme.text_secondary
             } else {
@@ -459,8 +428,7 @@ impl App {
                 .size(11.0)
                 .color(self.theme.text_secondary));
         }
-        // Подсказка про существующий файл: сразу видно, что аккаунты на
-        // диске есть и нужен именно тот пароль, которым их сохраняли.
+        // Hint that the vault file exists, so the right password is needed.
         if !self.accounts_unlocked {
             if let Some(age) = self.vault_age_text() {
                 ui.label(
@@ -505,10 +473,7 @@ mod tests {
     use super::*;
     use crate::models::StoredAccount;
 
-    /// Позиции всех нарисованных строк текста: (текст, x, y).
-    ///
-    /// Кадров два: высоту нижней панели egui узнаёт по содержимому первого
-    /// прохода, и только со второго панель стоит на своём месте.
+    /// Positions of all drawn text lines: (text, x, y); run two frames so panels settle.
     fn texts(app: &mut App) -> Vec<(String, f32, f32)> {
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
@@ -536,11 +501,7 @@ mod tests {
             .collect()
     }
 
-    /// Текст вместе с цветом: нужен там, где важно не только «что написано»,
-    /// но и «как выглядит» (ошибка входа красная, состояние соединения — нет).
-    ///
-    /// Цвет берём из первого раздела набора: `RichText::color` кладёт его
-    /// именно туда, а `fallback_color` у всех подписей одинаковый.
+    /// Text with color, for checking how it looks; color comes from the first galley section.
     fn colored_texts(app: &mut App) -> Vec<(String, Color32, f32, f32)> {
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
@@ -575,9 +536,7 @@ mod tests {
         app
     }
 
-    /// Состояние соединения — не ошибка входа: красный цвет должен остаться
-    /// настоящим отказам. Раньше `login_footer` красил любой `status` красным,
-    /// и «Reconnecting: websocket closed» выглядело как ошибка пользователя.
+    /// Connection status isn't a login error and must not be painted red.
     #[test]
     fn connection_status_is_not_painted_as_login_error() {
         let mut app = make_app();
@@ -592,7 +551,7 @@ mod tests {
         assert_ne!(color, ERROR_RED, "сеть — не ошибка входа");
         assert_eq!(color, app.theme.text_secondary);
 
-        // А настоящий отказ по-прежнему красный.
+        // A real failure is still red.
         app.status = "Неверный токен".into();
         let list = colored_texts(&mut app);
         let color = list
@@ -603,9 +562,7 @@ mod tests {
         assert_eq!(color, ERROR_RED, "ошибку входа нужно красить красным");
     }
 
-    /// В подписи входа не должно быть строк геометрии: они пишутся каждый кадр
-    /// и вытесняют человеческие сообщения. Раньше можно было увидеть
-    /// «Last: SCROLL: inner_h=…» — внутреннее измерение в лицо пользователю.
+    /// The login footer must hide per-frame geometry debug lines.
     #[test]
     fn login_footer_hides_geometry_debug_lines() {
         let mut app = make_app();
@@ -629,7 +586,7 @@ mod tests {
         );
     }
 
-    /// Токен и пароль хранилища — в одну строку, галка «запомнить» под ними.
+    /// Token and vault password on one row, with "remember" below.
     #[test]
     fn token_and_password_are_in_one_row() {
         let mut app = make_app();
@@ -645,12 +602,12 @@ mod tests {
         assert!((ty - py).abs() < 0.5, "поля должны быть в одной строке: y {} vs {}", ty, py);
         assert!(px > tx + 100.0, "пароль должен быть справа от токена: x {} vs {}", px, tx);
 
-        // Подписи полей — тоже в одной строке.
+        // Field labels are on one row too.
         let lbl_t = at(&list, "Токен");
         let lbl_p = at(&list, "Пароль хранилища");
         assert!((lbl_t[0].1 - lbl_p[0].1).abs() < 0.5, "подписи полей не в одной строке");
 
-        // Галка «запомнить» — ниже обоих полей.
+        // "Remember" is below both fields.
         let remember = at(&list, "Запомнить этот аккаунт");
         assert_eq!(remember.len(), 1, "галка не найдена");
         assert!(
@@ -661,7 +618,7 @@ mod tests {
         );
     }
 
-    /// Надпись «Показать сохранённые аккаунты» должна быть ровно одна.
+    /// The "show saved accounts" caption must appear exactly once.
     #[test]
     fn saved_accounts_caption_is_not_duplicated() {
         let mut app = make_app();
@@ -672,14 +629,14 @@ mod tests {
             "надпись должна быть ровно один раз"
         );
 
-        // Если токен введён — кнопка становится «Войти», лишней надписи нет.
+        // With a token entered, the button becomes the login action and the caption disappears.
         app.token_input = "MTIz.token.value".into();
         let list = texts(&mut app);
         assert!(at(&list, "Показать сохранённые аккаунты").is_empty());
         assert_eq!(at(&list, "Войти").len(), 1);
     }
 
-    /// Сохранённые аккаунты рисуются полосой снизу, и по клику выбирается аккаунт.
+    /// Saved accounts render as a bottom strip; clicking selects one.
     #[test]
     fn account_strip_lists_accounts() {
         let mut app = make_app();
@@ -690,16 +647,11 @@ mod tests {
         let list = texts(&mut app);
         assert_eq!(at(&list, "АККАУНТЫ").len(), 1, "полоса аккаунтов не нарисована");
         assert_eq!(at(&list, "alice").len(), 1);
-        // Без имени показывается маска токена.
+        // Nameless accounts show a token mask.
         assert_eq!(at(&list, "••••").len(), 1, "аккаунт без имени не показан: {:?}", list);
     }
 
-    /// Аккаунты в ленте выстраиваются сеткой с переносом, а не одной длинной
-    /// строкой с горизонтальной прокруткой.
-    ///
-    /// Раньше список жил в `ScrollArea::horizontal`: при десятке аккаунтов они
-    /// уезжали за край окна, и добраться до дальних можно было только
-    /// прокруткой, о которой ничего не говорило.
+    /// Accounts wrap into a grid, not one horizontally scrolled row.
     #[test]
     fn many_accounts_wrap_into_a_grid() {
         let mut app = make_app();
@@ -721,9 +673,7 @@ mod tests {
         );
     }
 
-    /// Крестик удаления показывается только у выбранного аккаунта, а по
-    /// умолчанию не мозолит глаза: десять крестиков подряд перекрывали сами
-    /// аккаунты, из-за которых лента и нужна.
+    /// The remove ✕ appears only for the selected account.
     #[test]
     fn remove_button_hides_until_selected() {
         let mut app = make_app();

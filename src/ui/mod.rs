@@ -6,18 +6,13 @@ mod input;
 mod login;
 mod sidebar;
 
-/// Цвет, которым рисуют то, что пошло не так: неудачная отправка, отказ
-/// Discord. Жил в login.rs приватной константой, поэтому в чате — единственном
-/// месте, где неудача реально случается, — показать её было нечем.
+/// Color for failures: failed sends and Discord errors.
 pub(crate) const ERROR_RED: Color32 = Color32::from_rgb(250, 77, 77);
 
 impl crate::app::App {
-    /// Полоса «хранилище старого формата» вверху окна.
+    /// "Legacy vault" banner at the top of the window.
     ///
-    /// В старом открытом файле пароля нет вовсе, поэтому подходит любой ввод, и
-    /// раньше первая же запись перешифровывала файл этим (случайным) паролем.
-    /// Теперь запись ждёт подтверждения, а подтверждение надо где-то нажать —
-    /// экран входа после входа исчезает, значит полоса нужна в чате.
+    /// The login screen is gone after sign-in, so confirmation lives here.
     pub(crate) fn draw_legacy_vault_banner(&mut self, ctx: &egui::Context) {
         if !self.vault_legacy {
             return;

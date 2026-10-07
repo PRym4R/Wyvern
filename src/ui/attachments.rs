@@ -4,35 +4,36 @@ use eframe::egui::RichText;
 use crate::app::App;
 use crate::models::ChatMessage;
 
-/// Есть ли в строке подстрока без учёта регистра. Свой вариант вместо
-/// `to_lowercase()`, потому что вызывается на каждом кадре для каждой
-/// картинки, а копия строки URL — это лишняя аллокация мусора.
+/// Case-insensitive substring check; avoids a `to_lowercase()` allocation per frame.
 fn contains_ci(hay: &str, needle: &str) -> bool {
     let (h, n) = (hay.as_bytes(), needle.as_bytes());
     !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// Заканчивается ли строка на подстроку без учёта регистра.
+/// Case-insensitive suffix check.
 fn ends_with_ci(hay: &str, needle: &str) -> bool {
     let (h, n) = (hay.as_bytes(), needle.as_bytes());
     h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n)
 }
 
+/// Builds the URL tooltip only on hover, so `to_string` isn't run every frame.
+fn hover_text_lazy(response: egui::Response, make: impl FnOnce() -> String) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.label(make());
+    })
+}
+
 const VIDEO_EXTS: [&str; 5] = [".mp4", ".webm", ".ogg", ".m4v", ".mov"];
 
-/// Во сколько картинку в чате можно показывать. От этого зависит и размер
-/// текстуры, и высота сообщения в списке.
+/// Max size an image may be displayed at in chat.
 pub(crate) const MAX_IMAGE_DISPLAY: f32 = 360.0;
 
-/// Место под картинку, для которой Discord не прислал размер. Берётся
-/// только как последний обходной путь: обычно размер известен заранее, и
-/// резервируется ровно столько места, сколько картинка займёт. Число одно
-/// и то же для оценки высоты сообщения и для отрисовки, иначе список дёргается.
+/// Fallback placeholder height for images with no known size. Shared by
+/// height estimation and drawing so the list doesn't jump.
 pub(crate) const IMAGE_PLACEHOLDER: f32 = 180.0;
 
-/// Ссылка на картинку из эмбеда, если её вообще нужно показывать.
-/// Аватары и видео пропускаем: аватары мы рисуем отдельно, видео всё равно
-/// нечем показать. Возвращаем кусок исходной строки, а не её копию.
+/// Returns an embed image URL worth showing: skips avatars and videos.
+/// Borrows from the input rather than copying.
 pub(crate) fn embed_image_url(url: &str) -> Option<&str> {
     if url.is_empty() {
         return None;
@@ -46,14 +47,10 @@ pub(crate) fn embed_image_url(url: &str) -> Option<&str> {
     Some(url)
 }
 
-/// Перебрать картинки сообщения — вложения и эмбеды — и вызвать `f` на
-/// каждой. Вместе со ссылкой отдаём размер, который Discord прислал рядом с
-/// ней: по нему место под картинку резервируется точно, не дожидаясь
-/// загрузки, и сообщение не меняет высоту, когда картинка наконец приходит.
+/// Calls `f` for each image (attachment or embed) with its known size, so
+/// space is reserved without waiting for the download.
 ///
-/// Список не собирается: он нужен на каждом кадре и для каждого сообщения
-/// (в том числе для оценки высоты ещё не нарисованных), а копия URL'ов в куче
-/// — ровно та аллокация, ради которой эту строчку когда-то и переписывали.
+/// Iterates instead of collecting: this runs every frame for every message.
 pub(crate) fn for_each_image(msg: &ChatMessage, mut f: impl FnMut(&str, Option<egui::Vec2>)) {
     for att in &msg.attachments {
         if att.content_type.as_deref().map(|ct| ct.starts_with("image/")).unwrap_or(false) {
@@ -67,12 +64,12 @@ pub(crate) fn for_each_image(msg: &ChatMessage, mut f: impl FnMut(&str, Option<e
     }
 }
 
-/// Размер из пары `width`/`height` в виде, который ждёт `display_size`.
+/// Converts a `width`/`height` pair to the `Vec2` `display_size` expects.
 fn known_size(size: Option<[u32; 2]>) -> Option<egui::Vec2> {
     size.map(|[w, h]| egui::vec2(w as f32, h as f32))
 }
 
-/// Высота картинки в чате: настоящая, если она уже в кэше.
+/// Image size as displayed in chat, scaled down to fit `MAX_IMAGE_DISPLAY`.
 pub(crate) fn display_size(size: egui::Vec2) -> egui::Vec2 {
     if size.x <= 0.0 || size.y <= 0.0 {
         return egui::Vec2::ZERO;
@@ -81,10 +78,8 @@ pub(crate) fn display_size(size: egui::Vec2) -> egui::Vec2 {
     egui::vec2(size.x * scale, size.y * scale)
 }
 
-/// Сколько места займёт картинка в сообщении, когда её ещё нет в кэше.
-/// Размер Discord присылает вместе со ссылкой, поэтому место резервируется
-/// точно и сообщение не скачет на сотни пикселей в момент загрузки. Если
-/// размера нет (старые сообщения, битая ссылка) — берём заглушку.
+/// Space an image will occupy before it's cached, so the message doesn't jump.
+/// Falls back to `IMAGE_PLACEHOLDER` when no size is known.
 pub(crate) fn reserved_size(known: Option<egui::Vec2>) -> egui::Vec2 {
     match known {
         Some(s) => display_size(s),
@@ -94,17 +89,14 @@ pub(crate) fn reserved_size(known: Option<egui::Vec2>) -> egui::Vec2 {
 
 impl App {
     pub(crate) fn draw_attachments(&mut self, ui: &mut egui::Ui, msg: &ChatMessage) {
-        // Ссылка на картинку в уже скачанном виде или место под неё: URL'ы
-        // берём из сообщения, а не копируем — список показывается на каждом
-        // кадре, и копии URL'ов в куче не нужны.
+        // Draw the downloaded image or reserve its space; URLs are borrowed,
+        // not copied.
         for_each_image(msg, |url, known| {
             if let Some(tex) = self.download_image(ui.ctx(), url) {
-                // Картинка (или гифка) на экране: не дадим вытеснить её из
-                // кэша, пока её видно. Иначе в следующем кадре её снова
-                // качают — она мигает, и высота сообщения скачет.
+                // Keep a visible image pinned in the cache, or it gets
+                // re-downloaded next frame and flickers.
                 self.image_cache.mark_visible(url);
-                // Анимированную нужно перерисовывать непрерывно, пока она на
-                // экране: в покое кадров больше нет (Т-7).
+                // Animated images need continuous repaints while visible.
                 if tex.is_animated() {
                     self.animating = true;
                 }
@@ -112,20 +104,19 @@ impl App {
                 if disp.x <= 0.0 || disp.y <= 0.0 {
                     return;
                 }
-                ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)))
-                    .on_hover_text(url.to_string());
+                let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                hover_text_lazy(resp, || url.to_string());
             } else if self.failed_images.contains(url) {
-                // Картинка не загрузится уже никогда (битая или слишком
-                // большая) — не крутим вечный спиннер, а говорим об этом.
+                // Image will never load (broken or too large): show a note
+                // instead of an endless spinner.
                 ui.label(
                     RichText::new("не удалось загрузить")
                         .size(11.0)
                         .color(self.theme.text_secondary),
                 );
             } else {
-                // Ждём: место под картинку резервируем сразу и ровно столько,
-                // сколько она потом займёт, иначе в момент её появления
-                // высота сообщения скачет и всё, что ниже, уезжает вниз.
+                // Reserve the image's space now so the message doesn't jump
+                // when it appears.
                 let disp = reserved_size(known);
                 let color = self.theme.input_bg;
                 let (rect, _) = ui.allocate_exact_size(disp, egui::Sense::hover());
@@ -145,10 +136,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_ci, embed_image_url, ends_with_ci};
+    use super::{contains_ci, embed_image_url, ends_with_ci, hover_text_lazy};
+    use eframe::egui;
 
-    /// Поведение `embed_image_url` должно совпадать с прежней версией на
-    /// `to_lowercase()`: регистр в URL не должен ничего менять.
+    /// `embed_image_url` must be case-insensitive in URLs.
     #[test]
     fn embed_url_filters_match_old_rules() {
         assert_eq!(embed_image_url("https://cdn.discordapp.com/embeds/1/pic.png"), Some("https://cdn.discordapp.com/embeds/1/pic.png"));
@@ -162,7 +153,7 @@ mod tests {
         assert_eq!(embed_image_url("https://cdn.discordapp.com/embeds/1/clip.ogg"), None);
         assert_eq!(embed_image_url("https://cdn.discordapp.com/embeds/1/clip.M4V"), None);
         assert_eq!(embed_image_url("https://cdn.discordapp.com/embeds/1/clip.mov"), None);
-        // Расширение в середине URL видео не делает.
+        // An extension mid-URL doesn't make it a video.
         assert_eq!(
             embed_image_url("https://cdn.discordapp.com/embeds/1/mp4.png"),
             Some("https://cdn.discordapp.com/embeds/1/mp4.png")
@@ -177,6 +168,36 @@ mod tests {
         assert!(ends_with_ci("clip.MOV", ".mov"));
         assert!(!ends_with_ci("mov", ".mov"));
         assert!(ends_with_ci("anything", ""));
+    }
+
+    /// Tooltip text is built only on hover.
+    #[test]
+    fn tooltip_text_is_built_only_on_hover() {
+        use std::cell::Cell;
+        let ctx = egui::Context::default();
+        let calls = Cell::new(0u32);
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(80.0, 20.0));
+
+        let frame = |pointer: egui::Pos2| {
+            let input = egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let resp = ui.put(rect, egui::Label::new("картинка"));
+                    hover_text_lazy(resp, || {
+                        calls.set(calls.get() + 1);
+                        "https://cdn.discordapp.com/x.png".to_string()
+                    });
+                });
+            });
+        };
+
+        frame(egui::pos2(500.0, 500.0));
+        assert_eq!(calls.get(), 0, "без наведения текст подсказки не строится");
+        frame(rect.center());
+        assert_eq!(calls.get(), 1, "под курсором подсказка строится");
     }
 }
 

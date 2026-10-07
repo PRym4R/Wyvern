@@ -1,9 +1,8 @@
-//! Измерение памяти клиента под реальной нагрузкой.
+//! Client memory measurement under realistic load.
 //!
-//! Файл копируется без правок в базовую и в новую версию, чтобы числа
-//! сравнивались честно: одна и та же нагрузка, один и тот же код замера.
+//! Copied unchanged into both baseline and new versions so numbers compare fairly.
 //!
-//! Запуск: `cargo test --release -- --ignored --nocapture memcheck`
+//! Run: `cargo test --release -- --ignored --nocapture memcheck`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::models::{test_guild, test_user, ChatChannel, ChatMessage};
 
-// ───────────────────────── счётчик аллокаций ─────────────────────────
+// ───────────────────────── allocation counter ─────────────────────────
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -69,7 +68,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-// ───────────────────────── вспомогательное ─────────────────────────
+// ───────────────────────── helpers ─────────────────────────
 
 fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
@@ -105,8 +104,7 @@ fn mb(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/// Нагрузка: 300 сообщений, у каждого текст, картинка-вложение и
-/// «богатый» эмбед (author/footer/provider/fields/thumbnail) — как в жизни.
+/// Load fixture: messages each with text, an image attachment and a rich embed.
 fn fixture_json(n: usize) -> String {
     let mut arr: Vec<Value> = Vec::with_capacity(n);
     for i in 0..n {
@@ -230,7 +228,7 @@ fn report(name: &str, bytes: usize, allocs: usize) {
     );
 }
 
-// ───────────────────────── сам замер ─────────────────────────
+// ───────────────────────── the measurement ─────────────────────────
 
 #[test]
 #[ignore]
@@ -253,9 +251,7 @@ fn memcheck_report() {
         ..Default::default()
     };
 
-    // 0. Пол: пустой клиент без сообщений и картинок. Всё, что дальше
-    // прибавится к этому, — стоимость данных, а не egui, шрифтов и
-    // аллокатора; ниже это и есть настоящая цена картинок.
+    // 0. Baseline: empty client, so later numbers reflect data cost, not egui/fonts.
     let _ = ctx.run(raw.clone(), |ctx| {
         app.draw_chat(ctx);
     });
@@ -269,7 +265,7 @@ fn memcheck_report() {
     let cid = "1234567890123456789";
     let json = fixture_json(300);
 
-    // 1. Сообщения канала.
+    // 1. Channel messages.
     let base = live();
     reset_peak();
     let c0 = count();
@@ -298,8 +294,7 @@ fn memcheck_report() {
         held / n_msgs.max(1)
     );
 
-    // Выбираем этот канал, иначе чат рисует пустой экран приветствия и
-    // десять кадров ничего не меряют.
+    // Select the channel; otherwise chat draws the empty welcome screen.
     app.channels.push(ChatChannel {
         id: cid.to_string(),
         name: "основной".into(),
@@ -310,13 +305,13 @@ fn memcheck_report() {
     });
     app.selected_channel = Some(0);
 
-    // Чтобы рендер не лез в сеть, помечаем все картинки «не загружено».
+    // Mark all images as failed so rendering doesn't hit the network.
     for u in image_urls(&json) {
         app.failed_images.insert(u);
     }
     drop(json);
 
-    // 2. Кэш картинок: 32 обычных + 1 гифка (как сейчас разрешает политика).
+    // 2. Image cache: 32 stills + 1 GIF, as the current policy allows.
     let png = make_png(1600, 1200);
     let gif = make_gif(640, 480, 24);
     let before = live();
@@ -333,7 +328,7 @@ fn memcheck_report() {
     report("1 гифка 640x480 x24", live() - before, app.image_cache.len());
     eprintln!("  кэш картинок с гифкой: {:.2} МБ ({} шт.)", mb(with_gif), app.image_cache.len());
 
-    // 3. Десять кадров отрисовки загруженного канала вместе со списками.
+    // 3. Ten render frames of the loaded channel plus the lists.
     app.guilds.push(test_guild("111111111111111111", "Test Guild"));
     for i in 0..189 {
         app.channels.push(ChatChannel {
@@ -362,9 +357,7 @@ fn memcheck_report() {
     }
     report("10 кадров отрисовки (чат + списки)", total() - t0, count() - c0);
 
-    // Разбираем, сколько из оставшегося мусора — наш код, а сколько сам egui
-    // (на каждый лейбл он всё равно верстает и кэширует текст). Кэши к этому
-    // моменту прогреты, поэтому числа чуть ниже, чем у первых десяти кадров.
+    // Split remaining allocations between our code and egui's text layout/caches.
     let t1 = total();
     let c1 = count();
     for _ in 0..10 {
