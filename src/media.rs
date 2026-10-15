@@ -159,7 +159,7 @@ fn remember_failed(failed: &mut std::collections::HashSet<String>, key: String) 
 /// Only increments the counter when a slot is actually granted.
 fn take_image_slot() -> bool {
     IMAGE_DOWNLOADS_IN_FLIGHT
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
             if v < MAX_CONCURRENT_IMAGE_DOWNLOADS {
                 Some(v + 1)
             } else {
@@ -171,7 +171,7 @@ fn take_image_slot() -> bool {
 
 fn release_image_slot() {
     // saturating: keep the counter at zero instead of wrapping around.
-    let _ = IMAGE_DOWNLOADS_IN_FLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+    let _ = IMAGE_DOWNLOADS_IN_FLIGHT.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
         Some(v.saturating_sub(1))
     });
 }

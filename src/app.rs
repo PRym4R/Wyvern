@@ -133,6 +133,13 @@ pub(crate) struct App {
     pub(crate) egui_ctx: Option<egui::Context>,
     /// Whether an animated image was drawn this frame; it must keep repainting while visible.
     pub(crate) animating: bool,
+    /// URL of the image currently shown full-size, if any.
+    pub(crate) lightbox_url: Option<String>,
+    /// Files selected for the next send (drag-drop / paste).
+    pub(crate) pending_attachments: Vec<String>,
+    /// Quick-switch dialog open (Ctrl+K).
+    pub(crate) quick_switch_open: bool,
+    pub(crate) quick_switch_query: String,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -236,6 +243,10 @@ impl App {
             gw_started: false,
             egui_ctx: None,
             animating: false,
+            lightbox_url: None,
+            pending_attachments: Vec::new(),
+            quick_switch_open: false,
+            quick_switch_query: String::new(),
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),

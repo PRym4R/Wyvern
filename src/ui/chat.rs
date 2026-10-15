@@ -6,6 +6,7 @@ use crate::app::{App, EditTarget, ReplyTarget};
 use crate::messages::ToGateway;
 use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
+use crate::ui::markdown::render_message_text;
 use crate::ui::ERROR_RED;
 
 /// How far beyond the viewport messages are drawn, so fast scrolling
@@ -117,6 +118,8 @@ impl App {
         self.draw_channel_list(ctx);
         let r2 = ctx.available_rect();
         self.draw_input_bar(ctx);
+        self.draw_lightbox(ctx);
+        self.draw_quick_switch(ctx);
         let r3 = ctx.available_rect();
         self.draw_main_chat(ctx);
         let r4 = ctx.available_rect();
@@ -657,7 +660,7 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
-                        ui.label(RichText::new(content).size(14.0).color(self.theme.text));
+                        render_message_text(ui, content, 14.0, self.theme.text);
                         self.draw_attachments(ui, msg);
                     });
                 });
@@ -713,7 +716,7 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
-                        ui.label(RichText::new(content).size(14.0).color(self.theme.text));
+                        render_message_text(ui, content, 14.0, self.theme.text);
                         self.draw_attachments(ui, msg);
                     });
                 });
@@ -722,6 +725,81 @@ impl App {
                 ui.add_space(6.0);
         }
     }
+    pub(crate) fn draw_lightbox(&mut self, ctx: &egui::Context) {
+        let Some(url) = self.lightbox_url.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Просмотр")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                if let Some(tex) = self.image_cache.get(&url).cloned().or_else(|| self.download_image(ui.ctx(), &url)) {
+                    let size = tex.size_vec2();
+                    let max = ui.ctx().screen_rect().size() * 0.85;
+                    let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
+                    let disp = egui::vec2(size.x * scale, size.y * scale);
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                } else {
+                    ui.spinner();
+                }
+                if ui.button("Закрыть").clicked() {
+                    open = false;
+                }
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.lightbox_url = None;
+        }
+    }
+
+    pub(crate) fn draw_quick_switch(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
+            self.quick_switch_open = true;
+        }
+        if !self.quick_switch_open {
+            return;
+        }
+        let mut open = self.quick_switch_open;
+        egui::Window::new("Быстрый переход")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.quick_switch_query)
+                        .hint_text("Канал..."),
+                );
+                ui.separator();
+                let query = self.quick_switch_query.to_lowercase();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for i in 0..self.channels.len() {
+                            let Some(ch) = self.channels.get(i) else { continue };
+                            if !query.is_empty() && !ch.name.to_lowercase().contains(&query) {
+                                continue;
+                            }
+                            let label = if ch.guild_id.is_some() {
+                                format!("# {}", ch.name)
+                            } else {
+                                format!("@ {}", ch.name)
+                            };
+                            if ui.button(label).clicked() {
+                                let cid = ch.id.clone();
+                                self.selected_channel = Some(i);
+                                self.scroll_to_bottom = true;
+                                self.open_channel(&cid);
+                                self.quick_switch_open = false;
+                                self.quick_switch_query.clear();
+                            }
+                        }
+                    });
+            });
+        self.quick_switch_open = open;
+        if !open {
+            self.quick_switch_query.clear();
+        }
+    }
+
 }
 
 #[cfg(test)]

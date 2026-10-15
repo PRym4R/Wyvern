@@ -489,3 +489,66 @@ pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Opt
 pub(crate) fn more_history_available(got: usize) -> bool {
     got >= HISTORY_PAGE
 }
+
+pub(super) async fn send_files(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    content: String,
+    paths: Vec<String>,
+    reply_to: Option<String>,
+) {
+    let url = format!("{}/channels/{}/messages", API_BASE, channel_id);
+    let mut payload = json!({ "content": content });
+    if let Some(reference) = reply_to.as_deref() {
+        payload["message_reference"] = json!({
+            "message_id": reference,
+            "channel_id": channel_id.as_str(),
+        });
+    }
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("payload_json", payload.to_string());
+
+    for (i, path) in paths.iter().enumerate() {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file".to_string());
+                let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
+                form = form.part(format!("files[{}]", i), part);
+            }
+            Err(e) => {
+                let _ = event_tx.send(ToApp::Debug(format!("Read file error: {}", e)));
+                return;
+            }
+        }
+    }
+
+    let req = httpc
+        .post(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+        .multipart(form);
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                let _ = event_tx.send(ToApp::Debug(format!("Send files failed {}: {}", status, body)));
+            } else {
+                let _ = event_tx.send(ToApp::Debug("Files sent".into()));
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Send files error: {}", e)));
+        }
+    }
+}

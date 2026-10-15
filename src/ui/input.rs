@@ -43,6 +43,38 @@ pub(crate) fn trim_input(text: &str) -> &str {
 
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<String> = ctx
+            .input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().to_string()))
+                    .collect()
+            });
+        for path in dropped {
+            if !self.pending_attachments.contains(&path) {
+                self.pending_attachments.push(path);
+            }
+        }
+        let pasted: Vec<String> = ctx
+            .input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| {
+                        if let egui::Event::Paste(text) = e {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
+        for text in pasted {
+            let path = text.trim().to_string();
+            if std::path::Path::new(&path).is_file() && !self.pending_attachments.contains(&path) {
+                self.pending_attachments.push(path);
+            }
+        }
         let has_channel = self.selected_channel.is_some();
         let ch_name = self.selected_channel
             .and_then(|i| self.channels.get(i))
@@ -101,6 +133,24 @@ impl App {
                                 .truncate(),
                             );
                         });
+                    });
+                }
+                if !self.pending_attachments.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(12.0);
+                        let mut remove = None;
+                        for i in 0..self.pending_attachments.len() {
+                            let name = std::path::Path::new(&self.pending_attachments[i])
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| self.pending_attachments[i].clone());
+                            if ui.small_button(format!("{} x", name)).clicked() {
+                                remove = Some(i);
+                            }
+                        }
+                        if let Some(i) = remove {
+                            self.pending_attachments.remove(i);
+                        }
                     });
                 }
                 ui.horizontal(|ui| {
@@ -226,6 +276,31 @@ impl App {
 
     /// Enter or "Send": send if there's text, then always clear the field so whitespace doesn't linger.
     pub(crate) fn submit_input(&mut self) {
+        if !self.pending_attachments.is_empty() {
+            if let Some(idx) = self.selected_channel {
+                let cid = self.channels[idx].id.clone();
+                let text = trim_input(&self.input).to_string();
+                if !within_message_limit(&text) {
+                    self.push_debug(format!(
+                        "Message over limit: {} chars > {}",
+                        text.chars().count(),
+                        MAX_MESSAGE_CHARS
+                    ));
+                    return;
+                }
+                let paths = std::mem::take(&mut self.pending_attachments);
+                let reply_to = self.reply_to.take().map(|r| r.message_id);
+                self.send_error = None;
+                self.input.clear();
+                self.send_cmd(ToGateway::SendFiles {
+                    channel_id: cid,
+                    content: text,
+                    paths,
+                    reply_to,
+                });
+            }
+            return;
+        }
         let text = trim_input(&self.input).to_string();
         // Too long: don't send and don't clear, so the text can be shortened.
         if !within_message_limit(&text) {

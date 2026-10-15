@@ -105,6 +105,10 @@ impl App {
                     return;
                 }
                 let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    self.lightbox_url = Some(url.to_string());
+                }
                 hover_text_lazy(resp, || url.to_string());
             } else if self.failed_images.contains(url) {
                 // Image will never load (broken or too large): show a note
@@ -131,6 +135,18 @@ impl App {
                 );
             }
         });
+        for att in &msg.attachments {
+            let is_image = att
+                .content_type
+                .as_deref()
+                .map(|ct| ct.starts_with("image/"))
+                .unwrap_or(false);
+            if is_image {
+                continue;
+            }
+            let name = att.url.rsplit('/').next().unwrap_or(&att.url);
+            ui.hyperlink_to(name, &att.url);
+        }
     }
 }
 

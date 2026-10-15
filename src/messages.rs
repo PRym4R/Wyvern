@@ -49,6 +49,8 @@ pub(crate) enum ToGateway {
     /// failure. `reply_to` is the id of the message being answered, if any;
     /// it becomes `message_reference` in the REST body.
     Send { channel_id: String, content: String, local_id: String, reply_to: Option<String> },
+    /// Send a message with file attachments read from disk.
+    SendFiles { channel_id: String, content: String, paths: Vec<String>, reply_to: Option<String> },
     /// Edit one of our messages. Discord answers with MESSAGE_UPDATE, which is
     /// what actually replaces the row; a rejection comes back as `EditFailed`.
     EditMessage { channel_id: String, message_id: String, content: String },
