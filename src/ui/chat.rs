@@ -118,10 +118,10 @@ impl App {
         self.draw_channel_list(ctx);
         let r2 = ctx.available_rect();
         self.draw_input_bar(ctx);
-        self.draw_lightbox(ctx);
         self.draw_quick_switch(ctx);
         let r3 = ctx.available_rect();
         self.draw_main_chat(ctx);
+        self.draw_lightbox(ctx);
         let r4 = ctx.available_rect();
         if self.debug_frames % 15 == 0 {
             self.push_debug(format!("FRAME: screen={:.0}x{:.0} servers={:.0}x{:.0} channels={:.0}x{:.0} input={:.0}x{:.0} chat={:.0}x{:.0}",
@@ -773,15 +773,39 @@ impl App {
                 egui::ScrollArea::vertical()
                     .max_height(240.0)
                     .show(ui, |ui| {
+                        let selected_guild_id = self
+                            .selected_guild
+                            .and_then(|gi| self.guilds.get(gi).map(|g| g.id.clone()));
+                        let cross_server = !query.is_empty();
                         for i in 0..self.channels.len() {
                             let Some(ch) = self.channels.get(i) else { continue };
+                            let same_scope = match selected_guild_id.as_deref() {
+                                Some(gid) => ch.guild_id.as_deref() == Some(gid) || ch.guild_id.is_none(),
+                                None => ch.guild_id.is_none(),
+                            };
+                            if !cross_server && !same_scope {
+                                continue;
+                            }
                             if !query.is_empty() && !ch.name.to_lowercase().contains(&query) {
                                 continue;
                             }
-                            let label = if ch.guild_id.is_some() {
-                                format!("# {}", ch.name)
+                            let guild_tag = if cross_server {
+                                match &ch.guild_id {
+                                    Some(gid) => self
+                                        .guilds
+                                        .iter()
+                                        .find(|g| g.id == *gid)
+                                        .map(|g| format!(" [{}]", g.name))
+                                        .unwrap_or_default(),
+                                    None => " [DM]".to_string(),
+                                }
                             } else {
-                                format!("@ {}", ch.name)
+                                String::new()
+                            };
+                            let label = if ch.guild_id.is_some() {
+                                format!("# {}{}", ch.name, guild_tag)
+                            } else {
+                                format!("@ {}{}", ch.name, guild_tag)
                             };
                             if ui.button(label).clicked() {
                                 let cid = ch.id.clone();

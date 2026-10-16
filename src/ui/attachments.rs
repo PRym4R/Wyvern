@@ -104,9 +104,18 @@ impl App {
                 if disp.x <= 0.0 || disp.y <= 0.0 {
                     return;
                 }
-                let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)).sense(egui::Sense::all()));
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                if resp.clicked() {
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let rect_click = ui.ctx().pointer_latest_pos()
+                    .map(|p| resp.rect.contains(p) && ui.ctx().input(|i| i.pointer.primary_clicked()))
+                    .unwrap_or(false);
+                if resp.clicked() || rect_click {
+                    self.lightbox_url = Some(url.to_string());
+                }
+                if ui.small_button("🔍").clicked() {
                     self.lightbox_url = Some(url.to_string());
                 }
                 hover_text_lazy(resp, || url.to_string());
