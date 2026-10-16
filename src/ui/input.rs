@@ -15,6 +15,8 @@ const DEBUG_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs
 const MIN_INPUT_WIDTH: f32 = 60.0;
 /// Tallest the composer grows before it scrolls instead (about six rows).
 const COMPOSER_MAX_H: f32 = 120.0;
+/// How many rows the composer wants before it starts scrolling (six rows).
+const COMPOSER_ROWS_MAX: usize = 6;
 /// Space around the composer field inside its panel (top/bottom gaps + frame).
 const COMPOSER_CHROME: f32 = 20.0;
 /// Row space taken by padding, channel name, "Send" button and gaps.
@@ -32,6 +34,13 @@ pub(crate) fn within_message_limit(text: &str) -> bool {
 /// Input-field width from the row's free space, clamped to a minimum.
 pub(crate) fn input_width(available: f32) -> f32 {
     (available - INPUT_CHROME).max(MIN_INPUT_WIDTH)
+}
+
+/// How many rows the composer wants: every newline counts, plus the current line.
+/// Past `COMPOSER_ROWS_MAX` the field stops growing and scrolls instead.
+fn composer_rows(input: &str) -> usize {
+    let rows = input.matches('\n').count() + 1;
+    rows.clamp(1, COMPOSER_ROWS_MAX)
 }
 
 /// Trim whitespace plus invisible characters that plain `trim()` misses.
@@ -186,6 +195,7 @@ impl App {
                         // COMPOSER_MAX_H, then scrolls. Enter sends;
                         // Shift+Enter inserts a newline (see `return_key`).
                         let field_id = egui::Id::new("message_input");
+                        let desired_rows = composer_rows(&self.input);
                         let focused = ui.memory(|m| m.has_focus(field_id));
                         let enter_sends = focused
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
@@ -201,7 +211,7 @@ impl App {
                                     egui::TextEdit::multiline(&mut self.input)
                                         .id(field_id)
                                         .desired_width(field_w)
-                                        .desired_rows(1)
+                                        .desired_rows(desired_rows)
                                         .return_key(Some(egui::KeyboardShortcut::new(
                                             egui::Modifiers::SHIFT,
                                             egui::Key::Enter,
