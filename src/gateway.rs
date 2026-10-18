@@ -521,7 +521,9 @@ async fn gw_inner(
                                                                         let mut channels: Vec<ChatChannel> = Vec::new();
                                                                         for c in arr {
                                                                             let ctype = c["type"].as_i64().unwrap_or(0);
-                                                                            if ctype == 0 || ctype == 11 || ctype == 12 {
+                                                                            // Text, announcement (5), threads, and the
+                                                                            // categories (4) that group them.
+                                                                            if matches!(ctype, 0 | 4 | 5 | 11 | 12) {
                                                                                 channels.push(ChatChannel {
                                                                                     id: c["id"].as_str().unwrap_or("").to_string(),
                                                                                     name: c["name"].as_str().unwrap_or("unknown").to_string(),
@@ -529,6 +531,7 @@ async fn gw_inner(
                                                                                     channel_type: ctype,
                                                                                     topic: c["topic"].as_str().map(|s| s.to_string()),
                                                                                     position: c["position"].as_i64().unwrap_or(0) as i32,
+                                                                                    parent_id: c["parent_id"].as_str().map(|s| s.to_string()),
                                                                                 });
                                                                             }
                                                                         }
@@ -631,6 +634,7 @@ async fn gw_inner(
                                             channel_type: ctype,
                                             topic: None,
                                             position: 0,
+                                            parent_id: None,
                                         }));
                                     }
                                 }
@@ -719,6 +723,7 @@ async fn gw_inner(
                                             channel_type: ctype,
                                             topic,
                                             position: pos,
+                                            parent_id: ch["parent_id"].as_str().map(|s| s.to_string()),
                                         }));
                                     }
                                 }
@@ -739,6 +744,7 @@ async fn gw_inner(
                                         channel_type: ctype,
                                         topic: None,
                                         position: 0,
+                                        parent_id: None,
                                     }));
                                 } else {
                                     let _ = event_tx.send(ToApp::Channel(ChatChannel {
@@ -748,6 +754,7 @@ async fn gw_inner(
                                         channel_type: ctype,
                                         topic: d["topic"].as_str().map(|s| s.to_string()),
                                         position: d["position"].as_i64().unwrap_or(0) as i32,
+                                        parent_id: d["parent_id"].as_str().map(|s| s.to_string()),
                                     }));
                                 }
                             }

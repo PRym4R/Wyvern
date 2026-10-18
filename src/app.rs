@@ -125,6 +125,8 @@ pub(crate) struct App {
     pub(crate) unread: HashMap<String, u32>,
     /// Unread messages that mention us, a subset of `unread`, shown in red.
     pub(crate) mentions: HashMap<String, u32>,
+    /// Category ids whose children are hidden in the sidebar.
+    pub(crate) collapsed_categories: HashSet<String>,
     pub(crate) input: String,
     /// Natural height of the multiline composer, measured last frame; drives the panel height.
     pub(crate) composer_h: f32,
@@ -284,6 +286,7 @@ impl App {
             typing: HashMap::new(),
             unread: HashMap::new(),
             mentions: HashMap::new(),
+            collapsed_categories: HashSet::new(),
             input: String::new(),
             composer_h: 0.0,
             reply_to: None,
@@ -677,7 +680,10 @@ impl App {
 
                         let gid = self.guilds.get(guild_idx).map(|g| g.id.clone());
                         if let Some(gid) = gid {
-                            let chan_idx = self.channels.iter().position(|c| c.guild_id.as_deref() == Some(gid.as_str()));
+                            let chan_idx = self.channels.iter().position(|c| {
+                                c.guild_id.as_deref() == Some(gid.as_str())
+                                    && matches!(c.channel_type, 0 | 5)
+                            });
                             if let Some(chan_idx) = chan_idx {
                                 self.selected_channel = Some(chan_idx);
                                 let cid = self.channels[chan_idx].id.clone();
@@ -1325,6 +1331,59 @@ impl App {
             mentions += m;
         }
         (unread, mentions)
+    }
+
+    /// Sidebar order for a guild: loose text channels first, then one group per
+    /// category (its channel indices, by position). Channels whose parent is a
+    /// thread rather than a category are left out, as before.
+    pub(crate) fn guild_channel_layout(
+        &self,
+        guild_id: &str,
+    ) -> (Vec<usize>, Vec<(usize, Vec<usize>)>) {
+        let text_like = |ch: &ChatChannel| matches!(ch.channel_type, 0 | 5);
+        let in_guild = |ch: &ChatChannel| ch.guild_id.as_deref() == Some(guild_id);
+        let mut loose: Vec<usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| {
+                in_guild(ch)
+                    && text_like(ch)
+                    && ch
+                        .parent_id
+                        .as_deref()
+                        .map(|p| !self.channels.iter().any(|c| c.id == p && c.channel_type == 4))
+                        .unwrap_or(true)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        loose.sort_by_key(|&i| self.channels[i].position);
+        let mut cats: Vec<usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| in_guild(ch) && ch.channel_type == 4)
+            .map(|(i, _)| i)
+            .collect();
+        cats.sort_by_key(|&i| self.channels[i].position);
+        let groups = cats
+            .into_iter()
+            .map(|ci| {
+                let cat_id = self.channels[ci].id.as_str();
+                let mut kids: Vec<usize> = self
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ch)| {
+                        in_guild(ch) && text_like(ch) && ch.parent_id.as_deref() == Some(cat_id)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                kids.sort_by_key(|&i| self.channels[i].position);
+                (ci, kids)
+            })
+            .collect();
+        (loose, groups)
     }
 
     /// Takes the open channel's messages for the frame so rendering owns the Vec and

@@ -47,7 +47,7 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 230 tests (229 + measurement)
+cargo test --release                                        # 231 tests (230 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -107,6 +107,12 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   servers get the same badge aggregated over their channels.
 - Opening a channel clears its badge at once and sends Discord a best-effort
   read receipt for the newest message.
+
+### Channel categories and announcements
+
+- Guild channels are grouped under their categories: a collapsible header above
+  each group, children ordered by position, and uncategorized channels kept at
+  the top. Announcement channels show a 📢 marker.
 
 ## 0.7.0 — 2026-10-18
 

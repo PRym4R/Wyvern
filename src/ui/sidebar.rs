@@ -175,6 +175,40 @@ impl App {
                 });
             });
     }
+    /// One text/announcement channel row with its unread badge; opens the
+    /// channel when clicked.
+    fn draw_channel_row(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(ch) = self.channels.get(i) else { return };
+        let prefix = if ch.channel_type == 5 { "📢" } else { "#" };
+        let is_sel = self.selected_channel == Some(i);
+        let (unread, mentions) = self.channel_badge(&ch.id);
+        let label = if mentions > 0 {
+            format!("{} {}  @{}", prefix, ch.name, mentions)
+        } else if unread > 0 {
+            format!("{} {}  ({})", prefix, ch.name, unread)
+        } else {
+            format!("{} {}", prefix, ch.name)
+        };
+        let mut text = RichText::new(&label).size(14.0);
+        text = if is_sel || mentions > 0 {
+            text.color(Color32::WHITE).strong()
+        } else if unread > 0 {
+            text.color(self.theme.text)
+        } else {
+            text.color(self.theme.text_secondary)
+        };
+        let response = ui.add_sized(
+            [ui.available_width(), 32.0],
+            egui::Button::new(text)
+                .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT }),
+        );
+        if response.clicked() {
+            let cid = ch.id.clone();
+            self.selected_channel = Some(i);
+            self.scroll_to_bottom = true;
+            self.open_channel(&cid);
+        }
+    }
     pub(crate) fn draw_channel_list(&mut self, ctx: &egui::Context) {
         let panel = egui::SidePanel::left("channels")
             .resizable(true)
@@ -199,49 +233,41 @@ impl App {
                         ui.separator();
                         ui.add_space(4.0);
 
-                        // Collect only channel indices, not channel clones, each frame.
-                        let ch_idx: Vec<usize> = self.channels.iter()
-                            .enumerate()
-                            .filter(|(_, ch)| {
-                                ch.guild_id.as_deref() == Some(guild.id.as_str()) && ch.channel_type == 0
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
+                        // Group text channels under their categories; the layout
+                        // is computed before the scroll closure so the `guild`
+                        // borrow ends before we touch `self` mutably.
+                        let (loose, groups) = self.guild_channel_layout(&guild.id);
                         #[cfg(test)]
                         {
                             // Test-only probe: how many times the guild was cloned.
                             self.probe_channel_guild_cloned = 0;
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for i in ch_idx {
-                                let Some(ch) = self.channels.get(i) else { continue };
-                                let is_sel = self.selected_channel == Some(i);
-                                let (unread, mentions) = self.channel_badge(&ch.id);
-                                let label = if mentions > 0 {
-                                    format!("# {}  @{}", ch.name, mentions)
-                                } else if unread > 0 {
-                                    format!("# {}  ({})", ch.name, unread)
-                                } else {
-                                    format!("# {}", ch.name)
-                                };
-                                let mut text = RichText::new(&label).size(14.0);
-                                text = if is_sel || mentions > 0 {
-                                    text.color(Color32::WHITE).strong()
-                                } else if unread > 0 {
-                                    text.color(self.theme.text)
-                                } else {
-                                    text.color(self.theme.text_secondary)
-                                };
-                                let response = ui.add_sized(
-                                    [ui.available_width(), 32.0],
-                                    egui::Button::new(text)
-                                        .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT }),
+                            for i in loose {
+                                self.draw_channel_row(ui, i);
+                            }
+                            for (ci, kids) in groups {
+                                let Some(cat) = self.channels.get(ci) else { continue };
+                                let collapsed = self.collapsed_categories.contains(&cat.id);
+                                let arrow = if collapsed { "▸" } else { "▾" };
+                                let header = format!("{} {}", arrow, cat.name.to_uppercase());
+                                let resp = ui.add_sized(
+                                    [ui.available_width(), 26.0],
+                                    egui::Button::new(
+                                        RichText::new(header).size(12.0).color(self.theme.text_secondary),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
                                 );
-                                if response.clicked() {
-                                    let cid = ch.id.clone();
-                                    self.selected_channel = Some(i);
-                                    self.scroll_to_bottom = true;
-                                    self.open_channel(&cid);
+                                if resp.clicked() {
+                                    let cid = cat.id.clone();
+                                    if !self.collapsed_categories.insert(cid.clone()) {
+                                        self.collapsed_categories.remove(&cid);
+                                    }
+                                }
+                                if !collapsed {
+                                    for i in kids {
+                                        self.draw_channel_row(ui, i);
+                                    }
                                 }
                             }
                         });
@@ -479,6 +505,7 @@ mod tests {
                 channel_type: 0,
                 topic: None,
                 position: i,
+                parent_id: None,
             });
         }
         app.selected_guild = Some(0);

@@ -540,6 +540,7 @@ impl App {
             channel_type: 0,
             topic: None,
             position: 999,
+            parent_id: None,
         });
         let idx = self.channels.len() - 1;
         self.selected_channel = Some(idx);
@@ -631,6 +632,7 @@ mod tests {
             channel_type: 1,
             topic: None,
             position: 0,
+            parent_id: None,
         });
         app.selected_channel = Some(0);
         let ctx = egui::Context::default();

@@ -235,6 +235,8 @@ pub(crate) struct ChatChannel {
     pub(crate) channel_type: i64,
     pub(crate) topic: Option<String>,
     pub(crate) position: i32,
+    /// Category (type 4) this channel sits under; `None` for top-level and DMs.
+    pub(crate) parent_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

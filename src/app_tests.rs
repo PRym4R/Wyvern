@@ -19,6 +19,7 @@ fn make_app() -> App {
             channel_type: 1,
             topic: None,
             position: i,
+            parent_id: None,
         });
     }
     a.selected_guild = None;
@@ -244,6 +245,7 @@ fn note_unread_ignores_own_and_open_channel() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.chat_at_bottom = true;
@@ -542,6 +544,7 @@ fn late_history_keeps_current_channel_loading() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.channels.push(ChatChannel {
         id: "c2".into(),
@@ -550,6 +553,7 @@ fn late_history_keeps_current_channel_loading() {
         channel_type: 1,
         topic: None,
         position: 1,
+        parent_id: None,
     });
     app.selected_channel = Some(1);
     app.open_channel("c2");
@@ -634,6 +638,7 @@ fn older_page_is_prepended_without_duplicates() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -692,6 +697,7 @@ fn boundary_message_is_not_duplicated() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -732,6 +738,7 @@ fn older_history_requested_once_at_a_time() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -767,6 +774,7 @@ fn discord_page_is_stored_oldest_first_and_paged_from_the_oldest() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -820,6 +828,7 @@ fn exhausted_channel_stops_asking() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -849,6 +858,7 @@ fn new_message_scrolls_only_when_at_bottom() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -882,6 +892,7 @@ fn own_message_is_replaced_not_duplicated() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -944,6 +955,7 @@ fn local_echo_id_never_goes_to_pagination() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -977,6 +989,7 @@ fn failed_history_clears_the_spinner_and_explains() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1015,6 +1028,7 @@ fn failed_older_page_clears_its_own_spinner() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1054,6 +1068,7 @@ fn failed_history_of_other_channel_leaves_current_alone() {
             channel_type: 1,
             topic: None,
             position: 0,
+            parent_id: None,
         });
     }
     app.selected_channel = Some(1);
@@ -1311,6 +1326,7 @@ fn app_with_channel(cmd_tx: mpsc::UnboundedSender<ToGateway>) -> App {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app
@@ -1331,6 +1347,7 @@ fn older_page_survives_the_memory_ceiling() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     // List full: 500 messages, m0 through m499.
@@ -1415,6 +1432,7 @@ fn stale_older_page_into_cleared_list_asks_first_page_again() {
             channel_type: 1,
             topic: None,
             position: 0,
+            parent_id: None,
         });
     }
     app.selected_channel = Some(0);
@@ -1494,6 +1512,7 @@ fn failed_send_removes_echo_and_returns_text() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1539,6 +1558,7 @@ fn failed_send_does_not_overwrite_new_draft() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1572,6 +1592,7 @@ fn sending_clears_the_previous_failure_notice() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1601,6 +1622,7 @@ fn live_message_already_in_history_is_not_doubled() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1925,6 +1947,7 @@ fn channel_update_renames_channel() {
         channel_type: 1,
         topic: Some("тема".into()),
         position: 0,
+        parent_id: None,
     });
 
     tx.send(ToApp::ChannelUpdated {
@@ -1959,6 +1982,7 @@ fn gateway_backlog_is_drained_in_bounded_batches() {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
 
@@ -1999,6 +2023,7 @@ fn app_with_events() -> (App, mpsc::UnboundedSender<ToApp>) {
         channel_type: 1,
         topic: None,
         position: 0,
+        parent_id: None,
     });
     app.selected_channel = Some(0);
     (app, tx)
@@ -2143,4 +2168,33 @@ fn typing_indicators_track_and_lapse() {
     }
     app.prune_typing();
     assert!(app.typing.is_empty(), "lapsed indicators must be pruned");
+}
+
+#[test]
+fn channel_layout_nests_text_under_categories() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    let ch = |id: &str, name: &str, ty: i64, pos: i32, parent: Option<&str>| ChatChannel {
+        id: id.into(),
+        name: name.into(),
+        guild_id: Some("g1".into()),
+        channel_type: ty,
+        topic: None,
+        position: pos,
+        parent_id: parent.map(|s| s.to_string()),
+    };
+    app.channels.push(ch("loose1", "general", 0, 0, None));
+    app.channels.push(ch("cat", "Text Channels", 4, 1, None));
+    app.channels.push(ch("c1", "chat", 0, 0, Some("cat")));
+    app.channels.push(ch("a1", "news", 5, 1, Some("cat")));
+    // A thread's parent is not a category: it must not show up anywhere.
+    app.channels.push(ch("thread", "thread", 11, 0, Some("c1")));
+    app.channels.push(ch("loose2", "offtopic", 0, 2, None));
+
+    let (loose, groups) = app.guild_channel_layout("g1");
+    let names = |v: &[usize]| v.iter().map(|&i| app.channels[i].name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&loose), vec!["general", "offtopic"]);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(app.channels[groups[0].0].name, "Text Channels");
+    assert_eq!(names(&groups[0].1), vec!["chat", "news"]);
 }

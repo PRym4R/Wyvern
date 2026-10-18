@@ -330,6 +330,7 @@ pub(super) async fn open_dm(
                 channel_type: 1,
                 topic: None,
                 position: 0,
+                parent_id: None,
             }));
         }
         Err(e) => {
