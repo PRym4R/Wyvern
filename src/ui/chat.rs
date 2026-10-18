@@ -174,7 +174,7 @@ impl App {
                 let author_name = self.display_name(msg).to_string();
                 let preview = reply_preview(self.display_content(msg));
                 let preview = if preview.is_empty() {
-                    "сообщение".to_string()
+                    "message".to_string()
                 } else {
                     preview
                 };
@@ -213,21 +213,21 @@ impl App {
         let menu = self.message_menu(msg);
         response.context_menu(|ui| {
             if ui
-                .add_enabled(menu.reply, egui::Button::new("Ответить"))
+                .add_enabled(menu.reply, egui::Button::new("Reply"))
                 .clicked()
             {
                 self.run_message_action(ui.ctx(), MessageAction::Reply, msg);
                 ui.close_menu();
             }
             if ui
-                .add_enabled(menu.edit, egui::Button::new("Изменить"))
+                .add_enabled(menu.edit, egui::Button::new("Edit"))
                 .clicked()
             {
                 self.run_message_action(ui.ctx(), MessageAction::Edit, msg);
                 ui.close_menu();
             }
             if ui
-                .add_enabled(menu.delete, egui::Button::new("Удалить"))
+                .add_enabled(menu.delete, egui::Button::new("Delete"))
                 .clicked()
             {
                 self.run_message_action(ui.ctx(), MessageAction::Delete, msg);
@@ -235,7 +235,7 @@ impl App {
             }
             ui.separator();
             if ui
-                .add_enabled(menu.copy, egui::Button::new("Копировать текст"))
+                .add_enabled(menu.copy, egui::Button::new("Copy text"))
                 .clicked()
             {
                 self.run_message_action(ui.ctx(), MessageAction::Copy, msg);
@@ -385,7 +385,7 @@ impl App {
                         // silently.
                         if let Some(reason) = self.send_error.as_ref() {
                             ui.horizontal_centered(|ui| {
-                                ui.label(RichText::new(format!("Не отправлено: {reason}"))
+                                ui.label(RichText::new(format!("Not sent: {reason}"))
                                     .size(12.0)
                                     .color(ERROR_RED));
                             });
@@ -400,7 +400,7 @@ impl App {
                             // Don't show an empty channel silently: it looks
                             // like the channel has no messages.
                             ui.horizontal_centered(|ui| {
-                                ui.label(RichText::new(format!("Не удалось загрузить историю: {reason}"))
+                                ui.label(RichText::new(format!("Couldn't load history: {reason}"))
                                     .size(12.0)
                                     .color(self.theme.text_secondary));
                             });
@@ -435,7 +435,7 @@ impl App {
                                         // Loading older messages failed; a
                                         // spinner here would spin forever.
                                         ui.horizontal(|ui| {
-                                            ui.label(RichText::new(format!("Не удалось догрузить: {reason}"))
+                                            ui.label(RichText::new(format!("Couldn't load more: {reason}"))
                                                 .size(12.0)
                                                 .color(self.theme.text_secondary));
                                         });
@@ -447,7 +447,7 @@ impl App {
                                         ui.vertical_centered(|ui| {
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "Достигнут предел: в этом канале хранится не больше {} сообщений",
+                                                    "Limit reached: this channel keeps at most {} messages",
                                                     crate::app::MAX_MESSAGES_PER_CHANNEL
                                                 ))
                                                 .size(12.0)
@@ -455,7 +455,7 @@ impl App {
                                             );
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "{dropped} новых скрыто — открой канал заново, чтобы увидеть их"
+                                                    "{dropped} new messages hidden — reopen the channel to see them"
                                                 ))
                                                 .size(11.0)
                                                 .color(self.theme.text_secondary),

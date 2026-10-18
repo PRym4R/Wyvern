@@ -186,7 +186,7 @@ impl HeartbeatBook {
     /// so the connection should be closed.
     fn tick(&mut self) -> Result<(), &'static str> {
         if self.unanswered >= HEARTBEAT_ACK_LIMIT {
-            return Err("heartbeat остался без ACK");
+            return Err("heartbeat was left without an ACK");
         }
         self.unanswered += 1;
         Ok(())
@@ -216,10 +216,10 @@ fn reconnect_delay_with_jitter(attempt: u32, roll: f64) -> Duration {
 /// Meaning of a WebSocket close code: `Some` means fatal, do not retry.
 fn close_fatal_reason(code: u16) -> Option<&'static str> {
     match code {
-        4004 => Some("токен отклонён Discord: он недействителен"),
-        4007 => Some("токен отозван"),
-        4013 => Some("набор подписок (intents) неверный — Discord его не принимает"),
-        4014 => Some("эти подписки (intents) запрещены для этого аккаунта"),
+        4004 => Some("token rejected by Discord: it is invalid"),
+        4007 => Some("token was revoked"),
+        4013 => Some("invalid intents set — Discord won't accept it"),
+        4014 => Some("these intents are not allowed for this account"),
         _ => None,
     }
 }

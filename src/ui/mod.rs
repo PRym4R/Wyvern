@@ -25,15 +25,15 @@ impl crate::app::App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(
-                            "Хранилище старого формата: пароля в нём нет. Пароль, который ты ввёл, \
-                             закрепится за хранилищем только по кнопке — до этого файл не \
-                             перезаписывается.",
+                            "Legacy vault format: it has no password. The password you entered \
+                             is pinned to the vault only when you press the button — until then \
+                             the file is not rewritten.",
                         )
                         .size(12.0)
                         .color(self.theme.text),
                     );
                     if ui
-                        .button(RichText::new("Закрепить пароль").size(12.0).color(Color32::WHITE))
+                        .button(RichText::new("Pin password").size(12.0).color(Color32::WHITE))
                         .clicked()
                     {
                         self.confirm_legacy_migration();

@@ -735,7 +735,7 @@ impl App {
             if pw.is_empty() {
                 // Can't remember without a vault password; stop and tell the user instead of continuing silently.
                 self.status =
-                    "Чтобы запомнить аккаунт, введи пароль хранилища (или сними галочку «Запомнить»)"
+                    "To remember the account, enter the vault password (or uncheck \"Remember\")"
                         .to_string();
                 return;
             }
@@ -744,7 +744,7 @@ impl App {
                 Ok(None) => {}
                 // Vault didn't open; continuing would lose the account without a word.
                 Err(e) => {
-                    self.status = format!("{} — введи пароль хранилища или сними галочку «Запомнить»", e);
+                    self.status = format!("{} — enter the vault password or uncheck \"Remember\"", e);
                     return;
                 }
             }

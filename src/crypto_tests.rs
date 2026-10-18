@@ -395,7 +395,7 @@ mod vault_write_tests {
         one_account(&mut app);
         app.save_accounts("правильный");
         assert!(
-            app.status.contains("хранилищ"),
+            app.status.contains("vault"),
             "ошибка записи должна попасть в статус, а там: {:?}",
             app.status
         );
@@ -411,7 +411,7 @@ mod vault_write_tests {
         one_account(&mut app);
         app.save_accounts("правильный");
         assert!(
-            app.status.contains("хранилищ"),
+            app.status.contains("vault"),
             "ошибка замены файла должна попасть в статус, а там: {:?}",
             app.status
         );
@@ -447,7 +447,7 @@ mod vault_write_tests {
             .unlock_vault("правильный")
             .expect_err("второй экземпляр не должен открыть занятое хранилище");
         assert!(
-            err.contains("другом экземпляре"),
+            err.contains("another client instance"),
             "нужен понятный отказ, а не {err:?}"
         );
 

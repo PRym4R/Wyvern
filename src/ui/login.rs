@@ -139,7 +139,7 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("АККАУНТЫ")
+                    RichText::new("ACCOUNTS")
                         .size(10.0)
                         .color(theme.text_secondary),
                 );
@@ -275,19 +275,19 @@ impl App {
 
     /// Login form for a fresh token: token and vault password side by side.
     fn login_token_form(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("НОВЫЙ ВХОД").size(10.0).color(self.theme.text_secondary));
+        ui.label(RichText::new("NEW LOGIN").size(10.0).color(self.theme.text_secondary));
         ui.add_space(10.0);
 
         let field = (ui.available_width() - 10.0) / 2.0;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(field);
-                ui.label(RichText::new("Токен").size(12.0).color(self.theme.text_secondary));
+                ui.label(RichText::new("Token").size(12.0).color(self.theme.text_secondary));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.token_input)
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Вставь токен...")
+                        .hint_text("Paste a token...")
                         .font(egui::FontId::proportional(15.0))
                         .margin(egui::Margin::symmetric(10, 8)),
                 );
@@ -295,17 +295,17 @@ impl App {
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 ui.set_width(field);
-                ui.label(RichText::new("Пароль хранилища").size(12.0).color(self.theme.text_secondary));
+                ui.label(RichText::new("Vault password").size(12.0).color(self.theme.text_secondary));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.login_password)
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Локальный пароль...")
+                        .hint_text("Local password...")
                         .font(egui::FontId::proportional(15.0))
                         .margin(egui::Margin::symmetric(10, 8)),
                 );
                 ui.label(
-                    RichText::new("только для файла аккаунтов, Discord его не видит")
+                    RichText::new("for the accounts file only; Discord never sees it")
                         .size(10.0)
                         .color(self.theme.text_secondary),
                 );
@@ -315,15 +315,15 @@ impl App {
 
         ui.checkbox(
             &mut self.remember_account,
-            RichText::new("Запомнить этот аккаунт").size(13.0).color(self.theme.text),
+            RichText::new("Remember this account").size(13.0).color(self.theme.text),
         );
         ui.add_space(16.0);
 
         let has_token = !self.token_input.trim().is_empty();
         let (label, enabled) = if has_token {
-            ("Войти", true)
+            ("Log in", true)
         } else {
-            ("Показать сохранённые аккаунты", !self.login_password.is_empty())
+            ("Show saved accounts", !self.login_password.is_empty())
         };
         let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let btn = ui.add_sized(
@@ -368,7 +368,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.label(RichText::new(&name).size(17.0).color(self.theme.text));
                 ui.label(
-                    RichText::new(format!("Токен {}", self.mask_token(&token)))
+                    RichText::new(format!("Token {}", self.mask_token(&token)))
                         .size(11.0)
                         .color(self.theme.text_secondary),
                 );
@@ -376,12 +376,12 @@ impl App {
         });
         ui.add_space(16.0);
 
-        ui.label(RichText::new("Пароль хранилища").size(12.0).color(self.theme.text_secondary));
+        ui.label(RichText::new("Vault password").size(12.0).color(self.theme.text_secondary));
         ui.add(
             egui::TextEdit::singleline(&mut self.login_password)
                 .password(true)
                 .desired_width(f32::INFINITY)
-                .hint_text("Пароль от ~/.wyvern_accounts.json...")
+                .hint_text("Password for ~/.wyvern_accounts.json...")
                 .font(egui::FontId::proportional(15.0))
                 .margin(egui::Margin::symmetric(10, 8)),
         );
@@ -391,13 +391,13 @@ impl App {
         let (back_clicked, go_clicked) = ui.horizontal(|ui| {
             let back = ui.add_sized(
                 [96.0, 40.0],
-                egui::Button::new(RichText::new("Назад").size(14.0).color(self.theme.text))
+                egui::Button::new(RichText::new("Back").size(14.0).color(self.theme.text))
                     .fill(self.theme.input_bg)
                     .corner_radius(8.0),
             );
             let go = ui.add_sized(
                 [ui.available_width(), 40.0],
-                egui::Button::new(RichText::new("Войти").size(15.0).color(Color32::BLACK))
+                egui::Button::new(RichText::new("Log in").size(15.0).color(Color32::BLACK))
                     .fill(self.theme.accent)
                     .corner_radius(8.0),
             );
@@ -433,7 +433,7 @@ impl App {
             if let Some(age) = self.vault_age_text() {
                 ui.label(
                     RichText::new(format!(
-                        "Файл хранилища найден ({}), открой его паролем оттуда",
+                        "Vault file found ({}); open it with the password that created it",
                         age
                     ))
                     .size(11.0)
@@ -443,7 +443,7 @@ impl App {
         }
         if self.saved_accounts.is_empty() && self.status.is_empty() {
             ui.label(
-                RichText::new("Пароль хранилища открывает список аккаунтов внизу слева")
+                RichText::new("The vault password opens the accounts list in the bottom left")
                     .size(11.0)
                     .color(self.theme.text_secondary),
             );
@@ -460,7 +460,7 @@ impl App {
                     self.login_notice = h;
                 }
                 if self.saved_accounts.is_empty() {
-                    self.status = "Пароль верный, но аккаунтов в хранилище пока нет".to_string();
+                    self.status = "Password is correct, but the vault has no accounts yet".to_string();
                 }
             }
             Err(e) => self.status = e,
@@ -592,23 +592,23 @@ mod tests {
         let mut app = make_app();
         let list = texts(&mut app);
 
-        let token = at(&list, "Вставь токен...");
-        let pass = at(&list, "Локальный пароль...");
+        let token = at(&list, "Paste a token...");
+        let pass = at(&list, "Local password...");
         assert_eq!(token.len(), 1, "поле токена не найдено: {:?}", list);
         assert_eq!(pass.len(), 1, "поле пароля не найдено: {:?}", list);
         let (tx, ty) = token[0];
         let (px, py) = pass[0];
-        eprintln!("[TEST] токен x={tx:.0} y={ty:.0} | пароль x={px:.0} y={py:.0} | галка y={:.0}", at(&list, "Запомнить этот аккаунт")[0].1);
+        eprintln!("[TEST] токен x={tx:.0} y={ty:.0} | пароль x={px:.0} y={py:.0} | галка y={:.0}", at(&list, "Remember this account")[0].1);
         assert!((ty - py).abs() < 0.5, "поля должны быть в одной строке: y {} vs {}", ty, py);
         assert!(px > tx + 100.0, "пароль должен быть справа от токена: x {} vs {}", px, tx);
 
         // Field labels are on one row too.
-        let lbl_t = at(&list, "Токен");
-        let lbl_p = at(&list, "Пароль хранилища");
+        let lbl_t = at(&list, "Token");
+        let lbl_p = at(&list, "Vault password");
         assert!((lbl_t[0].1 - lbl_p[0].1).abs() < 0.5, "подписи полей не в одной строке");
 
         // "Remember" is below both fields.
-        let remember = at(&list, "Запомнить этот аккаунт");
+        let remember = at(&list, "Remember this account");
         assert_eq!(remember.len(), 1, "галка не найдена");
         assert!(
             remember[0].1 > ty + 20.0,
@@ -624,7 +624,7 @@ mod tests {
         let mut app = make_app();
         let list = texts(&mut app);
         assert_eq!(
-            at(&list, "Показать сохранённые аккаунты").len(),
+            at(&list, "Show saved accounts").len(),
             1,
             "надпись должна быть ровно один раз"
         );
@@ -632,8 +632,8 @@ mod tests {
         // With a token entered, the button becomes the login action and the caption disappears.
         app.token_input = "MTIz.token.value".into();
         let list = texts(&mut app);
-        assert!(at(&list, "Показать сохранённые аккаунты").is_empty());
-        assert_eq!(at(&list, "Войти").len(), 1);
+        assert!(at(&list, "Show saved accounts").is_empty());
+        assert_eq!(at(&list, "Log in").len(), 1);
     }
 
     /// Saved accounts render as a bottom strip; clicking selects one.
@@ -645,7 +645,7 @@ mod tests {
             StoredAccount { token: "tok-two".into(), username: String::new() },
         ];
         let list = texts(&mut app);
-        assert_eq!(at(&list, "АККАУНТЫ").len(), 1, "полоса аккаунтов не нарисована");
+        assert_eq!(at(&list, "ACCOUNTS").len(), 1, "полоса аккаунтов не нарисована");
         assert_eq!(at(&list, "alice").len(), 1);
         // Nameless accounts show a token mask.
         assert_eq!(at(&list, "••••").len(), 1, "аккаунт без имени не показан: {:?}", list);

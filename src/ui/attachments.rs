@@ -142,7 +142,7 @@ impl App {
                 // Image will never load (broken or too large): show a note
                 // instead of an endless spinner.
                 ui.label(
-                    RichText::new("не удалось загрузить")
+                    RichText::new("failed to load")
                         .size(11.0)
                         .color(self.theme.text_secondary),
                 );

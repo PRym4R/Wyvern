@@ -339,7 +339,7 @@ fn wrong_password_still_errors() {
 
     let res = app.unlock_vault("wrong");
     let err = res.err().expect("неверный пароль должен давать ошибку");
-    assert!(err.contains("Неверный пароль"), "непонятное сообщение: {}", err);
+    assert!(err.contains("Wrong vault password"), "непонятное сообщение: {}", err);
     assert!(!app.accounts_unlocked);
     let _ = std::fs::remove_file(&tmp);
 }
@@ -1026,7 +1026,7 @@ fn remember_without_vault_password_stops_the_login() {
         "вход не должен продолжаться: подключаться с обещанием сохранить аккаунт нельзя"
     );
     assert!(
-        app.status.contains("пароль хранилища"),
+        app.status.contains("vault password"),
         "пользователь должен видеть, что делать: {:?}",
         app.status
     );
@@ -1050,7 +1050,7 @@ fn failed_vault_unlock_stops_the_login() {
 
     assert!(!app.gw_started, "вход с неверным паролем хранилища продолжаться не должен");
     assert!(
-        app.status.contains("пароль хранилища"),
+        app.status.contains("vault password"),
         "пользователь должен видеть, что делать: {:?}",
         app.status
     );

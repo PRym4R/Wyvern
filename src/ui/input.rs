@@ -104,13 +104,13 @@ impl App {
                             ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
                         ui.painter().rect_filled(bar, 1.0, self.theme.accent);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Отмена").clicked() {
+                            if ui.small_button("Cancel").clicked() {
                                 self.cancel_reply();
                             }
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(format!(
-                                        "Ответ {}: {}",
+                                        "Reply to {}: {}",
                                         reply.author_name, reply.preview
                                     ))
                                     .size(12.0)
@@ -130,12 +130,12 @@ impl App {
                             ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
                         ui.painter().rect_filled(bar, 1.0, self.theme.accent);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Отмена").clicked() {
+                            if ui.small_button("Cancel").clicked() {
                                 self.cancel_edit();
                             }
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new("Редактирование сообщения")
+                                    RichText::new("Editing message")
                                         .size(12.0)
                                         .color(self.theme.text_secondary),
                                 )
@@ -236,7 +236,7 @@ impl App {
                             egui::Button::new(RichText::new("Send").size(14.0).color(Color32::WHITE))
                                 .fill(self.theme.accent)
                                 .min_size(egui::vec2(84.0, 36.0)),
-                        ).on_hover_text(if fits { "" } else { "сообщение длиннее 2000 символов" });
+                        ).on_hover_text(if fits { "" } else { "message is longer than 2000 characters" });
 
                         let send_clicked = send_btn.clicked();
 
@@ -379,7 +379,7 @@ impl App {
     fn handle_debug_command(&mut self, rest: &str) {
         if let Some(id) = rest.strip_prefix("add ").map(str::trim) {
             if id.is_empty() {
-                self.status = "нужен id канала: /debug add <id>".to_string();
+                self.status = "channel id required: /debug add <id>".to_string();
                 return;
             }
             // Repeating the same command within the window confirms it.
@@ -392,12 +392,12 @@ impl App {
                 self.add_debug_channel(id);
             } else {
                 self.pending_debug_add = Some((id.to_string(), std::time::Instant::now()));
-                self.status = format!("канал {id} будет добавлен после повторного /debug add {id}");
+                self.status = format!("channel {id} will be added after a second /debug add {id}");
                 self.push_debug(format!("Debug add awaiting confirmation: {id}"));
             }
             return;
         }
-        self.status = format!("неизвестная отладочная команда: {rest}");
+        self.status = format!("unknown debug command: {rest}");
         self.push_debug(format!("Unknown debug command: {rest}"));
     }
 
@@ -415,7 +415,7 @@ impl App {
         self.selected_channel = Some(idx);
         self.scroll_to_bottom = true;
         self.open_channel(id);
-        self.status = format!("канал {id} добавлен");
+        self.status = format!("channel {id} added");
         self.push_debug(format!("Debug channel added: {id}"));
     }
 }
@@ -748,7 +748,7 @@ mod tests {
             frame_has_text(&out, "исходный текст"),
             "в строке ответа нет текста"
         );
-        assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены reply");
+        assert!(frame_has_text(&out, "Cancel"), "нет кнопки отмены reply");
     }
 
     /// Saving an edit sends an edit command instead of a new message.
@@ -837,10 +837,10 @@ mod tests {
         let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
 
         assert!(
-            frame_has_text(&out, "Редактирование сообщения"),
+            frame_has_text(&out, "Editing message"),
             "нет пометки правки"
         );
-        assert!(frame_has_text(&out, "Отмена"), "нет кнопки отмены правки");
+        assert!(frame_has_text(&out, "Cancel"), "нет кнопки отмены правки");
     }
 
     /// Enter sends, while Shift+Enter keeps the field and inserts a newline.

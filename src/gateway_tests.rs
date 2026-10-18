@@ -111,7 +111,7 @@ mod http_tests {
             seen.push(ev);
         }
         assert!(
-            seen.iter().any(|e| matches!(e, ToApp::SendFailed { reason, .. } if reason.contains("нет связи"))),
+            seen.iter().any(|e| matches!(e, ToApp::SendFailed { reason, .. } if reason.contains("no connection"))),
             "пользователь должен узнать об отказе, получено: {seen:?}"
         );
     }
@@ -256,10 +256,10 @@ mod http_tests {
     #[test]
     fn message_action_reasons_are_readable() {
         for (status, must_contain) in [
-            (403u16, "прав"),
-            (404, "удалено"),
-            (429, "подождать"),
-            (500, "отклонил"),
+            (403u16, "permission"),
+            (404, "deleted"),
+            (429, "wait"),
+            (500, "rejected"),
         ] {
             let reason = message_action_reason(status);
             assert!(
@@ -308,12 +308,12 @@ mod http_tests {
     #[test]
     fn send_failure_reasons_are_readable() {
         for (status, must_contain) in [
-            (403u16, "писать нельзя"),
-            (404, "прав"),
-            (429, "подождать"),
+            (403u16, "write"),
+            (404, "not found"),
+            (429, "wait"),
             (400, "2000"),
             (413, "2000"),
-            (500, "отклонил"),
+            (500, "rejected"),
         ] {
             let reason = send_failure_reason(status);
             assert!(
@@ -434,7 +434,7 @@ mod close_tests {
             assert!(!reason.is_empty(), "причина должна показываться пользователю");
         }
         // 4004 is the most common: invalid token.
-        assert!(close_fatal_reason(4004).unwrap().contains("токен"));
+        assert!(close_fatal_reason(4004).unwrap().contains("token"));
     }
 
     /// Ordinary drops (network, sleep, Discord-side reconnect) must still

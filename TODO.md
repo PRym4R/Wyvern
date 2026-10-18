@@ -275,7 +275,25 @@ Gemini).
       росла только панель (поле «уезжало вверх, а не увеличивалось»). Теперь
       строки считаются по `\n`, раскладка — `ui.horizontal_top` (строка получает
       полную высоту), `composer_h` зажат в `COMPOSER_MAX_H`. Есть регресс-тест
-      на клип-ректу поля: на старом коде падает с «клип 14.0 px».
+       на клип-ректу поля: на старом коде падает с «клип 14.0 px».
+
+### Интерфейс переведён на английский
+
+- [x] **Весь пользовательский русский текст заменён на английский**: экран
+      входа (полоса `ACCOUNTS`, `NEW LOGIN`, поля `Token` / `Vault password`,
+      галка `Remember this account`, кнопки `Log in` / `Back` /
+      `Show saved accounts`), меню сообщения (`Reply` / `Edit` / `Delete` /
+      `Copy text`), строки reply/edit в композере (`Cancel`,
+      `Editing message`), тосты ошибок отправки/истории/лимита, баннер
+      legacy-хранилища (`Pin password`), сообщения хранилища и auth
+      (`Wrong vault password`, `Vault is already open in another client
+      instance`, `Account not found in the vault`), причины отказа Discord
+      (`you can't write in this channel`, `Discord rejected the message` и
+      т.д.) и фатальные коды закрытия гейтвея (4004/4007/4013/4014).
+      Комментарии и так были английскими; тестовые сообщения (`assert!`/
+      `eprintln`) и отладочные логи (`push_debug`/`eprintln!`) оставлены как
+      есть — это не интерфейс. Тесты, проверявшие старые подписи, обновлены.
+      Итого 211 тестов проходят (1 — замер памяти).
 
 ### По `BUGS.txt` (части 4–5), после 0.5.1
 

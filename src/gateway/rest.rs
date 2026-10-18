@@ -40,12 +40,12 @@ pub(super) async fn send_message(
 /// unusable, so only the actionable meaning is shown.
 pub(crate) fn send_failure_reason(status: u16) -> &'static str {
     match status {
-        403 => "в этот канал писать нельзя",
-        404 => "канал не найден — возможно, прав на него нет",
-        429 => "слишком много сообщений подряд, Discord просит подождать",
+        403 => "you can't write in this channel",
+        404 => "channel not found — you may not have access to it",
+        429 => "too many messages in a row, Discord asks you to wait",
         // 413 = too large, 400 = e.g. over 2000 characters.
-        400 | 413 => "Discord отклонил текст (скорее всего, длиннее 2000 символов)",
-        _ => "Discord отклонил сообщение",
+        400 | 413 => "Discord rejected the text (most likely longer than 2000 characters)",
+        _ => "Discord rejected the message",
     }
 }
 
@@ -61,7 +61,7 @@ pub(crate) fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, 
     reqwest::Client::builder()
         .timeout(timeout)
         .build()
-        .map_err(|e| format!("не собрать HTTP-клиент: {}", e))
+        .map_err(|e| format!("failed to build HTTP client: {}", e))
 }
 
 /// Send a message to a ready URL. The URL is a parameter so tests can point
@@ -119,7 +119,7 @@ pub(crate) async fn send_message_to(
             let _ = event_tx.send(ToApp::SendFailed {
                 channel_id,
                 local_id,
-                reason: "не удалось отправить: нет связи с Discord".to_string(),
+                reason: "couldn't send: no connection to Discord".to_string(),
             });
         }
     }
@@ -137,10 +137,10 @@ pub(crate) fn message_url(channel_id: &str, message_id: &str) -> String {
 /// user.
 pub(crate) fn message_action_reason(status: u16) -> &'static str {
     match status {
-        403 => "нет прав на это сообщение",
-        404 => "сообщение уже удалено",
-        429 => "Discord просит подождать (лимит запросов)",
-        _ => "Discord отклонил запрос",
+        403 => "no permission for this message",
+        404 => "message is already deleted",
+        429 => "Discord asks you to wait (rate limit)",
+        _ => "Discord rejected the request",
     }
 }
 
@@ -199,7 +199,7 @@ pub(crate) async fn edit_message_to(
                 channel_id,
                 message_id,
                 content,
-                reason: "не удалось изменить: нет связи с Discord".to_string(),
+                reason: "couldn't edit: no connection to Discord".to_string(),
             });
         }
     }
@@ -251,7 +251,7 @@ pub(crate) async fn delete_message_to(
             let _ = event_tx.send(ToApp::Debug(format!("Delete error: {}", e)));
             let _ = event_tx.send(ToApp::DeleteFailed {
                 channel_id,
-                reason: "не удалось удалить: нет связи с Discord".to_string(),
+                reason: "couldn't delete: no connection to Discord".to_string(),
             });
         }
     }
@@ -399,7 +399,7 @@ pub(super) async fn fetch_history_page(
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(2);
                     let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
-                    reason = "Discord просит подождать (лимит запросов)".to_string();
+                    reason = "Discord asks you to wait (rate limit)".to_string();
                     time::sleep(Duration::from_secs(retry)).await;
                     continue;
                 }
@@ -408,9 +408,9 @@ pub(super) async fn fetch_history_page(
                     // 403 = no channel access; retrying won't help, and the
                     // user sees an empty channel.
                     reason = if status == 403 {
-                        "нет прав на канал".to_string()
+                        "no permission for the channel".to_string()
                     } else {
-                        format!("сервер ответил {}", status)
+                        format!("server responded {}", status)
                     };
                     failed = true;
                     break;
@@ -425,13 +425,13 @@ pub(super) async fn fetch_history_page(
                     }
                     Err(e) => {
                         let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
-                        reason = "не удалось прочитать ответ".to_string();
+                        reason = "couldn't read the response".to_string();
                     }
                 }
             }
             Err(e) => {
                 let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
-                reason = "нет связи с Discord".to_string();
+                reason = "no connection to Discord".to_string();
                 time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -440,7 +440,7 @@ pub(super) async fn fetch_history_page(
         // Nothing arrived: report failure so the loading spinner clears
         // instead of waiting forever.
         if reason.is_empty() {
-            reason = "история не пришла".to_string();
+            reason = "history didn't arrive".to_string();
         }
         let _ = event_tx.send(ToApp::HistoryFailed { channel_id, before, reason });
         return;

@@ -109,7 +109,7 @@ impl App {
         };
         // Don't swallow write errors: the UI would claim success while the disk is stale.
         if let Err(e) = write_vault_file(&self.vault_path(), encrypted.as_bytes()) {
-            self.status = format!("Не удалось сохранить хранилище: {}", e);
+            self.status = format!("Failed to save vault: {}", e);
         }
     }
     /// This instance's vault file; the override lives in App fields because
@@ -133,17 +133,17 @@ impl App {
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|e| format!("Не удалось открыть замок хранилища ({}): {}", path.display(), e))?;
+            .map_err(|e| format!("Failed to open the vault lock ({}): {}", path.display(), e))?;
         match file.try_lock() {
             Ok(()) => {
                 self.vault_lock = Some(file);
                 Ok(())
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                Err("Хранилище уже открыто в другом экземпляре клиента".to_string())
+                Err("Vault is already open in another client instance".to_string())
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                Err(format!("Не удалось заблокировать хранилище: {}", e))
+                Err(format!("Failed to lock the vault: {}", e))
             }
         }
     }
@@ -199,18 +199,18 @@ impl App {
         let meta = std::fs::metadata(self.vault_path()).ok()?;
         let secs = meta.modified().ok()?.elapsed().ok()?.as_secs();
         Some(if secs < 90 {
-            format!("изменён {} сек назад", secs)
-        } else if secs < 5400 {
-            format!("изменён {} мин назад", secs / 60)
+            format!("changed {}s ago", secs)
+        } else if secs < 3600 {
+            format!("changed {}m ago", secs / 60)
         } else {
-            format!("изменён {} ч назад", secs / 3600)
+            format!("changed {}h ago", secs / 3600)
         })
     }
     /// Unlock the vault. `Ok(Some(hint))` if a whitespace-guessed variant matched.
     /// An empty stored account list must still count as a successful unlock.
     pub(crate) fn unlock_vault(&mut self, password: &str) -> Result<Option<String>, String> {
         if password.is_empty() {
-            return Err("Введите пароль хранилища".to_string());
+            return Err("Enter the vault password".to_string());
         }
         // Take the lock before reading so no second instance can write over it.
         self.acquire_vault_lock()?;
@@ -236,8 +236,8 @@ impl App {
             self.vault_legacy = true;
             self.refresh_active_index();
             return Ok(Some(
-                "Хранилище старого формата: в нём нет пароля. Пароль, который ты ввёл, станет \
-                 паролем хранилища только после подтверждения — нажми «Закрепить пароль»."
+                "Legacy vault format: it has no password. The password you entered becomes \
+                 the vault password only after you confirm — press \"Pin password\"."
                     .to_string(),
             ));
         }
@@ -249,7 +249,7 @@ impl App {
             let hint = if candidate == password {
                 None
             } else {
-                Some("Пароль принят: убрал лишние пробелы".to_string())
+                Some("Password accepted: removed extra spaces".to_string())
             };
             self.saved_accounts = accounts;
             self.master_password = candidate;
@@ -259,7 +259,7 @@ impl App {
         }
 
         Err(format!(
-            "Неверный пароль хранилища (файл {})",
+            "Wrong vault password (file {})",
             self.vault_path().display()
         ))
     }
@@ -356,7 +356,7 @@ impl App {
             }
         }
         if !self.saved_accounts.iter().any(|a| a.token == token) {
-            self.status = "Аккаунт не найден в хранилище".to_string();
+            self.status = "Account not found in the vault".to_string();
             return;
         }
         // Clear the selection so returning to the login screen shows the plain form.
