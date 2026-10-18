@@ -10,6 +10,7 @@ mod memcheck;
 
 mod app;
 mod crypto;
+mod deleted;
 mod gateway;
 mod media;
 mod messages;
@@ -22,6 +23,7 @@ use eframe::egui;
 use tokio::sync::mpsc;
 
 use crate::app::App;
+use crate::deleted::DeletedStore;
 use crate::settings::Settings;
 
 /// Numbered panic log path: `/tmp/wyvern_panic_N.log`. Numbering keeps a
@@ -69,7 +71,11 @@ fn main() -> eframe::Result<()> {
     };
 
     let (_, rx) = mpsc::unbounded_channel();
-    let app = App::new(rx).with_settings(settings, Some(settings_path));
+    let deleted_path = DeletedStore::path();
+    let deleted = DeletedStore::load_from(&deleted_path);
+    let app = App::new(rx)
+        .with_settings(settings, Some(settings_path))
+        .with_deleted_store(deleted, Some(deleted_path));
 
     eframe::run_native(
         "wyvern",

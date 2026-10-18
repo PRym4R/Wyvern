@@ -12,6 +12,7 @@ use crate::models::{
     BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, MsgHeight,
     StoredAccount, Theme, UserProfile,
 };
+use crate::deleted::DeletedStore;
 use crate::settings::Settings;
 
 /// Caps messages per channel; history loads upward, so an unbounded list would grow forever.
@@ -163,6 +164,10 @@ pub(crate) struct App {
     pub(crate) revealed_images: HashSet<String>,
     /// Ids of deleted messages kept in the list (drawn red) when `keep_deleted` is on.
     pub(crate) deleted_ids: HashSet<String>,
+    /// Deleted messages kept across restarts so `keep_deleted` survives relaunch.
+    pub(crate) deleted_store: DeletedStore,
+    /// Where to write `deleted_store`; `None` disables persistence (tests).
+    pub(crate) deleted_path: Option<std::path::PathBuf>,
     pub(crate) show_friends: bool,
     pub(crate) friends: Vec<UserProfile>,
     pub(crate) history_loading: Option<String>,
@@ -275,6 +280,8 @@ impl App {
             settings_open: false,
             revealed_images: HashSet::new(),
             deleted_ids: HashSet::new(),
+            deleted_store: DeletedStore::default(),
+            deleted_path: None,
             show_friends: false,
             friends: Vec::new(),
             history_loading: None,
@@ -315,6 +322,12 @@ impl App {
         self.settings_path = path;
         self
     }
+    /// Attach the on-disk deleted-message store; `None` keeps it read-only.
+    pub(crate) fn with_deleted_store(mut self, store: DeletedStore, path: Option<std::path::PathBuf>) -> Self {
+        self.deleted_store = store;
+        self.deleted_path = path;
+        self
+    }
     /// Write settings to disk if a path is configured; a failure is logged, not fatal.
     pub(crate) fn write_settings(&mut self) {
         let Some(path) = self.settings_path.clone() else {
@@ -325,9 +338,36 @@ impl App {
             self.push_debug(format!("settings: не удалось сохранить: {e}"));
         }
     }
+    /// Write the deleted-message store if a path is configured; failures are logged.
+    pub(crate) fn write_deleted(&mut self) {
+        let Some(path) = self.deleted_path.clone() else {
+            return;
+        };
+        if let Err(e) = self.deleted_store.save_to(&path) {
+            self.push_debug(format!("deleted: could not save: {e}"));
+        }
+    }
+    /// Persist the content of deleted messages so their red rows survive a
+    /// restart (Discord no longer serves them). Only messages still in memory
+    /// can be stored — a delete for an unloaded channel has no content to keep.
+    fn remember_deleted<'a>(&mut self, channel_id: &str, ids: impl IntoIterator<Item = &'a str>) {
+        let ids: Vec<String> = ids.into_iter().map(str::to_string).collect();
+        let found: Vec<ChatMessage> = match self.messages.get(channel_id) {
+            Some(entry) => entry
+                .iter()
+                .filter(|m| ids.iter().any(|id| id == &m.id))
+                .map(|m| (**m).clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        if found.is_empty() {
+            return;
+        }
+        self.deleted_store.record(channel_id, found);
+        self.write_deleted();
+    }
     /// Save the composer text under its channel and clear it for the next one.
-    fn stash_draft(&mut self) {
-        let Some(cid) = self.draft_channel.clone() else {
+    fn stash_draft(&mut self) {        let Some(cid) = self.draft_channel.clone() else {
             return;
         };
         let text = std::mem::take(&mut self.input);
@@ -817,6 +857,18 @@ impl App {
             } else {
                 entry.clear();
                 entry.extend(incoming.into_iter().map(Arc::new));
+                // Deleted messages are gone from Discord and never come back with
+                // the refetched page; put the stored ones back so their red rows
+                // survive a restart, keeping chronological order.
+                if self.settings.keep_deleted {
+                    for m in self.deleted_store.channel(channel_id) {
+                        self.deleted_ids.insert(m.id.clone());
+                        if !entry.iter().any(|e| e.id == m.id) {
+                            entry.push(Arc::new(m.clone()));
+                        }
+                    }
+                    entry.sort_by_key(|m| m.id.parse::<u128>().unwrap_or(u128::MAX));
+                }
                 0
             }
         };
@@ -990,6 +1042,7 @@ impl App {
     pub(crate) fn delete_message(&mut self, channel_id: &str, message_id: &str) {
         if self.settings.keep_deleted {
             self.deleted_ids.insert(message_id.to_string());
+            self.remember_deleted(channel_id, std::iter::once(message_id));
             return;
         }
         if let Some(entry) = self.messages.get_mut(channel_id) {
@@ -1001,6 +1054,7 @@ impl App {
     pub(crate) fn delete_messages(&mut self, channel_id: &str, ids: &[String]) {
         if self.settings.keep_deleted {
             self.deleted_ids.extend(ids.iter().cloned());
+            self.remember_deleted(channel_id, ids.iter().map(String::as_str));
             return;
         }
         if let Some(entry) = self.messages.get_mut(channel_id) {

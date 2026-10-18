@@ -117,7 +117,8 @@ impl<V: CacheCost> BoundedCache<V> {
 }
 
 /// Embed as the client can render it: image and text; other JSON fields are dropped.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub(crate) struct Embed {
     pub(crate) image_url: Option<String>,
     /// Image size sent by Discord, used to compute message height without downloading.
@@ -168,7 +169,8 @@ pub(crate) fn image_size_of(v: &Value) -> Option<[u32; 2]> {
     size_from(num("width"), num("height"))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub(crate) struct ChatMessage {
     pub(crate) id: String,
     pub(crate) channel_id: String,
@@ -193,7 +195,8 @@ impl ChatMessage {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub(crate) struct Attachment {
     pub(crate) url: String,
     pub(crate) content_type: Option<String>,

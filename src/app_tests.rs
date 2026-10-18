@@ -1972,3 +1972,31 @@ fn switching_channels_drops_the_edit() {
         "смена канала должна убрать правку"
     );
 }
+
+/// A deleted message kept red must come back after a relaunch: Discord no longer
+/// serves it in history, so it has to be restored from the on-disk store.
+#[test]
+fn kept_deleted_message_survives_a_reload() {
+    let mut app = make_app();
+    app.settings.keep_deleted = true;
+    app.delete_message("c0", "m1");
+    assert!(app.deleted_ids.contains("m1"), "deleted id must be marked");
+    assert_eq!(
+        app.deleted_store.channel("c0").len(),
+        1,
+        "deleted message must be stored"
+    );
+
+    // Relaunch: the in-memory list and the red marks are gone, the store isn't.
+    app.messages.clear();
+    app.deleted_ids.clear();
+    // Discord returns an empty first page — the message was deleted there too.
+    app.apply_history("c0", Vec::new(), false, false);
+
+    let kept = app.messages.get("c0").expect("channel list must exist");
+    assert!(
+        kept.iter().any(|m| m.id == "m1"),
+        "deleted message must be restored"
+    );
+    assert!(app.deleted_ids.contains("m1"), "it must be drawn red again");
+}

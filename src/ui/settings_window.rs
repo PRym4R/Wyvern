@@ -77,6 +77,12 @@ impl crate::app::App {
                     .changed()
                 {
                     self.settings.keep_deleted = keep;
+                    if !keep {
+                        // Turning the view off also discards the stored archive.
+                        self.deleted_ids.clear();
+                        self.deleted_store.clear();
+                        self.write_deleted();
+                    }
                     self.write_settings();
                 }
                 ui.label(
