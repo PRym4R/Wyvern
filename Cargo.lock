@@ -5029,6 +5029,7 @@ name = "wyvern"
 version = "0.5.2"
 dependencies = [
  "aes-gcm",
+ "arboard",
  "base64",
  "eframe",
  "futures-util",

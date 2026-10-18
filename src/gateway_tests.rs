@@ -567,6 +567,39 @@ mod parse_tests {
         assert_eq!(m.embeds[0].description, None, "у эмбеда нет description — выкидываем пустое");
     }
 
+    /// A replying message keeps the referenced author and a one-line preview.
+    #[test]
+    fn reply_reference_is_parsed_from_history_and_live() {
+        let body = r#"[{
+            "id": "2",
+            "channel_id": "9",
+            "content": "согласен",
+            "timestamp": "2026-09-26T12:01:00.000000+00:00",
+            "author": {"id": "8", "username": "vasya"},
+            "attachments": [],
+            "embeds": [],
+            "referenced_message": {
+                "id": "1",
+                "content": "первая\nстрока",
+                "author": {"id": "7", "username": "petya"},
+                "attachments": [],
+                "embeds": []
+            }
+        }]"#;
+        let m = parse_one(body);
+        let reply = m.reply.expect("ссылка на сообщение должна разобраться");
+        assert_eq!(reply.author_name, "petya");
+        assert_eq!(reply.preview, "первая строка", "переводы строк складываются в одну");
+
+        // The live path must agree with the history path.
+        let live = parse_message_value(
+            &serde_json::from_str::<serde_json::Value>(body).unwrap()[0],
+            "9",
+        )
+        .expect("живое сообщение");
+        assert_eq!(live.reply.map(|r| r.preview), Some("первая строка".to_string()));
+    }
+
     /// History and live messages must parse identically, except the channel:
     /// a page takes the requested channel, a live message its own `channel_id`.
     #[test]

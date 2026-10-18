@@ -97,6 +97,7 @@ mod geometry_tests {
             timestamp: "2026-01-01T00:00:00.000Z".into(),
             attachments: vec![],
             embeds: vec![],
+            reply: None,
             is_own: i % 11 == 0,
         }
     }
@@ -1039,6 +1040,7 @@ mod menu_tests {
             timestamp: String::new(),
             attachments: vec![],
             embeds: vec![],
+            reply: None,
             is_own: own,
         }
     }

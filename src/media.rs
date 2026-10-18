@@ -15,6 +15,8 @@ static AVATAR_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_DOWNLOADS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Chat renders images at most 360x360, so 768px covers even HiDPI (2x) screens.
 const MAX_IMAGE_DIM: u32 = 768;
+/// Lightbox shows one image at a time, so it can afford full-screen detail.
+const LIGHTBOX_MAX_DIM: u32 = 2048;
 /// GIFs hold many frames, so frames are smaller to stay within budget.
 const MAX_GIF_DIM: u32 = 448;
 /// Floor for long GIFs: downscaled frames beat a truncated animation.
@@ -478,6 +480,138 @@ fn store_image_payload(
         }
     }
 }
+
+/// Decode a static image for the lightbox at higher resolution than the chat
+/// thumbnail. Animated images return `None` so the caller falls back to the
+/// chat cache (a high-res GIF could be enormous).
+fn decode_lightbox_payload(bytes: &[u8]) -> Option<ImagePayload> {
+    if bytes.len() < 6 {
+        return None;
+    }
+    if &bytes[..6] == b"GIF89a" || &bytes[..6] == b"GIF87a" {
+        return None;
+    }
+    let img = shrink(App::decode_static(bytes)?, LIGHTBOX_MAX_DIM).to_rgba8();
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(ImagePayload::Static(egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &img.into_raw(),
+    )))
+}
+
+    /// Turn a decoded lightbox payload into a texture, kept outside the chat
+    /// cache so it can be dropped independently.
+    fn store_lightbox_payload(
+        &mut self,
+        ctx: &egui::Context,
+        key: String,
+        payload: ImagePayload,
+    ) -> Option<LoadedImage> {
+        match payload {
+            ImagePayload::Static(ci) => {
+                let handle =
+                    ctx.load_texture(format!("lightbox:{key}"), ci, egui::TextureOptions::LINEAR);
+                ctx.request_repaint();
+                Some(LoadedImage::Static(handle))
+            }
+            // Lightbox decoding never produces animated payloads.
+            ImagePayload::Animated { .. } => None,
+        }
+    }
+
+    /// Drives the high-res lightbox image: starts the fetch for the open image,
+    /// collects the result, and drops the copy once it has been closed for its
+    /// grace period.
+    pub(crate) fn update_lightbox(&mut self, ctx: &egui::Context) {
+        let Some(url) = self.lightbox_url.clone() else {
+            // Closed: free the full-res copy after the grace period.
+            if let Some(at) = self.lightbox_evict_at {
+                let now = std::time::Instant::now();
+                if now >= at {
+                    self.lightbox_tex = None;
+                    self.lightbox_pending = None;
+                    self.lightbox_evict_at = None;
+                } else {
+                    ctx.request_repaint_after(at - now);
+                }
+            }
+            return;
+        };
+
+        // Collect a finished fetch. Keep it only if it's still the open image.
+        if let Some((pending_url, rx)) = self.lightbox_pending.take() {
+            match rx.try_recv() {
+                Ok(Some(payload)) => {
+                    if let Some(loaded) =
+                        self.store_lightbox_payload(ctx, pending_url.clone(), payload)
+                    {
+                        self.lightbox_tex = Some((pending_url, loaded));
+                    }
+                }
+                Ok(None) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.lightbox_pending = Some((pending_url, rx));
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        if self.lightbox_tex.as_ref().map(|(u, _)| u == &url).unwrap_or(false)
+            || self.lightbox_pending.is_some()
+        {
+            return;
+        }
+
+        // Start a fetch for the newly opened image.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let url_moved = url.clone();
+        std::thread::spawn(move || {
+            let payload = http()
+                .get(&url_moved)
+                .send()
+                .ok()
+                .and_then(|resp| read_limited(resp, MAX_DOWNLOAD_BYTES))
+                .and_then(|bytes| App::decode_lightbox_payload(&bytes));
+            let _ = result_tx.send(payload);
+        });
+        self.lightbox_pending = Some((url, result_rx));
+    }
+
+    /// If the system clipboard holds an image, write it to a temp PNG and queue
+    /// it as an attachment for the next send.
+    pub(crate) fn paste_clipboard_image(&mut self) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        let Ok(img) = clipboard.get_image() else {
+            return;
+        };
+        let (w, h) = (img.width as u32, img.height as u32);
+        if w == 0 || h == 0 {
+            return;
+        }
+        // arboard returns RGBA8 bytes.
+        let Some(buf) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("wyvern-paste-{}.png", stamp));
+        if buf.save(&path).is_err() {
+            return;
+        }
+        let path = path.to_string_lossy().to_string();
+        if !self.pending_attachments.contains(&path) {
+            self.pending_attachments.push(path);
+        }
+        self.push_debug("CLIP: картинка вставлена из буфера".to_string());
+    }
 
 /// Reap finished downloads even for images no longer on screen.
 /// Otherwise decoded pixels linger in `pending_images`; the cache bounds memory.

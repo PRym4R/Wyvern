@@ -36,6 +36,7 @@ fn make_app() -> App {
             timestamp: "2026-01-01T00:00:00.000Z".into(),
             attachments: vec![],
             embeds: vec![],
+            reply: None,
             is_own: false,
         })],
     );
@@ -158,6 +159,7 @@ fn chat_scroll_to_bottom_on_history() {
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reply: None,
         is_own: false,
     }).map(Arc::new).collect::<Vec<_>>();
 
@@ -358,6 +360,7 @@ fn history_is_capped_and_old_channels_dropped() {
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reply: None,
         is_own: false,
     };
     for i in 0..MAX_MESSAGES_PER_CHANNEL + 50 {
@@ -412,6 +415,7 @@ fn test_msg(id: &str, channel_id: &str, content: &str) -> ChatMessage {        C
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reply: None,
         is_own: false,
     }
 }

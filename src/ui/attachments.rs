@@ -106,7 +106,16 @@ impl App {
                     self.theme.text_secondary,
                 );
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-                if resp.clicked() {
+                // `clicked()` alone can miss when the pointer is captured by the
+                // surrounding message/scroll interaction; fall back to a direct
+                // pointer hit-test, as the revealed image already does.
+                let clicked = resp.clicked()
+                    || ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .map(|p| rect.contains(p) && ui.ctx().input(|i| i.pointer.primary_clicked()))
+                        .unwrap_or(false);
+                if clicked {
                     self.revealed_images.insert(url.to_string());
                 }
                 return;
@@ -132,10 +141,10 @@ impl App {
                     .map(|p| resp.rect.contains(p) && ui.ctx().input(|i| i.pointer.primary_clicked()))
                     .unwrap_or(false);
                 if resp.clicked() || rect_click {
-                    self.lightbox_url = Some(url.to_string());
+                    self.open_lightbox(url);
                 }
                 if ui.small_button("🔍").clicked() {
-                    self.lightbox_url = Some(url.to_string());
+                    self.open_lightbox(url);
                 }
                 hover_text_lazy(resp, || url.to_string());
             } else if self.failed_images.contains(url) {

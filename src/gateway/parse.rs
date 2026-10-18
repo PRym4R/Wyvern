@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::models::{image_size_of, size_from, Attachment, ChatMessage, Embed};
+use crate::models::{image_size_of, message_preview, size_from, Attachment, ChatMessage, Embed, ReplyRef};
 
 /// Deserialize a field that may not be a string (e.g. `content` can be a
 /// number) by stringifying it, instead of dropping the whole page.
@@ -132,6 +132,45 @@ struct RawMessage {
     attachments: Vec<RawAttachment>,
     #[serde(default)]
     embeds: Vec<RawEmbed>,
+    /// The message this one replies to, if any (Discord includes it inline).
+    #[serde(default)]
+    referenced_message: Option<RawRefMessage>,
+}
+
+/// The replied-to message, reduced to the author and a text preview.
+#[derive(serde::Deserialize)]
+struct RawRefMessage {
+    #[serde(default)]
+    author: Option<RawAuthor>,
+    #[serde(default, deserialize_with = "de_text")]
+    content: String,
+    #[serde(default)]
+    attachments: Vec<RawAttachment>,
+    #[serde(default)]
+    embeds: Vec<RawEmbed>,
+}
+
+impl RawRefMessage {
+    fn into_reply(self) -> ReplyRef {
+        // Content is best; otherwise fall back to an attachment/embed caption so
+        // an image reply still shows something.
+        let text = if !self.content.trim().is_empty() {
+            self.content
+        } else {
+            self.attachments
+                .iter()
+                .find_map(|a| a.description.clone())
+                .or_else(|| self.embeds.iter().find_map(|e| e.description.clone()))
+                .unwrap_or_default()
+        };
+        ReplyRef {
+            author_name: self
+                .author
+                .and_then(|a| a.username)
+                .unwrap_or_else(|| "?".into()),
+            preview: message_preview(&text),
+        }
+    }
 }
 
 impl RawMessage {
@@ -162,6 +201,7 @@ impl RawMessage {
             // Store embeds trimmed: the full JSON costs far more than the two
             // fields used.
             embeds: self.embeds.into_iter().filter_map(RawEmbed::into_embed).collect(),
+            reply: self.referenced_message.map(RawRefMessage::into_reply),
             is_own: false,
         })
     }
@@ -230,6 +270,27 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
             .as_array()
             .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
             .unwrap_or_default(),
+        reply: m.get("referenced_message").map(|r| {
+            let content = r["content"].as_str().unwrap_or("");
+            let text = if !content.trim().is_empty() {
+                content.to_string()
+            } else {
+                r["attachments"]
+                    .as_array()
+                    .and_then(|a| a.iter().find_map(|x| x["description"].as_str()))
+                    .or_else(|| {
+                        r["embeds"]
+                            .as_array()
+                            .and_then(|e| e.iter().find_map(|x| x["description"].as_str()))
+                    })
+                    .unwrap_or("")
+                    .to_string()
+            };
+            ReplyRef {
+                author_name: r["author"]["username"].as_str().unwrap_or("?").to_string(),
+                preview: message_preview(&text),
+            }
+        }),
         is_own: false,
     })
 }

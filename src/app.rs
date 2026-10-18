@@ -137,6 +137,13 @@ pub(crate) struct App {
     pub(crate) animating: bool,
     /// URL of the image currently shown full-size, if any.
     pub(crate) lightbox_url: Option<String>,
+    /// High-resolution copy of the lightbox image, kept only while viewing and
+    /// for a short grace period after closing.
+    pub(crate) lightbox_tex: Option<(String, crate::models::LoadedImage)>,
+    /// In-flight high-res fetch: url plus a receiver for the decoded payload.
+    pub(crate) lightbox_pending: Option<(String, std::sync::mpsc::Receiver<Option<crate::models::ImagePayload>>)>,
+    /// When to drop the high-res copy (set when the lightbox closes).
+    pub(crate) lightbox_evict_at: Option<std::time::Instant>,
     /// Files selected for the next send (drag-drop / paste).
     pub(crate) pending_attachments: Vec<String>,
     /// Quick-switch dialog open (Ctrl+K).
@@ -262,6 +269,9 @@ impl App {
             egui_ctx: None,
             animating: false,
             lightbox_url: None,
+            lightbox_tex: None,
+            lightbox_pending: None,
+            lightbox_evict_at: None,
             pending_attachments: Vec::new(),
             quick_switch_open: false,
             quick_switch_query: String::new(),
@@ -1151,11 +1161,24 @@ impl App {
         self.schedule_repaint(ctx, had_events);
     }
 
+    /// Opens the full-size viewer for `url`, resetting any previous high-res copy.
+    pub(crate) fn open_lightbox(&mut self, url: &str) {
+        let changed = self.lightbox_url.as_deref() != Some(url);
+        self.lightbox_url = Some(url.to_string());
+        if changed {
+            self.lightbox_evict_at = None;
+            self.lightbox_pending = None;
+            if self.lightbox_tex.as_ref().map(|(u, _)| u != url).unwrap_or(false) {
+                self.lightbox_tex = None;
+            }
+        }
+    }
+
     /// Whether to request the next frame; idle requests nothing so the app doesn't repaint 20x/s.
-    fn schedule_repaint(&self, ctx: &egui::Context, had_events: bool) {
-        // Background loads are reaped in draw and animations advance by time, so keep frames coming.
+    fn schedule_repaint(&self, ctx: &egui::Context, had_events: bool) {        // Background loads are reaped in draw and animations advance by time, so keep frames coming.
         let busy = !self.pending_avatars.is_empty()
             || !self.pending_images.is_empty()
+            || self.lightbox_pending.is_some()
             || self.history_loading.is_some()
             || self.history_loading_more
             || self.animating;

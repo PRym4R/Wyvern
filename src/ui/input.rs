@@ -79,9 +79,36 @@ impl App {
                     .collect()
             });
         for text in pasted {
-            let path = text.trim().to_string();
+            // Some sources hand paths over as `file://` URIs.
+            let path = text.trim().strip_prefix("file://").unwrap_or(text.trim()).to_string();
             if std::path::Path::new(&path).is_file() && !self.pending_attachments.contains(&path) {
                 self.pending_attachments.push(path);
+            }
+        }
+        // Ctrl+V: egui-winit turns the press into `Event::Paste` for text and
+        // swallows the key, so an image-only clipboard would otherwise be
+        // silent. The key *release* still reaches us, so treat Ctrl+V-release as
+        // the paste gesture and read the clipboard image ourselves.
+        let paste_gesture = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. }
+                        if modifiers.ctrl
+                )
+            })
+        });
+        if paste_gesture {
+            self.paste_clipboard_image();
+        }
+        // Esc cancels a pending reply/edit; while a modal window is open Esc
+        // belongs to that window (lightbox/quick switch/settings).
+        let modal_open = self.lightbox_url.is_some() || self.quick_switch_open || self.settings_open;
+        if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.edit_target.is_some() {
+                self.cancel_edit();
+            } else if self.reply_to.is_some() {
+                self.cancel_reply();
             }
         }
         let has_channel = self.selected_channel.is_some();
@@ -263,6 +290,11 @@ impl App {
             let cid = self.channels[idx].id.clone();
             // Reply target, if any, travels with this send only.
             let reply_to = self.reply_to.as_ref().map(|r| r.message_id.clone());
+            // The optimistic echo shows the quote immediately, before Discord confirms.
+            let reply_ref = self.reply_to.as_ref().map(|r| crate::models::ReplyRef {
+                author_name: r.author_name.clone(),
+                preview: r.preview.clone(),
+            });
             // Optimistic echo with a fake local id; MESSAGE_CREATE replaces it by id.
             let local_id = format!("{}{}", LOCAL_ID_PREFIX, self.next_local_id);
             self.next_local_id += 1;
@@ -279,6 +311,7 @@ impl App {
                 timestamp: String::new(),
                 attachments: Vec::new(),
                 embeds: Vec::new(),
+                reply: reply_ref,
                 is_own: true,
             }));
             self.send_cmd(ToGateway::Send { channel_id: cid, content: text.to_string(), local_id, reply_to });
@@ -729,6 +762,39 @@ mod tests {
         app.cancel_reply();
 
         assert!(app.reply_to.is_none(), "отмена должна убрать reply");
+    }
+
+    /// Esc cancels a pending reply while the composer is active.
+    #[test]
+    fn escape_cancels_reply() {
+        let (mut app, ctx) = narrow_app();
+        app.reply_to = Some(ReplyTarget {
+            message_id: "m42".into(),
+            author_name: "Алиса".into(),
+            preview: "исходное".into(),
+        });
+        let mut raw = frame();
+        raw.events.push(key_event(egui::Key::Escape, egui::Modifiers::NONE));
+
+        ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+
+        assert!(app.reply_to.is_none(), "Esc должен отменить reply");
+    }
+
+    /// Esc cancels a pending edit rather than leaving the composer stuck.
+    #[test]
+    fn escape_cancels_edit() {
+        let (mut app, ctx) = narrow_app();
+        app.edit_target = Some(EditTarget {
+            channel_id: "c1".into(),
+            message_id: "m42".into(),
+        });
+        let mut raw = frame();
+        raw.events.push(key_event(egui::Key::Escape, egui::Modifiers::NONE));
+
+        ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+
+        assert!(app.edit_target.is_none(), "Esc должен отменить правку");
     }
 
     /// The reply bar names the author, shows the source text and offers cancel.

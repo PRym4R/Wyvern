@@ -25,6 +25,8 @@ const LINE_H: f32 = 16.5;
 const BUBBLE_BASE_H: f32 = 30.0;
 /// Another author's message is never shorter than an avatar-lined row.
 const OTHER_MIN_H: f32 = 72.0;
+/// Height of the reply quote line above a reply's own content.
+const REPLY_ROW_H: f32 = 16.0;
 /// Gap after an image inside a message.
 const IMAGE_GAP: f32 = 6.0;
 /// Average 14pt character width; only for estimation — on-screen heights
@@ -79,12 +81,7 @@ fn estimate_lines(chars: usize, text_w: f32) -> f32 {
 /// One-line preview of a replied message, capped so the composer bar stays
 /// short. Newlines are folded so the bar never grows taller.
 pub(crate) fn reply_preview(text: &str) -> String {
-    const PREVIEW_CHARS: usize = 120;
-    let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
-    if text.chars().count() > PREVIEW_CHARS {
-        preview.push('…');
-    }
-    preview.replace(['\n', '\r'], " ")
+    crate::models::message_preview(text)
 }
 
 /// Chat width rounded to a pixel, used as the height-cache key. Ignoring
@@ -208,6 +205,16 @@ impl App {
             message_id: msg.id.clone(),
         });
     }
+    /// Wires a message's interactions: the context menu, and double-click to
+    /// reply (which also focuses the composer).
+    fn message_interactions(&mut self, ctx: &egui::Context, response: &egui::Response, msg: &ChatMessage) {
+        self.message_context_menu(response, msg);
+        let resp = response.interact(egui::Sense::click());
+        if resp.double_clicked() && self.message_menu(msg).reply {
+            self.run_message_action(ctx, MessageAction::Reply, msg);
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("message_input")));
+        }
+    }
     /// Context menu for one message, attached to its frame response.
     fn message_context_menu(&mut self, response: &egui::Response, msg: &ChatMessage) {
         let menu = self.message_menu(msg);
@@ -281,7 +288,8 @@ impl App {
             };
             images += h + IMAGE_GAP;
         });
-        let total = BUBBLE_BASE_H + NAME_ROW_H + lines * LINE_H + images;
+        let total = BUBBLE_BASE_H + NAME_ROW_H + lines * LINE_H + images
+            + if msg.reply.is_some() { REPLY_ROW_H } else { 0.0 };
         if own { total } else { total.max(OTHER_MIN_H) }
     }
     /// Scroll offset to open the frame at. Recomputes the anchored message's
@@ -638,9 +646,29 @@ impl App {
             }
         }
     }
+    /// Quote line shown above a reply's content, so a reply is recognisable as
+    /// one instead of looking like a plain message.
+    fn draw_reply_quote(&self, ui: &mut egui::Ui, msg: &ChatMessage) {
+        let Some(reply) = &msg.reply else {
+            return;
+        };
+        let name = if reply.author_name.is_empty() { "message" } else { reply.author_name.as_str() };
+        let preview = if reply.preview.is_empty() { "…" } else { reply.preview.as_str() };
+        ui.horizontal(|ui| {
+            let (bar, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
+            ui.painter().rect_filled(bar, 1.5, self.theme.accent.gamma_multiply(0.7));
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{name}: {preview}"))
+                        .size(11.0)
+                        .color(self.theme.text_secondary),
+                )
+                .truncate(),
+            );
+        });
+    }
     /// Draws one message. The caller measures height from the scroll content.
-    pub(crate) fn draw_message(&mut self, ui: &mut egui::Ui, msg: &ChatMessage, avatar_key: &mut String) {
-        let display = self.display_name(msg);
+    pub(crate) fn draw_message(&mut self, ui: &mut egui::Ui, msg: &ChatMessage, avatar_key: &mut String) {        let display = self.display_name(msg);
         // Kept-deleted messages stay in the list but are drawn red.
         let deleted = !msg.id.is_empty() && self.deleted_ids.contains(&msg.id);
         let text_color = if deleted { crate::ui::ERROR_RED } else { self.theme.text };
@@ -664,11 +692,12 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
+                        self.draw_reply_quote(ui, msg);
                         render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
                     });
                 });
-                self.message_context_menu(&frame.response, msg);
+                self.message_interactions(ui.ctx(), &frame.response, msg);
             });
             ui.add_space(6.0);
         } else {
@@ -720,16 +749,19 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
+                        self.draw_reply_quote(ui, msg);
                         render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
                     });
                 });
                 });
-                self.message_context_menu(&frame.response, msg);
+                self.message_interactions(ui.ctx(), &frame.response, msg);
                 ui.add_space(6.0);
         }
     }
     pub(crate) fn draw_lightbox(&mut self, ctx: &egui::Context) {
+        // Poll the high-res fetch and drop it once its grace period ends.
+        self.update_lightbox(ctx);
         let Some(url) = self.lightbox_url.clone() else {
             return;
         };
@@ -739,7 +771,19 @@ impl App {
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                if let Some(tex) = self.image_cache.get(&url).cloned().or_else(|| self.download_image(ui.ctx(), &url)) {
+                // Prefer the high-res copy; fall back to the chat thumbnail (or
+                // the animated original) while it loads or for GIFs.
+                let tex = self
+                    .lightbox_tex
+                    .as_ref()
+                    .filter(|(u, _)| u == &url)
+                    .map(|(_, l)| l.clone())
+                    .or_else(|| self.image_cache.get(&url).cloned())
+                    .or_else(|| self.download_image(ui.ctx(), &url));
+                if let Some(tex) = tex {
+                    if tex.is_animated() {
+                        self.animating = true;
+                    }
                     let size = tex.size_vec2();
                     let max = ui.ctx().screen_rect().size() * 0.85;
                     let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
@@ -754,6 +798,11 @@ impl App {
             });
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.lightbox_url = None;
+            // Keep the high-res pixels briefly so reopening is instant.
+            if self.lightbox_tex.is_some() {
+                self.lightbox_evict_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+            }
         }
     }
 

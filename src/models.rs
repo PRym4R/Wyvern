@@ -182,7 +182,29 @@ pub(crate) struct ChatMessage {
     pub(crate) timestamp: String,
     pub(crate) attachments: Vec<Attachment>,
     pub(crate) embeds: Vec<Embed>,
+    /// The message this one replies to, reduced to what the client shows.
+    pub(crate) reply: Option<ReplyRef>,
     pub(crate) is_own: bool,
+}
+
+/// A referenced (replied-to) message: the bits needed for the quote line above
+/// the reply's own content.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ReplyRef {
+    pub(crate) author_name: String,
+    pub(crate) preview: String,
+}
+
+/// One-line preview of a message: folded, trimmed and capped, for reply quotes.
+pub(crate) fn message_preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 120;
+    let trimmed = text.trim();
+    let mut preview: String = trimmed.chars().take(PREVIEW_CHARS).collect();
+    if trimmed.chars().count() > PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview.replace(['\n', '\r'], " ")
 }
 
 /// Prefix for locally echoed message ids; never valid for lookups or pagination.
