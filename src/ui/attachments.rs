@@ -92,6 +92,25 @@ impl App {
         // Draw the downloaded image or reserve its space; URLs are borrowed,
         // not copied.
         for_each_image(msg, |url, known| {
+            // Spoiler mode: hide the media behind a click-to-reveal placeholder,
+            // and don't even download it until asked.
+            if self.settings.blur_media && !self.revealed_images.contains(url) {
+                let disp = reserved_size(known);
+                let (rect, resp) = ui.allocate_exact_size(disp, egui::Sense::click());
+                ui.painter().rect_filled(rect, 6.0, self.theme.input_bg);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "кликните, чтобы показать",
+                    egui::FontId::proportional(13.0),
+                    self.theme.text_secondary,
+                );
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    self.revealed_images.insert(url.to_string());
+                }
+                return;
+            }
             if let Some(tex) = self.download_image(ui.ctx(), url) {
                 // Keep a visible image pinned in the cache, or it gets
                 // re-downloaded next frame and flickers.

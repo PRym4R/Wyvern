@@ -22,6 +22,10 @@ fn settings_round_trip_through_a_file() {
     s.window = Some([1000.0, 700.0]);
     s.last_channel = Some("c42".into());
     s.drafts.insert("c1".into(), "hello".into());
+    s.ui_scale = Some(1.25);
+    s.blur_media = true;
+    s.notifications = true;
+    s.keep_deleted = true;
 
     s.save_to(&path).expect("настройки должны записаться");
     assert!(
@@ -125,6 +129,24 @@ fn last_channel_is_restored_when_known() {
     assert_eq!(app.selected_channel, Some(0));
     assert_eq!(app.selected_guild, Some(0));
     assert_eq!(app.current_channel_id(), Some("c7"));
+}
+
+#[test]
+fn keep_deleted_marks_instead_of_removing() {
+    let mut app = offline_app();
+    app.settings.keep_deleted = true;
+    app.delete_message("c1", "m1");
+    assert!(
+        app.deleted_ids.contains("m1"),
+        "с включённым хранением удалённое сообщение должно остаться (красным)"
+    );
+
+    let mut app = offline_app();
+    app.delete_message("c1", "m1");
+    assert!(
+        !app.deleted_ids.contains("m1"),
+        "без хранения удалённое сообщение просто исчезает, метки нет"
+    );
 }
 
 #[test]

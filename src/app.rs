@@ -157,6 +157,12 @@ pub(crate) struct App {
     pub(crate) settings_path: Option<std::path::PathBuf>,
     /// Channel id whose text currently sits in `input`, so a switch can stash the draft.
     pub(crate) draft_channel: Option<String>,
+    /// Settings window open.
+    pub(crate) settings_open: bool,
+    /// Image URLs revealed by click while `blur_media` is on (this session).
+    pub(crate) revealed_images: HashSet<String>,
+    /// Ids of deleted messages kept in the list (drawn red) when `keep_deleted` is on.
+    pub(crate) deleted_ids: HashSet<String>,
     pub(crate) show_friends: bool,
     pub(crate) friends: Vec<UserProfile>,
     pub(crate) history_loading: Option<String>,
@@ -266,6 +272,9 @@ impl App {
             settings: Settings::default(),
             settings_path: None,
             draft_channel: None,
+            settings_open: false,
+            revealed_images: HashSet::new(),
+            deleted_ids: HashSet::new(),
             show_friends: false,
             friends: Vec::new(),
             history_loading: None,
@@ -328,6 +337,27 @@ impl App {
             self.settings.drafts.insert(cid, text);
         }
     }
+    /// Desktop notification via `notify-send`; only when the window isn't focused.
+    #[cfg(target_os = "linux")]
+    fn notify_desktop(&self, msg: &ChatMessage) {
+        let focused = self.egui_ctx.as_ref().map(|c| c.input(|i| i.focused)).unwrap_or(false);
+        if focused {
+            return;
+        }
+        let text = self.display_content(msg);
+        if text.trim().is_empty() {
+            return;
+        }
+        use std::process::{Command, Stdio};
+        let _ = Command::new("notify-send")
+            .arg(&msg.author_name)
+            .arg(text)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn notify_desktop(&self, _msg: &ChatMessage) {}
     /// Reopen the channel from the previous session if it is already known.
     pub(crate) fn restore_last_channel(&mut self) -> bool {
         let Some(remembered) = self.settings.last_channel.clone() else {
@@ -430,6 +460,9 @@ impl App {
                         // The confirmation replaces our local echo; otherwise the same text would appear twice.
                         let replaced = self.replace_local_echo(&cid, &msg);
                         if !replaced {
+                            if self.settings.notifications && !msg.is_own {
+                                self.notify_desktop(&msg);
+                            }
                             let entry = self.messages.entry(cid).or_default();
                             entry.push(Arc::new(msg));
                             // A new own message while viewing the newest: drop the oldest.
@@ -953,7 +986,12 @@ impl App {
         }
     }
     /// Remove one message and its cached height so it doesn't linger until rejoin.
+    /// With `keep_deleted` on, the row stays and is drawn red instead.
     pub(crate) fn delete_message(&mut self, channel_id: &str, message_id: &str) {
+        if self.settings.keep_deleted {
+            self.deleted_ids.insert(message_id.to_string());
+            return;
+        }
         if let Some(entry) = self.messages.get_mut(channel_id) {
             entry.retain(|m| m.id != message_id);
         }
@@ -961,6 +999,10 @@ impl App {
     }
     /// Bulk delete: one event for many ids.
     pub(crate) fn delete_messages(&mut self, channel_id: &str, ids: &[String]) {
+        if self.settings.keep_deleted {
+            self.deleted_ids.extend(ids.iter().cloned());
+            return;
+        }
         if let Some(entry) = self.messages.get_mut(channel_id) {
             entry.retain(|m| !ids.iter().any(|id| id == &m.id));
         }
@@ -1030,6 +1072,9 @@ impl App {
             self.stash_draft();
             self.write_settings();
         }
+
+        // Apply the UI scale from settings (1.0 = default).
+        ctx.set_zoom_factor(self.settings.ui_scale.unwrap_or(1.0));
 
         self.theme = match self.theme_index {
             0 => Theme::dark(),

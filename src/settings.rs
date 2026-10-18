@@ -17,6 +17,14 @@ pub(crate) struct Settings {
     pub(crate) last_channel: Option<String>,
     /// Unsent composer text per channel id.
     pub(crate) drafts: HashMap<String, String>,
+    /// UI scale (1.0 = default); `None` means 1.0.
+    pub(crate) ui_scale: Option<f32>,
+    /// Hide images/GIFs behind a click-to-reveal placeholder.
+    pub(crate) blur_media: bool,
+    /// Show a desktop notification for incoming messages.
+    pub(crate) notifications: bool,
+    /// Keep deleted messages in the list, drawn in red, instead of removing them.
+    pub(crate) keep_deleted: bool,
 }
 
 impl Settings {

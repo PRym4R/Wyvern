@@ -122,6 +122,7 @@ impl App {
         let r3 = ctx.available_rect();
         self.draw_main_chat(ctx);
         self.draw_lightbox(ctx);
+        self.draw_settings(ctx);
         let r4 = ctx.available_rect();
         if self.debug_frames % 15 == 0 {
             self.push_debug(format!("FRAME: screen={:.0}x{:.0} servers={:.0}x{:.0} channels={:.0}x{:.0} input={:.0}x{:.0} chat={:.0}x{:.0}",
@@ -640,6 +641,9 @@ impl App {
     /// Draws one message. The caller measures height from the scroll content.
     pub(crate) fn draw_message(&mut self, ui: &mut egui::Ui, msg: &ChatMessage, avatar_key: &mut String) {
         let display = self.display_name(msg);
+        // Kept-deleted messages stay in the list but are drawn red.
+        let deleted = !msg.id.is_empty() && self.deleted_ids.contains(&msg.id);
+        let text_color = if deleted { crate::ui::ERROR_RED } else { self.theme.text };
         if self.is_own_msg(msg) {
             let max_w = (ui.available_width() * 0.75).clamp(160.0, 480.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -660,7 +664,7 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
-                        render_message_text(ui, content, 14.0, self.theme.text);
+                        render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
                     });
                 });
@@ -716,7 +720,7 @@ impl App {
                         });
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
-                        render_message_text(ui, content, 14.0, self.theme.text);
+                        render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
                     });
                 });

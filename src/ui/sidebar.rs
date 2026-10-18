@@ -92,6 +92,17 @@ impl App {
                     }
                     ubtn.on_hover_text("Toggle theme");
 
+                    let sbtn = ui.add_sized(
+                        [48.0, 42.0],
+                        egui::Button::new(RichText::new("⚙").size(18.0).color(Color32::WHITE))
+                            .fill(self.theme.input_bg)
+                            .corner_radius(21.0),
+                    );
+                    if sbtn.clicked() {
+                        self.settings_open = true;
+                    }
+                    sbtn.on_hover_text("Настройки");
+
                     let abtn = ui.add_sized(
                         [48.0, 42.0],
                         egui::Button::new(RichText::new("👤").size(18.0).color(Color32::WHITE))

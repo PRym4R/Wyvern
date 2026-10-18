@@ -5,6 +5,7 @@ mod chat;
 mod input;
 mod login;
 mod markdown;
+mod settings_window;
 mod sidebar;
 
 /// Color for failures: failed sends and Discord errors.
