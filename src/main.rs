@@ -14,6 +14,7 @@ mod gateway;
 mod media;
 mod messages;
 mod models;
+mod settings;
 mod ui;
 mod util;
 
@@ -21,6 +22,7 @@ use eframe::egui;
 use tokio::sync::mpsc;
 
 use crate::app::App;
+use crate::settings::Settings;
 
 /// Numbered panic log path: `/tmp/wyvern_panic_N.log`. Numbering keeps a
 /// series of panics instead of overwriting the previous one.
@@ -50,15 +52,24 @@ fn main() -> eframe::Result<()> {
     }));
 
     // Version in the title: the repo-root binary is not always rebuilt.
+    // Restore the window size from the last session, if it was saved.
+    let settings_path = Settings::path();
+    let settings = Settings::load_from(&settings_path);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_min_inner_size([700.0, 500.0])
+        .with_title(format!("Wyvern {}", env!("CARGO_PKG_VERSION")));
+    if let Some([w, h]) = settings.window {
+        if w >= 700.0 && h >= 500.0 {
+            viewport = viewport.with_inner_size([w, h]);
+        }
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_min_inner_size([700.0, 500.0])
-            .with_title(format!("Wyvern {}", env!("CARGO_PKG_VERSION"))),
+        viewport,
         ..Default::default()
     };
 
     let (_, rx) = mpsc::unbounded_channel();
-    let app = App::new(rx);
+    let app = App::new(rx).with_settings(settings, Some(settings_path));
 
     eframe::run_native(
         "wyvern",

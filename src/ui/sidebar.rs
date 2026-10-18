@@ -88,6 +88,7 @@ impl App {
                     );
                     if ubtn.clicked() {
                         self.theme_index = (self.theme_index + 1) % 3;
+                        self.write_settings();
                     }
                     ubtn.on_hover_text("Toggle theme");
 

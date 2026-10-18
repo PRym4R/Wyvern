@@ -12,6 +12,7 @@ use crate::models::{
     BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, MsgHeight,
     StoredAccount, Theme, UserProfile,
 };
+use crate::settings::Settings;
 
 /// Caps messages per channel; history loads upward, so an unbounded list would grow forever.
 pub(crate) const MAX_MESSAGES_PER_CHANNEL: usize = 500;
@@ -150,6 +151,12 @@ pub(crate) struct App {
     pub(crate) pending_images: HashMap<String, std::sync::mpsc::Receiver<Option<ImagePayload>>>,
     pub(crate) failed_images: HashSet<String>,
     pub(crate) theme: Theme,
+    /// Persisted UI state (theme, window size, last channel, drafts).
+    pub(crate) settings: Settings,
+    /// Where to write `settings`; `None` disables persistence (tests keep it off).
+    pub(crate) settings_path: Option<std::path::PathBuf>,
+    /// Channel id whose text currently sits in `input`, so a switch can stash the draft.
+    pub(crate) draft_channel: Option<String>,
     pub(crate) show_friends: bool,
     pub(crate) friends: Vec<UserProfile>,
     pub(crate) history_loading: Option<String>,
@@ -256,6 +263,9 @@ impl App {
             pending_images: HashMap::new(),
             failed_images: HashSet::new(),
             theme: Theme::dark(),
+            settings: Settings::default(),
+            settings_path: None,
+            draft_channel: None,
             show_friends: false,
             friends: Vec::new(),
             history_loading: None,
@@ -282,6 +292,69 @@ impl App {
             scroll_to_bottom: true,
             debug_frames: 0,
             last_scroll_offset_y: 0.0,
+        }
+    }
+    /// Apply settings loaded from disk (called once, before the first frame).
+    /// `path` is where they get written back; `None` keeps the app read-only.
+    pub(crate) fn with_settings(mut self, settings: Settings, path: Option<std::path::PathBuf>) -> Self {
+        if let Some(idx) = settings.theme_index {
+            if idx <= 2 {
+                self.theme_index = idx;
+            }
+        }
+        self.settings = settings;
+        self.settings_path = path;
+        self
+    }
+    /// Write settings to disk if a path is configured; a failure is logged, not fatal.
+    pub(crate) fn write_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        self.settings.theme_index = Some(self.theme_index);
+        if let Err(e) = self.settings.save_to(&path) {
+            self.push_debug(format!("settings: не удалось сохранить: {e}"));
+        }
+    }
+    /// Save the composer text under its channel and clear it for the next one.
+    fn stash_draft(&mut self) {
+        let Some(cid) = self.draft_channel.clone() else {
+            return;
+        };
+        let text = std::mem::take(&mut self.input);
+        if text.trim().is_empty() {
+            self.settings.drafts.remove(&cid);
+        } else {
+            self.settings.drafts.insert(cid, text);
+        }
+    }
+    /// Reopen the channel from the previous session if it is already known.
+    pub(crate) fn restore_last_channel(&mut self) -> bool {
+        let Some(remembered) = self.settings.last_channel.clone() else {
+            return false;
+        };
+        let Some(idx) = self.channels.iter().position(|c| c.id == remembered) else {
+            return false;
+        };
+        let guild = self.channels[idx].guild_id.clone();
+        let name = self.channels[idx].name.clone();
+        self.selected_guild = guild
+            .as_ref()
+            .and_then(|gid| self.guilds.iter().position(|g| &g.id == gid));
+        self.selected_channel = Some(idx);
+        self.autoselected = true;
+        self.scroll_to_bottom = true;
+        self.open_channel(&remembered);
+        self.push_debug(format!("Restored last channel {}", name));
+        true
+    }
+    /// Remember the window size each frame so the next launch can reuse it.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            let (w, h) = (rect.width(), rect.height());
+            if w >= 1.0 && h >= 1.0 {
+                self.settings.window = Some([w, h]);
+            }
         }
     }
     pub(crate) fn push_debug(&mut self, msg: String) {
@@ -408,7 +481,7 @@ impl App {
                         self.push_debug(format!("Guild {}: +{} channels", guild_id, self.channels.len() - before));
                     }
 
-                    if !self.autoselected && self.selected_guild.is_none() && self.selected_channel.is_none() && !self.channels.is_empty() {
+                    if !self.autoselected && self.selected_guild.is_none() && self.selected_channel.is_none() && !self.channels.is_empty() && !self.restore_last_channel() {
                         let guild_idx = self.guilds.iter().position(|g| g.id == guild_id)
                             .or_else(|| self.guilds.iter().position(|g| {
                                 self.channels.iter().any(|c| c.guild_id.as_deref() == Some(g.id.as_str()))
@@ -583,6 +656,9 @@ impl App {
         self.selected_guild = None;
         self.selected_channel = None;
         self.autoselected = false;
+        // Drafts belong to the previous account's channels; don't leak them.
+        self.draft_channel = None;
+        self.input.clear();
         self.history_loading = None;
         self.history_loading_more = false;
         self.history_exhausted = false;
@@ -649,6 +725,15 @@ impl App {
     }
     /// Open a channel; other channels' messages can be dropped since history reloads anyway.
     pub(crate) fn open_channel(&mut self, channel_id: &str) {
+        // Save the draft of the channel the composer was showing, then show this
+        // channel's own draft (empty if none). Reopening the same channel keeps
+        // what is already typed.
+        if self.draft_channel.as_deref() != Some(channel_id) {
+            self.stash_draft();
+            self.input = self.settings.drafts.get(channel_id).cloned().unwrap_or_default();
+        }
+        self.draft_channel = Some(channel_id.to_string());
+        self.settings.last_channel = Some(channel_id.to_string());
         self.history_loading = Some(channel_id.to_string());
         self.history_loading_more = false;
         self.history_exhausted = false;
@@ -664,6 +749,7 @@ impl App {
         self.reply_to = None;
         self.edit_target = None;
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
+        self.write_settings();
     }
     /// Stores a history page: the first page replaces, `prepend` inserts at the front.
     /// Spinners/scroll are only touched for the currently open channel.
@@ -937,6 +1023,13 @@ impl App {
     /// One app frame: poll, draw, schedule; separate from `eframe::App::update` for tests.
     pub(crate) fn run_frame(&mut self, ctx: &egui::Context) {
         let had_events = self.poll(ctx);
+
+        // Track the window size; on close, persist it together with the drafts.
+        self.remember_window(ctx);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.stash_draft();
+            self.write_settings();
+        }
 
         self.theme = match self.theme_index {
             0 => Theme::dark(),
