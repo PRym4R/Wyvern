@@ -151,7 +151,7 @@ fn chat_scroll_to_bottom_on_history() {
     let many = (0..300).map(|i| ChatMessage {
         id: format!("m{}", i),
         channel_id: "c0".into(),
-        author_id: "u1".into(),
+        author_id: format!("u{}", i % 5),
         author_name: "Alice".into(),
         author_avatar: None,
         nickname: None,
@@ -1710,7 +1710,7 @@ fn edit_replaces_message_text() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(rx);
     app.messages.insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "до правки"))]);
-    app.msg_heights.insert("m1".into(), MsgHeight { height: 40.0, width: 0 });
+    app.msg_heights.insert("m1".into(), MsgHeight { height: 40.0, width: 0, grouped: false });
 
     let mut edited = test_msg("m1", "c1", "после правки");
     edited.author_name = String::new();
@@ -1761,7 +1761,7 @@ fn delete_removes_message_and_height() {
             Arc::new(test_msg("m2", "c1", "второе")),
         ],
     );
-    app.msg_heights.insert("m1".into(), MsgHeight { height: 30.0, width: 0 });
+    app.msg_heights.insert("m1".into(), MsgHeight { height: 30.0, width: 0, grouped: false });
 
     tx.send(ToApp::MessageDeleted {
         channel_id: "c1".into(),

@@ -29,6 +29,18 @@ const OTHER_MIN_H: f32 = 72.0;
 const REPLY_ROW_H: f32 = 16.0;
 /// Gap after an image inside a message.
 const IMAGE_GAP: f32 = 6.0;
+/// Avatar side; a grouped row is indented by this plus the item spacing to
+/// line its text up under the block's first message.
+const AVATAR_SIDE: f32 = 36.0;
+/// How long after the previous message a following one may still join the
+/// same block.
+const GROUP_WINDOW_MINUTES: u32 = 7;
+/// Grouped rows skip the name row and use a tighter gap, so the estimate
+/// sheds both.
+const GROUPED_GAP: f32 = 2.0;
+const MESSAGE_GAP: f32 = 6.0;
+/// Floor for a grouped row (one text line plus padding).
+const GROUPED_MIN_H: f32 = 30.0;
 /// Average 14pt character width; only for estimation — on-screen heights
 /// are measured for real.
 const CHAR_W: f32 = 7.0;
@@ -68,6 +80,18 @@ pub(crate) fn visible_window(offsets: &[f32], offset: f32, viewport: f32) -> (us
     // First message whose top is past the bottom edge.
     let end = offsets.partition_point(|v| *v < bottom).max(first + 1).min(n);
     (first, end)
+}
+
+/// Minute of the day plus date prefix from an ISO-8601 timestamp, used to
+/// decide whether two messages are close enough to form one block. Returns
+/// `None` for anything that isn't the fixed-length form Discord sends.
+fn minute_of(iso: &str) -> Option<(u32, &str)> {
+    if iso.len() < 16 || !iso.is_char_boundary(16) {
+        return None;
+    }
+    let hh: u32 = iso[11..13].parse().ok()?;
+    let mm: u32 = iso[14..16].parse().ok()?;
+    Some((hh * 60 + mm, &iso[..10]))
 }
 
 /// Lines a text of `chars` characters takes at width `text_w`.
@@ -134,6 +158,24 @@ impl App {
     /// Whether this is our own message; own and other bubbles differ.
     pub(crate) fn is_own_msg(&self, msg: &ChatMessage) -> bool {
         msg.is_own || (!self.user_id.is_empty() && msg.author_id == self.user_id)
+    }
+    /// Whether `cur` continues `prev`'s block and may be drawn compactly:
+    /// same author, close in time, and not a reply (a reply always starts its
+    /// own block so its quote stays readable).
+    pub(crate) fn groups_with(&self, prev: &ChatMessage, cur: &ChatMessage) -> bool {
+        if self.is_own_msg(prev) != self.is_own_msg(cur) || cur.reply.is_some() {
+            return false;
+        }
+        if prev.author_id.is_empty() || prev.author_id != cur.author_id {
+            return false;
+        }
+        // Same day guards the midnight wrap-around; then a bounded minute gap.
+        match (minute_of(&prev.timestamp), minute_of(&cur.timestamp)) {
+            (Some((a, da)), Some((b, db))) => {
+                da == db && b >= a && b - a <= GROUP_WINDOW_MINUTES
+            }
+            _ => false,
+        }
     }
     /// Which context-menu actions apply to `msg`. Reply/Edit/Delete need a
     /// confirmed id; only our own messages can be edited or deleted, and edit
@@ -252,27 +294,29 @@ impl App {
     }
     /// Measured height after drawing, otherwise an estimate from text length;
     /// virtualization needs it to decide what to draw.
-    fn msg_height(&mut self, msg: &ChatMessage, width: f32) -> f32 {
+    fn msg_height(&mut self, msg: &ChatMessage, width: f32, grouped: bool) -> f32 {
         // Messages without an id (unconfirmed sends) aren't cached: the key
         // would collide.
         if !msg.id.is_empty() {
             if let Some(h) = self.msg_heights.get(&msg.id) {
-                // Only valid at the same width; after a resize old values
-                // are wrong and the list drifts.
-                if h.width == width_key(width) {
+                // Only valid at the same width and grouping; after a resize or
+                // when a predecessor arrives and re-groups it, old values are
+                // wrong and the list drifts.
+                if h.width == width_key(width) && h.grouped == grouped {
                     return h.height;
                 }
             }
         }
-        self.estimate_msg_height(msg, width)
+        self.estimate_msg_height(msg, width, grouped)
     }
     /// Estimated height. Error washes out once the message is drawn, but a
     /// systematic bias makes the list and scrollbar drift, hence measured
     /// constants.
-    fn estimate_msg_height(&mut self, msg: &ChatMessage, width: f32) -> f32 {
+    fn estimate_msg_height(&mut self, msg: &ChatMessage, width: f32, grouped: bool) -> f32 {
         let own = self.is_own_msg(msg);
         // Text width inside the bubble: own messages are capped to a share
-        // of chat width, others also lose room to the avatar.
+        // of chat width; a grouped other message stays indented under the
+        // block's avatar, the same room an avatar row loses.
         let text_w = if own {
             (width * 0.75).clamp(160.0, 480.0) - 21.0
         } else {
@@ -288,9 +332,21 @@ impl App {
             };
             images += h + IMAGE_GAP;
         });
-        let total = BUBBLE_BASE_H + NAME_ROW_H + lines * LINE_H + images
+        let mut total = BUBBLE_BASE_H + lines * LINE_H + images
             + if msg.reply.is_some() { REPLY_ROW_H } else { 0.0 };
-        if own { total } else { total.max(OTHER_MIN_H) }
+        if grouped {
+            // No name row, and a tighter gap than a full block.
+            total += GROUPED_GAP - MESSAGE_GAP;
+        } else {
+            total += NAME_ROW_H;
+        }
+        if own {
+            total
+        } else if grouped {
+            total.max(GROUPED_MIN_H)
+        } else {
+            total.max(OTHER_MIN_H)
+        }
     }
     /// Scroll offset to open the frame at. Recomputes the anchored message's
     /// position so the view stays put as the list changes.
@@ -355,8 +411,9 @@ impl App {
                 offsets.reserve(msgs.len() + 1);
                 offsets.push(0.0);
                 let mut sum = 0.0_f32;
-                for m in &msgs {
-                    sum += self.msg_height(m, width);
+                for (i, m) in msgs.iter().enumerate() {
+                    let grouped = i > 0 && self.groups_with(&msgs[i - 1], m);
+                    sum += self.msg_height(m, width, grouped);
                     offsets.push(sum);
                 }
                 let total = sum;
@@ -510,8 +567,9 @@ impl App {
                                         if gap > 0.0 {
                                             ui.add_space(gap);
                                         }
+                                        let grouped = i > 0 && self.groups_with(&msgs[i - 1], msg);
                                         let before = ui.min_rect().bottom();
-                                        self.draw_message(ui, msg, &mut avatar_key);
+                                        self.draw_message(ui, msg, &mut avatar_key, grouped);
                                         let h = (ui.min_rect().bottom() - before).max(1.0);
                                         drawn = top + h;
                                         // Usually unchanged, so look it up first
@@ -521,11 +579,16 @@ impl App {
                                         let key = width_key(width);
                                         let stored = self.msg_heights.get(&msg.id).copied();
                                         if !msg.id.is_empty()
-                                            && stored.map(|m| (m.height, m.width)) != Some((h, key))
+                                            && stored.map(|m| (m.height, m.width, m.grouped))
+                                                != Some((h, key, grouped))
                                         {
                                             self.msg_heights.insert(
                                                 msg.id.clone(),
-                                                MsgHeight { height: h, width: key },
+                                                MsgHeight {
+                                                    height: h,
+                                                    width: key,
+                                                    grouped,
+                                                },
                                             );
                                         }
                                     }
@@ -668,7 +731,17 @@ impl App {
         });
     }
     /// Draws one message. The caller measures height from the scroll content.
-    pub(crate) fn draw_message(&mut self, ui: &mut egui::Ui, msg: &ChatMessage, avatar_key: &mut String) {        let display = self.display_name(msg);
+    /// `grouped` is set when this message continues the previous author's
+    /// block: the name row (and, for others, the avatar) is left out and the
+    /// row sits tighter so a burst reads as a single run.
+    pub(crate) fn draw_message(
+        &mut self,
+        ui: &mut egui::Ui,
+        msg: &ChatMessage,
+        avatar_key: &mut String,
+        grouped: bool,
+    ) {
+        let display = self.display_name(msg);
         // Kept-deleted messages stay in the list but are drawn red.
         let deleted = !msg.id.is_empty() && self.deleted_ids.contains(&msg.id);
         let text_color = if deleted { crate::ui::ERROR_RED } else { self.theme.text };
@@ -683,13 +756,15 @@ impl App {
                     .show(ui, |ui| {
                     ui.set_max_width(max_w);
                     ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
-                            if !msg.timestamp.is_empty() {
-                                let t = self.short_time(&msg.timestamp);
-                                ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
-                            }
-                        });
+                        if !grouped {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
+                                if !msg.timestamp.is_empty() {
+                                    let t = self.short_time(&msg.timestamp);
+                                    ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
+                                }
+                            });
+                        }
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
                         self.draw_reply_quote(ui, msg);
@@ -699,7 +774,7 @@ impl App {
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
             });
-            ui.add_space(6.0);
+            ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
         } else {
             let frame = egui::Frame::new()
                 .fill(self.theme.message_hover)
@@ -707,46 +782,54 @@ impl App {
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                ui.set_min_height(44.0);
+                if !grouped {
+                    ui.set_min_height(44.0);
+                }
                 ui.horizontal(|ui| {
-                    let size = 36.0;
-                    let avatar_tex = msg.author_avatar.as_ref()
-                        .and_then(|h| {
-                            avatar_key.clear();
-                            avatar_key.push_str(&msg.author_id);
-                            avatar_key.push('_');
-                            avatar_key.push_str(h);
-                            self.avatar_cache.get(avatar_key.as_str()).cloned()
-                        })
-                        .or_else(|| {
-                            if let Some(h) = &msg.author_avatar {
-                                self.download_avatar(ui.ctx(), &msg.author_id, h)
-                            } else { None }
-                        });
-                    if let Some(tex) = avatar_tex {
-                        ui.add_sized(
-                            egui::vec2(size, size),
-                            egui::Image::new(
-                                egui::load::SizedTexture::new(tex.id(), egui::vec2(size, size))
-                            ).corner_radius(size / 2.0),
-                        );
+                    if grouped {
+                        // Keep the text under the block's first message.
+                        ui.add_space(AVATAR_SIDE + ui.spacing().item_spacing.x);
                     } else {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), size / 2.0, self.theme.accent);
-                        let initial = msg.author_name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                        ui.painter().text(
-                            rect.center(), egui::Align2::CENTER_CENTER, &initial,
-                            egui::FontId::proportional(16.0), Color32::WHITE,
-                        );
+                        let avatar_tex = msg.author_avatar.as_ref()
+                            .and_then(|h| {
+                                avatar_key.clear();
+                                avatar_key.push_str(&msg.author_id);
+                                avatar_key.push('_');
+                                avatar_key.push_str(h);
+                                self.avatar_cache.get(avatar_key.as_str()).cloned()
+                            })
+                            .or_else(|| {
+                                if let Some(h) = &msg.author_avatar {
+                                    self.download_avatar(ui.ctx(), &msg.author_id, h)
+                                } else { None }
+                            });
+                        if let Some(tex) = avatar_tex {
+                            ui.add_sized(
+                                egui::vec2(AVATAR_SIDE, AVATAR_SIDE),
+                                egui::Image::new(
+                                    egui::load::SizedTexture::new(tex.id(), egui::vec2(AVATAR_SIDE, AVATAR_SIDE))
+                                ).corner_radius(AVATAR_SIDE / 2.0),
+                            );
+                        } else {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(AVATAR_SIDE, AVATAR_SIDE), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), AVATAR_SIDE / 2.0, self.theme.accent);
+                            let initial = msg.author_name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                            ui.painter().text(
+                                rect.center(), egui::Align2::CENTER_CENTER, &initial,
+                                egui::FontId::proportional(16.0), Color32::WHITE,
+                            );
+                        }
                     }
                     ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
-                            if !msg.timestamp.is_empty() {
-                                let t = self.short_time(&msg.timestamp);
-                                ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
-                            }
-                        });
+                        if !grouped {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(display).strong().size(14.0).color(self.theme.accent));
+                                if !msg.timestamp.is_empty() {
+                                    let t = self.short_time(&msg.timestamp);
+                                    ui.label(RichText::new(t).size(11.0).color(self.theme.text_secondary));
+                                }
+                            });
+                        }
                         let content = self.display_content(msg);
                         let content = if content.is_empty() { "* (message)" } else { content };
                         self.draw_reply_quote(ui, msg);
@@ -756,7 +839,7 @@ impl App {
                 });
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
-                ui.add_space(6.0);
+                ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
         }
     }
     pub(crate) fn draw_lightbox(&mut self, ctx: &egui::Context) {

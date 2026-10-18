@@ -47,7 +47,7 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 221 tests (220 + measurement)
+cargo test --release                                        # 223 tests (222 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -83,6 +83,13 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   typing…"). Discord sends `TYPING_START` with no matching stop event, so the
   indicator lapses after eight seconds. DM events carry no name, so it is
   resolved from already-loaded messages; our own typing is ignored.
+
+### Message grouping
+
+- Consecutive messages from one author within seven minutes collapse into a
+  single block: the name row and avatar are drawn once and the rest are
+  indented under it. A reply, a different author, or a longer pause starts a
+  new block.
 
 ## 0.7.0 — 2026-10-18
 

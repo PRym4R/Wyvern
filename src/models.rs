@@ -339,11 +339,13 @@ impl LoadedImage {
     }
 }
 
-/// Measured row height plus the chat width it was measured at; stale after resize.
+/// Measured row height plus the chat width and grouping it was measured at;
+/// stale after a resize or when a predecessor re-groups the row.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MsgHeight {
     pub(crate) height: f32,
     pub(crate) width: u32,
+    pub(crate) grouped: bool,
 }
 
 #[derive(Clone, Debug)]

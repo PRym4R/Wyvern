@@ -158,14 +158,50 @@ mod geometry_tests {
         let m = message(0);
         h.app
             .msg_heights
-            .insert(m.id.clone(), MsgHeight { height: 999.0, width: 400 });
+            .insert(m.id.clone(), MsgHeight { height: 999.0, width: 400, grouped: false });
         // Same width: from the cache.
-        assert_eq!(h.app.msg_height(&m, 400.0), 999.0);
+        assert_eq!(h.app.msg_height(&m, 400.0, false), 999.0);
         // Different width: the old value is invalid, so it's recomputed.
-        let fresh = h.app.msg_height(&m, 800.0);
-        let estimate = h.app.estimate_msg_height(&m, 800.0);
+        let fresh = h.app.msg_height(&m, 800.0, false);
+        let estimate = h.app.estimate_msg_height(&m, 800.0, false);
         assert_ne!(fresh, 999.0, "после ресайза старые высоты не годятся");
         assert_eq!(fresh, estimate, "на новой ширине высота берётся из оценки");
+    }
+
+    /// Consecutive messages by one author inside the time window form a block;
+    /// a break in time, a different author, or a reply starts a new one.
+    #[test]
+    fn consecutive_messages_from_one_author_group() {
+        use crate::models::ReplyRef;
+        let h = app_with_messages(2);
+        let mut a = message(1);
+        a.author_id = "u0".into();
+        a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        let mut b = a.clone();
+        b.id = "b".into();
+        b.timestamp = "2026-01-01T00:03:00.000Z".into();
+        assert!(h.app.groups_with(&a, &b), "подряд одного автора должны слипаться");
+
+        let mut far = b.clone();
+        far.timestamp = "2026-01-01T00:30:00.000Z".into();
+        assert!(!h.app.groups_with(&a, &far), "перерыв больше окна не слипается");
+
+        let mut other = b.clone();
+        other.author_id = "u1".into();
+        assert!(!h.app.groups_with(&a, &other), "другой автор разбивает блок");
+
+        let mut reply = b.clone();
+        reply.reply = Some(ReplyRef {
+            author_name: "x".into(),
+            preview: "y".into(),
+        });
+        assert!(!h.app.groups_with(&a, &reply), "ответ всегда начинает новый блок");
+
+        let mut late = a.clone();
+        late.timestamp = "2026-01-01T23:58:00.000Z".into();
+        let mut next = b.clone();
+        next.timestamp = "2026-01-02T00:01:00.000Z".into();
+        assert!(!h.app.groups_with(&late, &next), "через полночь блок не тянется");
     }
 
     /// The wheel must scroll both ways. Check what's drawn, not the internal
@@ -347,7 +383,7 @@ mod geometry_tests {
         let mut sum_est = 0.0;
         let mut sum_real = 0.0;
         for (name, m) in &cases {
-            let est = h.app.estimate_msg_height(m, width);
+            let est = h.app.estimate_msg_height(m, width, false);
             // Draw one at a time; the list fits the window.
             h.app.messages.insert("c0".into(), vec![Arc::new(m.clone())]);
             scroll_to(&mut h.app, 0.0);
