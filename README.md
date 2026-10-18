@@ -47,7 +47,7 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 226 tests (225 + measurement)
+cargo test --release                                        # 229 tests (228 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -99,6 +99,14 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   is gone.
 - Irreversible actions ask first: deleting a message, removing a saved account,
   and clearing all drafts open a modal that Esc or a backdrop click cancels.
+
+### Unread and mentions
+
+- Channels accumulate an unread badge while you are elsewhere (or scrolled up);
+  a message that pings you turns the row bold with a red `@n` count, and
+  servers get the same badge aggregated over their channels.
+- Opening a channel clears its badge at once and sends Discord a best-effort
+  read receipt for the newest message.
 
 ## 0.7.0 — 2026-10-18
 

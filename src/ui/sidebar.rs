@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::app::App;
 use crate::messages::ToGateway;
+use crate::ui::ERROR_RED;
 
 impl App {
     /// Clicking "@": clears the server and channel selection only.
@@ -71,6 +72,21 @@ impl App {
                                 self.selected_guild = Some(i);
                                 self.selected_channel = None;
                                 self.show_friends = false;
+                            }
+                            let (unread, mentions) = self.guild_badge(&guild.id);
+                            if unread > 0 {
+                                let color = if mentions > 0 { ERROR_RED } else { self.theme.text };
+                                let text = if mentions > 0 { mentions } else { unread };
+                                let r = 9.0;
+                                let center = btn.rect.right_top() + egui::vec2(-r, r);
+                                ui.painter().circle_filled(center, r, color);
+                                ui.painter().text(
+                                    center,
+                                    egui::Align2::CENTER_CENTER,
+                                    text.to_string(),
+                                    egui::FontId::proportional(11.0),
+                                    Color32::BLACK,
+                                );
                             }
                         });
                         ui.add_space(6.0);
@@ -200,14 +216,26 @@ impl App {
                             for i in ch_idx {
                                 let Some(ch) = self.channels.get(i) else { continue };
                                 let is_sel = self.selected_channel == Some(i);
-                                let label = format!("# {}", ch.name);
+                                let (unread, mentions) = self.channel_badge(&ch.id);
+                                let label = if mentions > 0 {
+                                    format!("# {}  @{}", ch.name, mentions)
+                                } else if unread > 0 {
+                                    format!("# {}  ({})", ch.name, unread)
+                                } else {
+                                    format!("# {}", ch.name)
+                                };
+                                let mut text = RichText::new(&label).size(14.0);
+                                text = if is_sel || mentions > 0 {
+                                    text.color(Color32::WHITE).strong()
+                                } else if unread > 0 {
+                                    text.color(self.theme.text)
+                                } else {
+                                    text.color(self.theme.text_secondary)
+                                };
                                 let response = ui.add_sized(
                                     [ui.available_width(), 32.0],
-                                    egui::Button::new(
-                                        RichText::new(&label)
-                                            .color(if is_sel { Color32::WHITE } else { self.theme.text_secondary })
-                                            .size(14.0)
-                                    ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
+                                    egui::Button::new(text)
+                                        .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT }),
                                 );
                                 if response.clicked() {
                                     let cid = ch.id.clone();
@@ -292,13 +320,26 @@ impl App {
                                         .and_then(|s| self.channels.get(s))
                                         .map(|c| c.id == cid)
                                         .unwrap_or(false);
+                                    let (unread, mentions) = self.channel_badge(&cid);
+                                    let label = if mentions > 0 {
+                                        format!("{}  @{}", cname, mentions)
+                                    } else if unread > 0 {
+                                        format!("{}  ({})", cname, unread)
+                                    } else {
+                                        cname.clone()
+                                    };
+                                    let mut text = RichText::new(&label).size(14.0);
+                                    text = if is_sel || mentions > 0 {
+                                        text.color(Color32::WHITE).strong()
+                                    } else if unread > 0 {
+                                        text.color(self.theme.text)
+                                    } else {
+                                        text.color(self.theme.text_secondary)
+                                    };
                                     let response = ui.add_sized(
                                         [ui.available_width(), 32.0],
-                                        egui::Button::new(
-                                            RichText::new(&cname)
-                                                .color(if is_sel { Color32::WHITE } else { self.theme.text_secondary })
-                                                .size(14.0)
-                                        ).fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT })
+                                        egui::Button::new(text)
+                                            .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT }),
                                     );
                                     if response.clicked() {
                                         self.selected_channel = Some(i);

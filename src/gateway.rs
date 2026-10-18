@@ -19,8 +19,8 @@ mod rest;
 
 use self::parse::parse_message_value;
 use self::rest::{
-    api_client, delete_message, edit_message, fetch_history_page, fetch_relationships, open_dm,
-    send_files, send_message,
+    ack_message, api_client, delete_message, edit_message, fetch_history_page, fetch_relationships,
+    open_dm, send_files, send_message,
 };
 
 // Re-exported so the `crate::gateway::...` paths used by the test modules keep
@@ -847,6 +847,16 @@ async fn gw_inner(
                             }
                             fetch_history_page(httpc, tkc, ev.clone(), cid.clone(), before).await;
                             release_history(&inflight, &key).await;
+                        });
+                    }
+                    ToGateway::AckMessage { channel_id, message_id } => {
+                        // Best-effort read receipt; the badge is already cleared
+                        // locally, so a failure only lands in the debug log.
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            ack_message(httpc, tkc, ev, channel_id, message_id).await;
                         });
                     }
                     ToGateway::OpenDM { user_id } => {

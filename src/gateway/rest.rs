@@ -257,6 +257,41 @@ pub(crate) async fn delete_message_to(
     }
 }
 
+/// Mark a channel read up to a message. Best-effort: the format of user-token
+/// read state has changed before, so a rejection is only logged, never shown.
+pub(super) async fn ack_message(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    message_id: String,
+) {
+    let url = format!(
+        "{}/channels/{}/messages/{}/ack",
+        API_BASE, channel_id, message_id
+    );
+    let req = httpc
+        .post(&url)
+        .header("Authorization", &*tkn)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .header("X-Super-Properties", &super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+        .json(&json!({ "token": null }));
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let _ = event_tx.send(ToApp::Debug("Channel acked".into()));
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let _ = event_tx.send(ToApp::Debug(format!("Ack failed {}", status)));
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Ack error: {}", e)));
+        }
+    }
+}
+
 /// Open a DM with a user. Separate task, like `send_message`, so the network
 /// request doesn't stall the gateway loop.
 pub(super) async fn open_dm(

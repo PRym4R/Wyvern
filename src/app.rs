@@ -121,6 +121,10 @@ pub(crate) struct App {
     /// Who is typing, per channel: user id -> (display name, expiry). Pruned as
     /// entries lapse (Discord sends no "stopped typing" event).
     pub(crate) typing: HashMap<String, HashMap<String, (String, Instant)>>,
+    /// Unread message count per channel, for sidebar badges. Cleared on open.
+    pub(crate) unread: HashMap<String, u32>,
+    /// Unread messages that mention us, a subset of `unread`, shown in red.
+    pub(crate) mentions: HashMap<String, u32>,
     pub(crate) input: String,
     /// Natural height of the multiline composer, measured last frame; drives the panel height.
     pub(crate) composer_h: f32,
@@ -278,6 +282,8 @@ impl App {
             selected_channel: None,
             messages: HashMap::new(),
             typing: HashMap::new(),
+            unread: HashMap::new(),
+            mentions: HashMap::new(),
             input: String::new(),
             composer_h: 0.0,
             reply_to: None,
@@ -605,6 +611,7 @@ impl App {
                             if self.settings.notifications && !msg.is_own {
                                 self.notify_desktop(&msg);
                             }
+                            self.note_unread(&msg);
                             let entry = self.messages.entry(cid).or_default();
                             entry.push(Arc::new(msg));
                             // A new own message while viewing the newest: drop the oldest.
@@ -837,6 +844,10 @@ impl App {
         self.reply_to = None;
         self.edit_target = None;
         self.friends.clear();
+        // Badges belong to the old account's channels.
+        self.unread.clear();
+        self.mentions.clear();
+        self.typing.clear();
         self.selected_guild = None;
         self.selected_channel = None;
         self.autoselected = false;
@@ -933,6 +944,9 @@ impl App {
         // Switching channels drops the reply target along with the old list.
         self.reply_to = None;
         self.edit_target = None;
+        // Opening a channel reads it; the badge goes now, the ack follows history.
+        self.unread.remove(channel_id);
+        self.mentions.remove(channel_id);
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
         self.write_settings();
     }
@@ -1018,6 +1032,7 @@ impl App {
                 self.scroll_to_bottom = true;
                 // The list was fully replaced, so cached heights no longer apply.
                 self.msg_heights.clear();
+                self.ack_channel(channel_id);
             }
         }
         // Truncate by chars; slicing bytes would panic on non-ASCII ids.
@@ -1245,6 +1260,71 @@ impl App {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Whether `content` pings us (`<@id>` or the nick form `<@!id>`).
+    pub(crate) fn mentions_user(&self, content: &str) -> bool {
+        if self.user_id.is_empty() {
+            return false;
+        }
+        content.contains(&format!("<@{}>", self.user_id))
+            || content.contains(&format!("<@!{}>", self.user_id))
+    }
+
+    /// Counts a live message as unread unless it is in the open channel at the
+    /// bottom, where it is being read as it arrives.
+    pub(crate) fn note_unread(&mut self, msg: &ChatMessage) {
+        if msg.is_own || msg.id.is_empty() {
+            return;
+        }
+        let cid = msg.channel_id.as_str();
+        if self.current_channel_id() == Some(cid) && self.chat_at_bottom {
+            return;
+        }
+        *self.unread.entry(msg.channel_id.clone()).or_insert(0) += 1;
+        if self.mentions_user(&msg.content) {
+            *self.mentions.entry(msg.channel_id.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Clears a channel's local badge and tells Discord it was read up to its
+    /// newest message. The network call is best-effort.
+    pub(crate) fn ack_channel(&mut self, channel_id: &str) {
+        self.unread.remove(channel_id);
+        self.mentions.remove(channel_id);
+        let newest = self
+            .messages
+            .get(channel_id)
+            .and_then(|entry| entry.iter().rev().find(|m| !m.is_local_echo()))
+            .map(|m| m.id.clone());
+        if let Some(message_id) = newest {
+            if !message_id.is_empty() {
+                self.send_cmd(ToGateway::AckMessage {
+                    channel_id: channel_id.to_string(),
+                    message_id,
+                });
+            }
+        }
+    }
+
+    /// Unread and mention counts for one channel, for the sidebar badge.
+    pub(crate) fn channel_badge(&self, channel_id: &str) -> (u32, u32) {
+        (
+            self.unread.get(channel_id).copied().unwrap_or(0),
+            self.mentions.get(channel_id).copied().unwrap_or(0),
+        )
+    }
+
+    /// Totals across a guild's channels, for the server-list badge.
+    pub(crate) fn guild_badge(&self, guild_id: &str) -> (u32, u32) {
+        let mut unread = 0;
+        let mut mentions = 0;
+        for ch in self.channels.iter().filter(|c| c.guild_id.as_deref() == Some(guild_id)) {
+            let (u, m) = self.channel_badge(&ch.id);
+            unread += u;
+            mentions += m;
+        }
+        (unread, mentions)
     }
 
     /// Takes the open channel's messages for the frame so rendering owns the Vec and

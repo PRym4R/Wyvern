@@ -64,6 +64,9 @@ pub(crate) enum ToGateway {
     /// History page. `before` is the oldest shown id: `None` for the first
     /// page, otherwise paging upward.
     FetchHistory { channel_id: String, before: Option<String> },
+    /// Tell Discord the channel was read up to `message_id`. Best-effort: the
+    /// local unread badge is cleared regardless of the reply.
+    AckMessage { channel_id: String, message_id: String },
     OpenDM { user_id: String },
     Shutdown,
 }

@@ -923,9 +923,13 @@ mod geometry_tests {
         );
         assert_eq!(app.messages["c0"].len(), 50, "в канале должна быть одна страница");
         assert!(app.chat_at_bottom, "открытый канал показывает новое сообщение, а не начало");
+        // The read receipt is expected; a second history page is not.
+        let after = drain(&mut cmds);
         assert!(
-            drain(&mut cmds).is_empty(),
-            "пока не доскроллили вверх, следующая страница не нужна"
+            !after
+                .iter()
+                .any(|c| matches!(c, ToGateway::FetchHistory { .. })),
+            "пока не доскроллили вверх, следующая страница не нужна: {after:?}"
         );
     }
 

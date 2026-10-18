@@ -219,6 +219,80 @@ fn confirming_clear_drafts_empties_them() {
     assert_eq!(app.toasts.len(), 1, "об очистке стоит сообщить тостом");
 }
 
+/// Mentions are the two `<@id>` forms and need a known user id.
+#[test]
+fn mentions_user_detects_both_forms() {
+    let mut app = make_app();
+    app.user_id = "42".into();
+    assert!(app.mentions_user("привет <@42>!"), "обычное упоминание");
+    assert!(app.mentions_user("<@!42> hi"), "форма ника");
+    assert!(!app.mentions_user("<@7> no"), "чужой id не наш");
+    app.user_id.clear();
+    assert!(!app.mentions_user("<@42>"), "без user_id упоминаний нет");
+}
+
+/// Unread skips own messages and the channel being read at the bottom.
+#[test]
+fn note_unread_ignores_own_and_open_channel() {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "42".into();
+    app.channels.push(ChatChannel {
+        id: "c1".into(),
+        name: "general".into(),
+        guild_id: None,
+        channel_type: 1,
+        topic: None,
+        position: 0,
+    });
+    app.selected_channel = Some(0);
+    app.chat_at_bottom = true;
+    app.note_unread(&test_msg("m1", "c1", "hi <@42>"));
+    assert!(app.unread.get("c1").is_none(), "открытый канал внизу читается сразу");
+
+    // Scrolled away, the same channel now counts, mention included.
+    app.chat_at_bottom = false;
+    app.note_unread(&test_msg("m2", "c1", "hi <@42>"));
+    assert_eq!(app.unread.get("c1"), Some(&1));
+    assert_eq!(app.mentions.get("c1"), Some(&1));
+
+    // Our own message never counts.
+    let mut own = test_msg("m3", "c1", "me");
+    own.is_own = true;
+    app.note_unread(&own);
+    assert_eq!(app.unread.get("c1"), Some(&1));
+}
+
+/// Acking clears the badge and sends a receipt for the newest message.
+#[test]
+fn ack_clears_badge_and_sends_receipt() {
+    let (tx, mut cmds) = mpsc::unbounded_channel();
+    let (_t, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.to_gw = Some(tx);
+    app.messages.insert(
+        "c1".into(),
+        vec![
+            Arc::new(test_msg("m1", "c1", "hi")),
+            Arc::new(test_msg("m2", "c1", "last")),
+        ],
+    );
+    app.unread.insert("c1".into(), 3);
+    app.mentions.insert("c1".into(), 1);
+
+    app.ack_channel("c1");
+
+    assert!(app.unread.get("c1").is_none(), "бейдж должен сброситься");
+    assert!(app.mentions.get("c1").is_none());
+    match cmds.try_recv() {
+        Ok(ToGateway::AckMessage { channel_id, message_id }) => {
+            assert_eq!(channel_id, "c1");
+            assert_eq!(message_id, "m2", "подтверждаем самое свежее сообщение");
+        }
+        other => panic!("ожидался AckMessage, пришло {other:?}"),
+    }
+}
+
 #[test]
 fn account_encryption_roundtrip() {
     let accs = vec![
