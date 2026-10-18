@@ -9,7 +9,7 @@ impl crate::app::App {
             return;
         }
         let mut open = true;
-        egui::Window::new("Настройки")
+        egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -17,23 +17,23 @@ impl crate::app::App {
             .show(ctx, |ui| {
                 ui.set_min_width(380.0);
 
-                ui.heading("Тема");
+                ui.heading("Theme");
                 ui.horizontal(|ui| {
                     let mut changed = false;
-                    changed |= ui.radio_value(&mut self.theme_index, 0u8, "Тёмная").changed();
-                    changed |= ui.radio_value(&mut self.theme_index, 1u8, "Киберпанк").changed();
-                    changed |= ui.radio_value(&mut self.theme_index, 2u8, "Светлая").changed();
+                    changed |= ui.radio_value(&mut self.theme_index, 0u8, "Dark").changed();
+                    changed |= ui.radio_value(&mut self.theme_index, 1u8, "Cyberpunk").changed();
+                    changed |= ui.radio_value(&mut self.theme_index, 2u8, "Light").changed();
                     if changed {
                         self.write_settings();
                     }
                 });
 
                 ui.separator();
-                ui.heading("Интерфейс");
+                ui.heading("Interface");
                 let mut scale = self.settings.ui_scale.unwrap_or(1.0);
                 let resp = ui.add(
                     egui::Slider::new(&mut scale, 0.8..=1.6)
-                        .text("Масштаб интерфейса и шрифта")
+                        .text("UI and font scale")
                         .fixed_decimals(2),
                 );
                 if resp.changed() {
@@ -43,16 +43,16 @@ impl crate::app::App {
                 if resp.drag_stopped() {
                     self.write_settings();
                 }
-                if ui.button("Сбросить масштаб").clicked() {
+                if ui.button("Reset scale").clicked() {
                     self.settings.ui_scale = Some(1.0);
                     self.write_settings();
                 }
 
                 ui.separator();
-                ui.heading("Медиа и уведомления");
+                ui.heading("Media and notifications");
                 let mut blur = self.settings.blur_media;
                 if ui
-                    .checkbox(&mut blur, "Прятать картинки и GIF до клика")
+                    .checkbox(&mut blur, "Hide images and GIFs until clicked")
                     .changed()
                 {
                     self.settings.blur_media = blur;
@@ -62,7 +62,7 @@ impl crate::app::App {
                 }
                 let mut notes = self.settings.notifications;
                 if ui
-                    .checkbox(&mut notes, "Push-уведомления о новых сообщениях")
+                    .checkbox(&mut notes, "Notify about new messages")
                     .changed()
                 {
                     self.settings.notifications = notes;
@@ -70,10 +70,10 @@ impl crate::app::App {
                 }
 
                 ui.separator();
-                ui.heading("История");
+                ui.heading("History");
                 let mut keep = self.settings.keep_deleted;
                 if ui
-                    .checkbox(&mut keep, "Хранить удалённые сообщения (красным)")
+                    .checkbox(&mut keep, "Keep deleted messages (shown red)")
                     .changed()
                 {
                     self.settings.keep_deleted = keep;
@@ -90,17 +90,17 @@ impl crate::app::App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Очистить черновики").clicked() {
+                    if ui.button("Clear drafts").clicked() {
                         self.settings.drafts.clear();
                         self.write_settings();
                     }
-                    if ui.button("Сбросить размер окна").clicked() {
+                    if ui.button("Reset window size").clicked() {
                         self.settings.window = None;
                         self.write_settings();
                     }
                 });
                 ui.label(
-                    RichText::new(format!("Файл настроек: {}", Settings::path().display()))
+                    RichText::new(format!("Settings file: {}", Settings::path().display()))
                         .size(11.0)
                         .color(self.theme.text_secondary),
                 );

@@ -734,7 +734,7 @@ impl App {
             return;
         };
         let mut open = true;
-        egui::Window::new("Просмотр")
+        egui::Window::new("View")
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -748,7 +748,7 @@ impl App {
                 } else {
                     ui.spinner();
                 }
-                if ui.button("Закрыть").clicked() {
+                if ui.button("Close").clicked() {
                     open = false;
                 }
             });
@@ -765,12 +765,12 @@ impl App {
             return;
         }
         let mut open = self.quick_switch_open;
-        egui::Window::new("Быстрый переход")
+        egui::Window::new("Quick switch")
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.quick_switch_query)
-                        .hint_text("Канал..."),
+                        .hint_text("Channel..."),
                 );
                 ui.separator();
                 let query = self.quick_switch_query.to_lowercase();

@@ -101,7 +101,7 @@ impl App {
                     if sbtn.clicked() {
                         self.settings_open = true;
                     }
-                    sbtn.on_hover_text("Настройки");
+                    sbtn.on_hover_text("Settings");
 
                     let abtn = ui.add_sized(
                         [48.0, 42.0],

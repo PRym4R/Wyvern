@@ -101,7 +101,7 @@ impl App {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "кликните, чтобы показать",
+                    "click to reveal",
                     egui::FontId::proportional(13.0),
                     self.theme.text_secondary,
                 );
