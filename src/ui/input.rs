@@ -459,8 +459,70 @@ impl App {
             }
             return;
         }
+        // `/debug unread [n] [@]` fakes badges on the open channel; `all` covers
+        // the whole list, so the sidebar is checkable without a second account.
+        if rest == "unread" || rest.starts_with("unread ") {
+            let args = rest.strip_prefix("unread").unwrap_or("").trim();
+            self.debug_unread(args);
+            return;
+        }
         self.status = format!("unknown debug command: {rest}");
         self.push_debug(format!("Unknown debug command: {rest}"));
+    }
+
+    /// Seeds `unread`/`mentions` for the visual badge check. `n` defaults to 3;
+    /// `@` also marks mentions; `all` applies to every known channel.
+    fn debug_unread(&mut self, args: &str) {
+        let mut all = false;
+        let mut mention = false;
+        let mut count: Option<u32> = None;
+        for tok in args.split_whitespace() {
+            if tok == "all" {
+                all = true;
+            } else if tok == "@" {
+                mention = true;
+            } else if let Ok(n) = tok.parse::<u32>() {
+                count = Some(n);
+            } else {
+                self.status = format!("unknown unread option: {tok}");
+                return;
+            }
+        }
+        let n = count.unwrap_or(3);
+        let ids: Vec<String> = if all {
+            self.channels.iter().map(|c| c.id.clone()).collect()
+        } else {
+            match self.selected_channel.and_then(|i| self.channels.get(i)) {
+                Some(ch) => vec![ch.id.clone()],
+                None => {
+                    self.status = "no channel selected".to_string();
+                    return;
+                }
+            }
+        };
+        if ids.is_empty() {
+            self.status = "no channels to mark".to_string();
+            return;
+        }
+        for id in &ids {
+            if n == 0 {
+                self.unread.remove(id);
+                self.mentions.remove(id);
+            } else {
+                self.unread.insert(id.clone(), n);
+                if mention {
+                    self.mentions.insert(id.clone(), n);
+                } else {
+                    self.mentions.remove(id);
+                }
+            }
+        }
+        self.status = format!(
+            "debug unread: {n}{} on {} channel(s)",
+            if mention { " (mention)" } else { "" },
+            ids.len()
+        );
+        self.push_debug(self.status.clone());
     }
 
     /// Add a channel directly, bypassing Discord's lists; only reachable by id.
@@ -574,6 +636,20 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 600.0))),
             ..Default::default()
         }
+    }
+
+    /// `/debug unread` seeds badges so the sidebar is checkable without a
+    /// second account; zero clears them again.
+    #[test]
+    fn debug_unread_seeds_badges() {
+        let (mut app, _ctx) = narrow_app();
+        app.handle_input("/debug unread 5 @");
+        assert_eq!(app.unread.get("c1"), Some(&5), "счётчик непрочитанных");
+        assert_eq!(app.mentions.get("c1"), Some(&5), "упоминание");
+
+        app.handle_input("/debug unread 0");
+        assert!(app.unread.get("c1").is_none(), "ноль сбрасывает бейдж");
+        assert!(app.mentions.get("c1").is_none(), "и упоминание тоже");
     }
 
     /// Field width must never go negative: egui draws negative rects empty, hiding the field.

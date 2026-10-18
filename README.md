@@ -47,7 +47,7 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 229 tests (228 + measurement)
+cargo test --release                                        # 230 tests (229 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
