@@ -162,7 +162,7 @@ impl App {
                         }
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     ui.add_space(12.0);
                     ui.label(RichText::new(ch_name).strong().size(13.0).color(self.theme.text_secondary));
                     ui.add_space(8.0);
@@ -199,7 +199,7 @@ impl App {
                         let focused = ui.memory(|m| m.has_focus(field_id));
                         let enter_sends = focused
                             && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                        let resp = egui::ScrollArea::vertical()
+                        let scroll = egui::ScrollArea::vertical()
                             .id_salt("message_input_scroll")
                             .max_height(COMPOSER_MAX_H)
                             .max_width(field_w)
@@ -221,10 +221,11 @@ impl App {
                                         )
                                         .margin(egui::Margin::symmetric(12, 8)),
                                 )
-                            })
-                            .inner;
-                        // Remember the field's natural height so the panel can grow to fit it.
-                        self.composer_h = resp.rect.height();
+                            });
+                        let resp = scroll.inner;
+                        // The field's own (desired) height, capped: the ScrollArea
+                        // clips it to COMPOSER_MAX_H and scrolls the rest.
+                        self.composer_h = resp.rect.height().clamp(0.0, COMPOSER_MAX_H);
                         // Any edit clears the held-Enter resend guard; set before the Enter check.
                         if resp.changed() {
                             self.input_dirty = true;
@@ -906,6 +907,36 @@ mod tests {
             many_lines <= COMPOSER_MAX_H + 60.0,
             "поле должно упереться в потолок {COMPOSER_MAX_H}, а не расти безгранично: {many_lines}"
         );
+    }
+
+    /// The composer field must get real vertical room, not the one-row slice a
+    /// `ui.horizontal` row hands out: otherwise the text is clipped and only the
+    /// panel grows (the field visually slides up instead of getting taller).
+    #[test]
+    fn composer_field_is_not_clipped_to_a_single_row() {
+        let (mut app, ctx) = narrow_app();
+        app.input = (0..4).map(|i| format!("строка {i}")).collect::<Vec<_>>().join("\n");
+        for _ in 0..3 {
+            let _ = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        }
+
+        let out = ctx.run(frame(), |ctx| app.draw_input_bar(ctx));
+        let clip_h = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("строка 3") => Some(cs.clip_rect.height()),
+                _ => None,
+            })
+            .expect("поле ввода с текстом должно рисоваться");
+        assert!(
+            clip_h > composer_row_height(&ctx) * 3.0,
+            "поле ввода обрезано до одной строки: клип {clip_h:.1} px"
+        );
+    }
+
+    fn composer_row_height(ctx: &egui::Context) -> f32 {
+        ctx.style().text_styles[&egui::TextStyle::Body].size + 2.0
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
