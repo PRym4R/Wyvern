@@ -10,6 +10,10 @@ pub(crate) enum ToApp {
     MessageDeleted { channel_id: String, message_id: String },
     /// Bulk delete: one event for many ids.
     MessageDeletedBulk { channel_id: String, message_ids: Vec<String> },
+    /// Someone started typing in a channel. `user_name` may be empty when the
+    /// event carries only a user id (DMs); the app then resolves the name from
+    /// messages it has already seen.
+    Typing { channel_id: String, user_id: String, user_name: String },
     /// Channel name or topic changed; shown in the chat header.
     ChannelUpdated { channel_id: String, name: Option<String>, topic: Option<String> },
     /// First page of channel history, replacing what is there. `more` = older

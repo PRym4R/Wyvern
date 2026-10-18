@@ -50,6 +50,17 @@ pub(crate) fn trim_input(text: &str) -> &str {
     })
 }
 
+/// One-line summary of who is typing, Discord-style.
+fn typing_summary(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("{one} is typing…"),
+        [a, b] => format!("{a} and {b} are typing…"),
+        [a, b, c] => format!("{a}, {b} and {c} are typing…"),
+        _ => "Several people are typing…".to_string(),
+    }
+}
+
 impl App {
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
         let dropped: Vec<String> = ctx
@@ -188,6 +199,21 @@ impl App {
                             self.pending_attachments.remove(i);
                         }
                     });
+                }
+                // Who is typing: shown above the field, fades on its own since
+                // Discord sends no "stopped typing" event.
+                if let Some(id) = self.current_channel_id().map(str::to_string) {
+                    let names = self.typing_names(&id);
+                    if !names.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(typing_summary(&names))
+                                    .size(11.0)
+                                    .color(self.theme.text_secondary),
+                            );
+                        });
+                    }
                 }
                 ui.horizontal_top(|ui| {
                     ui.add_space(12.0);
@@ -776,7 +802,7 @@ mod tests {
         let mut raw = frame();
         raw.events.push(key_event(egui::Key::Escape, egui::Modifiers::NONE));
 
-        ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+        let _ = ctx.run(raw, |ctx| app.draw_input_bar(ctx));
 
         assert!(app.reply_to.is_none(), "Esc должен отменить reply");
     }
@@ -792,7 +818,7 @@ mod tests {
         let mut raw = frame();
         raw.events.push(key_event(egui::Key::Escape, egui::Modifiers::NONE));
 
-        ctx.run(raw, |ctx| app.draw_input_bar(ctx));
+        let _ = ctx.run(raw, |ctx| app.draw_input_bar(ctx));
 
         assert!(app.edit_target.is_none(), "Esc должен отменить правку");
     }
@@ -1028,5 +1054,22 @@ mod tests {
             egui::Shape::Text(t) => t.galley.text().contains(needle),
             _ => false,
         })
+    }
+
+    /// The typing line names one, two, three or "several" people.
+    #[test]
+    fn typing_summary_reads_naturally() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(typing_summary(&n(&[])), "");
+        assert_eq!(typing_summary(&n(&["Alice"])), "Alice is typing…");
+        assert_eq!(typing_summary(&n(&["Alice", "Bob"])), "Alice and Bob are typing…");
+        assert_eq!(
+            typing_summary(&n(&["Alice", "Bob", "Carol"])),
+            "Alice, Bob and Carol are typing…"
+        );
+        assert_eq!(
+            typing_summary(&n(&["A", "B", "C", "D"])),
+            "Several people are typing…"
+        );
     }
 }

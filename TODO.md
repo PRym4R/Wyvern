@@ -335,6 +335,20 @@ Gemini).
 - Тесты: +3 (`escape_cancels_reply`, `escape_cancels_edit`,
   `reply_reference_is_parsed_from_history_and_live`); итого 220.
 
+### Индикатор набора текста (0.8.0)
+
+- [x] **Кто печатает — видно над полем ввода**: гейтвей разбирает
+      `TYPING_START` (в гильдиях имя берётся из `member.user.username`, в ЛС
+      имени нет — подставляется из уже загруженных сообщений канала, иначе
+      `Someone`). `App::typing` хранит user id → (имя, срок) по каналам,
+      `prune_typing` выкидывает истёкшие каждый кадр (Discord не шлёт событие
+      «перестал печатать», индикатор живёт 8 секунд). Своё печатание
+      игнорируется. Строка «Alice is typing…» / «Alice and Bob are typing…» /
+      «Several people are typing…» рисуется в композере; `schedule_repaint`
+      держит кадры, пока индикатор виден. Отправку своего `TYPING_START` в
+      Discord пока не делаем. Тесты: `typing_indicators_track_and_lapse`,
+      `typing_summary_reads_naturally`; итого 222.
+
 ### По `BUGS.txt` (части 4–5), после 0.5.1
 
 Часть 4 (Б-1…Б-25) — поведение и надёжность, часть 5 (Т-1…Т-23) — цена кадра

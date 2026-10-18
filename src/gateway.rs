@@ -653,6 +653,19 @@ async fn gw_inner(
                                     let _ = event_tx.send(ToApp::MessageUpdated(msg));
                                 }
                             }
+                            "TYPING_START" => {
+                                let d = &v["d"];
+                                let _ = event_tx.send(ToApp::Typing {
+                                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+                                    user_id: d["user_id"].as_str().unwrap_or("").to_string(),
+                                    // Guild typing carries the member; DMs don't.
+                                    user_name: d["member"]["user"]["username"]
+                                        .as_str()
+                                        .or_else(|| d["user"]["username"].as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                });
+                            }
                             "MESSAGE_DELETE" => {
                                 let d = &v["d"];
                                 let _ = event_tx.send(ToApp::MessageDeleted {

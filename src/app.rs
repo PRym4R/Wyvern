@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, TextureHandle};
 use tokio::sync::mpsc;
@@ -29,6 +29,8 @@ const IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 /// Max failed image URLs remembered to avoid refetching them.
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
+/// How long a "typing" indicator stays up; Discord sends no stop event.
+const TYPING_TTL: Duration = Duration::from_secs(8);
 
 /// Whether to log debug lines to disk/stderr; off by default. Enable with `WYVERN_DEBUG=1`.
 fn debug_to_disk_from_env() -> bool {
@@ -80,6 +82,9 @@ pub(crate) struct App {
     pub(crate) selected_guild: Option<usize>,
     pub(crate) selected_channel: Option<usize>,
     pub(crate) messages: HashMap<String, Vec<Arc<ChatMessage>>>,
+    /// Who is typing, per channel: user id -> (display name, expiry). Pruned as
+    /// entries lapse (Discord sends no "stopped typing" event).
+    pub(crate) typing: HashMap<String, HashMap<String, (String, Instant)>>,
     pub(crate) input: String,
     /// Natural height of the multiline composer, measured last frame; drives the panel height.
     pub(crate) composer_h: f32,
@@ -232,6 +237,7 @@ impl App {
             selected_guild: None,
             selected_channel: None,
             messages: HashMap::new(),
+            typing: HashMap::new(),
             input: String::new(),
             composer_h: 0.0,
             reply_to: None,
@@ -533,6 +539,9 @@ impl App {
                 }
                 ToApp::ChannelUpdated { channel_id, name, topic } => {
                     self.update_channel(&channel_id, name, topic)
+                }
+                ToApp::Typing { channel_id, user_id, user_name } => {
+                    self.note_typing(&channel_id, &user_id, &user_name)
                 }
                 ToApp::History { channel_id, messages, more } => {
                     self.apply_history(&channel_id, messages, more, false);
@@ -1090,6 +1099,61 @@ impl App {
             }
         }
     }
+    /// Records that `user_id` is typing in `channel_id`; the indicator lapses
+    /// after a few seconds (Discord sends no stop event).
+    pub(crate) fn note_typing(&mut self, channel_id: &str, user_id: &str, user_name: &str) {
+        if user_id.is_empty() || user_id == self.user_id {
+            return;
+        }
+        let name = if user_name.is_empty() {
+            self.author_name_for(channel_id, user_id)
+        } else {
+            user_name.to_string()
+        };
+        self.typing
+            .entry(channel_id.to_string())
+            .or_default()
+            .insert(user_id.to_string(), (name, Instant::now() + TYPING_TTL));
+    }
+
+    /// A display name for a user id, looked up in the channel's loaded messages
+    /// (DM typing events carry no name).
+    fn author_name_for(&self, channel_id: &str, user_id: &str) -> String {
+        self.messages
+            .get(channel_id)
+            .and_then(|msgs| msgs.iter().rev().find(|m| m.author_id == user_id))
+            .map(|m| m.author_name.clone())
+            .unwrap_or_else(|| "Someone".to_string())
+    }
+
+    /// Drops lapsed typing entries; called once per frame.
+    pub(crate) fn prune_typing(&mut self) {
+        let now = Instant::now();
+        self.typing.retain(|_, users| {
+            users.retain(|_, (_, expiry)| *expiry > now);
+            !users.is_empty()
+        });
+    }
+
+    /// Display names of users currently typing in `channel_id`.
+    pub(crate) fn typing_names(&self, channel_id: &str) -> Vec<String> {
+        let now = Instant::now();
+        let mut names: Vec<String> = self
+            .typing
+            .get(channel_id)
+            .map(|users| {
+                users
+                    .values()
+                    .filter(|(_, expiry)| *expiry > now)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Takes the open channel's messages for the frame so rendering owns the Vec and
     /// can call `&mut` methods without cloning the Arc list each frame.
     /// `restore_channel_messages` puts them back; also returns the channel id.
@@ -1148,6 +1212,8 @@ impl App {
 
         // Animation flag is rebuilt each frame by rendering if an animated image is visible.
         self.animating = false;
+        // Typing indicators have no stop event; drop the ones that have lapsed.
+        self.prune_typing();
         // New image-cache frame: last frame's visible items age by one frame.
         self.image_cache.begin_frame();
         if self.shows_login() {
@@ -1175,10 +1241,12 @@ impl App {
     }
 
     /// Whether to request the next frame; idle requests nothing so the app doesn't repaint 20x/s.
-    fn schedule_repaint(&self, ctx: &egui::Context, had_events: bool) {        // Background loads are reaped in draw and animations advance by time, so keep frames coming.
+    fn schedule_repaint(&self, ctx: &egui::Context, had_events: bool) {
+        // Background loads are reaped in draw and animations advance by time, so keep frames coming.
         let busy = !self.pending_avatars.is_empty()
             || !self.pending_images.is_empty()
             || self.lightbox_pending.is_some()
+            || !self.typing.is_empty()
             || self.history_loading.is_some()
             || self.history_loading_more
             || self.animating;

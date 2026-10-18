@@ -77,6 +77,13 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
 - Kept-deleted messages persist across restarts in `~/.wyvern_deleted.json`
   (override `WYVERN_DELETED_PATH`); a history re-fetch no longer loses them.
 
+### Typing indicator
+
+- The composer shows who is typing ("Alice is typing…", "Several people are
+  typing…"). Discord sends `TYPING_START` with no matching stop event, so the
+  indicator lapses after eight seconds. DM events carry no name, so it is
+  resolved from already-loaded messages; our own typing is ignored.
+
 ## 0.7.0 — 2026-10-18
 
 ### Replies and message actions

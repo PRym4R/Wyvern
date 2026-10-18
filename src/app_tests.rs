@@ -2004,3 +2004,34 @@ fn kept_deleted_message_survives_a_reload() {
     );
     assert!(app.deleted_ids.contains("m1"), "it must be drawn red again");
 }
+
+/// Typing indicators appear for others, ignore us, resolve a name from loaded
+/// messages, and lapse after their TTL.
+#[test]
+fn typing_indicators_track_and_lapse() {
+    let mut app = make_app();
+    app.user_id = "me".into();
+
+    // A guild typing event carries a name.
+    app.note_typing("c0", "u2", "Bob");
+    assert_eq!(app.typing_names("c0"), vec!["Bob".to_string()]);
+
+    // Our own typing is ignored.
+    app.note_typing("c0", "me", "Me");
+    assert_eq!(app.typing_names("c0"), vec!["Bob".to_string()]);
+
+    // A DM typing event without a name resolves it from loaded messages.
+    app.note_typing("c0", "u1", "");
+    assert!(app.typing_names("c0").contains(&"Alice".to_string()));
+
+    // An unknown user falls back to a placeholder rather than an empty label.
+    app.note_typing("c0", "u9", "");
+    assert!(app.typing_names("c0").contains(&"Someone".to_string()));
+
+    // Force everything to lapse; pruning drops the whole channel.
+    for (_, expiry) in app.typing.get_mut("c0").unwrap().values_mut() {
+        *expiry = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    }
+    app.prune_typing();
+    assert!(app.typing.is_empty(), "lapsed indicators must be pruned");
+}
