@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::App;
+use crate::app::{App, ToastKind};
 
 use crate::messages::ToGateway;
 use crate::models::{ChatChannel, ChatMessage, LOCAL_ID_PREFIX};
@@ -484,7 +484,9 @@ impl App {
             } else if let Ok(n) = tok.parse::<u32>() {
                 count = Some(n);
             } else {
-                self.status = format!("unknown unread option: {tok}");
+                let msg = format!("unknown unread option: {tok}");
+                self.toast(ToastKind::Warn, msg.clone());
+                self.status = msg;
                 return;
             }
         }
@@ -495,12 +497,14 @@ impl App {
             match self.selected_channel.and_then(|i| self.channels.get(i)) {
                 Some(ch) => vec![ch.id.clone()],
                 None => {
+                    self.toast(ToastKind::Warn, "no channel selected");
                     self.status = "no channel selected".to_string();
                     return;
                 }
             }
         };
         if ids.is_empty() {
+            self.toast(ToastKind::Warn, "no channels to mark");
             self.status = "no channels to mark".to_string();
             return;
         }
@@ -517,12 +521,14 @@ impl App {
                 }
             }
         }
-        self.status = format!(
+        let msg = format!(
             "debug unread: {n}{} on {} channel(s)",
             if mention { " (mention)" } else { "" },
             ids.len()
         );
-        self.push_debug(self.status.clone());
+        self.toast(ToastKind::Info, msg.clone());
+        self.status = msg.clone();
+        self.push_debug(msg);
     }
 
     /// Add a channel directly, bypassing Discord's lists; only reachable by id.
