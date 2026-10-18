@@ -55,38 +55,7 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
 
 # Changes
 
-## Unreleased
-
-### Markdown
-
-Messages render Discord's common markdown, inline and across lines: bold,
-italic, underline, strikethrough, inline `code`, fenced code blocks,
-`> ` blockquotes, spoilers (greyed out) and links — both `[label](url)` and bare
-URLs. Markup is not sent as a styled message, it is drawn by the client, and the
-height estimate accounts for the extra lines so the layout does not jump.
-
-### Composer
-
-- Multiline input: Enter sends, Shift+Enter inserts a newline.
-- The field grows with its real line count and is capped (`COMPOSER_MAX_H`),
-  scrolling beyond that. It used to be clipped to a single row because it sat in
-  a `ui.horizontal`; the layout is now `ui.horizontal_top`.
-
-### Settings
-
-- A settings window: theme (Dark / Cyberpunk / Light), UI and font scale,
-  "hide media until clicked", "notify about new messages", "keep deleted
-  messages", plus "reset scale", "clear drafts" and "reset window size".
-- Theme, window size, the last channel and per-channel drafts persist across
-  restarts in `~/.wyvern_settings.json` (override `WYVERN_SETTINGS_PATH`).
-
-### Message actions
-
-- A context menu on each message: Reply, Edit, Delete, Copy text. Own messages
-  can be edited and deleted; a pending local echo hides its actions until the
-  server confirms.
-- The composer shows a reply bar (author + preview, Cancel) and an
-  "Editing message" bar.
+## 0.8.0 — 2026-10-18
 
 ### Lightbox and quick switch
 
@@ -97,19 +66,49 @@ height estimate accounts for the extra lines so the layout does not jump.
 - Quick switch (Ctrl+K) lists only the current server and DMs; typing a query
   widens the search across all servers and tags each channel with its server.
 
-### Replies, media and the keyboard
+### Settings and state
 
+- A settings window: theme (Dark / Cyberpunk / Light), UI and font scale,
+  "hide media until clicked", "notify about new messages", "keep deleted
+  messages", plus "reset scale", "clear drafts" and "reset window size".
+- Theme, window size, the last channel and per-channel drafts persist across
+  restarts in `~/.wyvern_settings.json` (override `WYVERN_SETTINGS_PATH`).
+- Clicking a hidden (blurred) image reveals it.
+- Kept-deleted messages persist across restarts in `~/.wyvern_deleted.json`
+  (override `WYVERN_DELETED_PATH`); a history re-fetch no longer loses them.
+
+## 0.7.0 — 2026-10-18
+
+### Replies and message actions
+
+- A context menu on each message: Reply, Edit, Delete, Copy text. Own messages
+  can be edited and deleted; a pending local echo hides its actions until the
+  server confirms.
+- The composer shows a reply bar (author + preview, Cancel) and an
+  "Editing message" bar.
 - Replies show a quote line (author + one-line preview); `referenced_message` is
   parsed from both history and live messages, and the optimistic echo shows it
   immediately.
 - Double-clicking a message replies to it and focuses the composer; Esc cancels a
   pending reply, else a pending edit.
+
+### Markdown
+
+- Messages render Discord's common markdown, inline and across lines: bold,
+  italic, underline, strikethrough, inline `code`, fenced code blocks,
+  `> ` blockquotes, spoilers (greyed out) and links — both `[label](url)` and
+  bare URLs. It is drawn by the client, and the height estimate accounts for the
+  extra lines so the layout does not jump.
+
+### Composer and files
+
+- Multiline input: Enter sends, Shift+Enter inserts a newline.
+- The field grows with its real line count and is capped (`COMPOSER_MAX_H`),
+  scrolling beyond that. It used to be clipped to a single row because it sat in
+  a `ui.horizontal`; the layout is now `ui.horizontal_top`.
 - Files can be attached by drag-and-drop, a file-picker button, pasted paths
   (including `file://`) and Ctrl+V of an image from the clipboard (`arboard` —
   the key *release* is the gesture, since egui-winit swallows the press).
-- Clicking a hidden (blurred) image reveals it.
-- Kept-deleted messages persist across restarts in `~/.wyvern_deleted.json`
-  (override `WYVERN_DELETED_PATH`); a history re-fetch no longer loses them.
 
 ### English UI
 
