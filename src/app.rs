@@ -31,6 +31,10 @@ const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_FAILED_IMAGES: usize = 512;
 /// How long a "typing" indicator stays up; Discord sends no stop event.
 const TYPING_TTL: Duration = Duration::from_secs(8);
+/// How long a toast stays on screen before it is pruned.
+pub(crate) const TOAST_TTL: Duration = Duration::from_secs(4);
+/// How many toasts stack before the oldest is dropped.
+const MAX_TOASTS: usize = 4;
 
 /// Whether to log debug lines to disk/stderr; off by default. Enable with `WYVERN_DEBUG=1`.
 fn debug_to_disk_from_env() -> bool {
@@ -72,6 +76,38 @@ pub(crate) struct EditTarget {
     pub(crate) message_id: String,
 }
 
+/// Severity of a toast, which only picks its accent colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToastKind {
+    Info,
+    Warn,
+    Error,
+}
+
+/// A transient corner notice. Lapses after `TOAST_TTL`.
+pub(crate) struct Toast {
+    pub(crate) text: String,
+    pub(crate) kind: ToastKind,
+    pub(crate) born: Instant,
+}
+
+/// What a confirmation dialog does once the user agrees.
+#[derive(Clone, Debug)]
+pub(crate) enum ConfirmAction {
+    DeleteMessage { channel_id: String, message_id: String },
+    RemoveAccount { index: usize },
+    ClearDrafts,
+}
+
+/// A modal "are you sure?" gate before an irreversible action.
+#[derive(Clone, Debug)]
+pub(crate) struct ConfirmDialog {
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) confirm_label: String,
+    pub(crate) action: ConfirmAction,
+}
+
 pub(crate) struct App {
     pub(crate) connected: bool,
     pub(crate) username: String,
@@ -110,6 +146,10 @@ pub(crate) struct App {
     pub(crate) status: String,
     /// Why the last message failed to send; shown in chat, unlike `status` which is login-only.
     pub(crate) send_error: Option<String>,
+    /// Corner notices (connection, send failures, account switch); lapse on their own.
+    pub(crate) toasts: Vec<Toast>,
+    /// Modal awaiting a yes/no before an irreversible action.
+    pub(crate) confirm: Option<ConfirmDialog>,
     /// Last submitted text, so held Enter/auto-repeat can't resend the same failed message.
     pub(crate) last_submitted: Option<String>,
     /// Whether the input changed since the last send; blocks resending identical text.
@@ -255,6 +295,8 @@ impl App {
             active_index: None,
             status: String::new(),
             send_error: None,
+            toasts: Vec::new(),
+            confirm: None,
             last_submitted: None,
             input_dirty: false,
             debug_log: VecDeque::new(),
@@ -414,6 +456,50 @@ impl App {
     }
     #[cfg(not(target_os = "linux"))]
     fn notify_desktop(&self, _msg: &ChatMessage) {}
+    /// Queues a corner notice, dropping the oldest if the stack is full.
+    pub(crate) fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.toasts.len() >= MAX_TOASTS {
+            self.toasts.remove(0);
+        }
+        self.toasts.push(Toast {
+            text,
+            kind,
+            born: Instant::now(),
+        });
+    }
+    /// Drops toasts past their lifetime.
+    fn prune_toasts(&mut self) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.toasts
+            .retain(|t| now.saturating_duration_since(t.born) < TOAST_TTL);
+    }
+    /// Runs the action a confirmation dialog was guarding. Public to tests.
+    pub(crate) fn run_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeleteMessage {
+                channel_id,
+                message_id,
+            } => {
+                self.send_cmd(ToGateway::DeleteMessage {
+                    channel_id,
+                    message_id,
+                });
+            }
+            ConfirmAction::RemoveAccount { index } => self.remove_saved_account(index),
+            ConfirmAction::ClearDrafts => {
+                self.settings.drafts.clear();
+                self.write_settings();
+                self.toast(ToastKind::Info, "Drafts cleared");
+            }
+        }
+    }
     /// Reopen the channel from the previous session if it is already known.
     pub(crate) fn restore_last_channel(&mut self) -> bool {
         let Some(remembered) = self.settings.last_channel.clone() else {
@@ -617,6 +703,8 @@ impl App {
                     // Connection status also means we're not online; clear `connected` on reconnect/disconnect.
                     if s.starts_with("Reconnecting") || s == "Disconnected" {
                         self.connected = false;
+                        // The login banner is gone after sign-in, so the toast carries the news.
+                        self.toast(ToastKind::Warn, s.clone());
                     }
                     self.status = s;
                 }
@@ -637,6 +725,7 @@ impl App {
                     if self.current_channel_id() == Some(channel_id.as_str()) && self.input.trim().is_empty() {
                         self.input = taken_back.unwrap_or_default();
                     }
+                    self.toast(ToastKind::Error, format!("Not sent: {}", reason));
                     self.send_error = Some(reason);
                     // Truncate by chars; the id is ours, not Discord's (see token masking).
                     let short: String = local_id.chars().take(14).collect();
@@ -648,6 +737,7 @@ impl App {
                     content,
                     reason,
                 } => {
+                    self.toast(ToastKind::Error, format!("Edit failed: {}", reason));
                     // A failed edit keeps the row as it was. Put the draft back
                     // into the composer, but only if the user hasn't already
                     // started writing something else.
@@ -668,6 +758,7 @@ impl App {
                     }
                 }
                 ToApp::DeleteFailed { channel_id, reason } => {
+                    self.toast(ToastKind::Error, format!("Delete failed: {}", reason));
                     // The row stays; show the reason only where it happened.
                     if self.current_channel_id() == Some(channel_id.as_str()) {
                         self.send_error = Some(reason);
@@ -679,6 +770,7 @@ impl App {
                     self.gw_started = false;
                     self.to_gw = None;
                     self.push_debug(format!("Auth failed: {}", reason));
+                    self.toast(ToastKind::Error, format!("Login failed: {}", reason));
                     self.status = reason;
                 }
                 ToApp::Debug(d) => self.push_debug(d),
@@ -775,6 +867,7 @@ impl App {
         self.token_input = token.clone();
         self.start_gateway(token.clone());
         self.add_saved_account(&token, "");
+        self.toast(ToastKind::Info, "Switching account…");
         self.push_debug(format!("Switched account to {}", self.mask_token(&token)));
     }
     /// Login with a fresh token; if "remember" is on, unlock/create the vault first.
@@ -1214,6 +1307,7 @@ impl App {
         self.animating = false;
         // Typing indicators have no stop event; drop the ones that have lapsed.
         self.prune_typing();
+        self.prune_toasts();
         // New image-cache frame: last frame's visible items age by one frame.
         self.image_cache.begin_frame();
         if self.shows_login() {
@@ -1221,6 +1315,9 @@ impl App {
         } else {
             self.draw_chat(ctx);
         }
+        // Overlays sit above both screens; the confirm modal dims everything under it.
+        self.draw_toasts(ctx);
+        self.draw_confirm(ctx);
         // Reap finished downloads after drawing so offscreen pixels don't pile up; LRU then spares visible items.
         self.reap_pending_images(ctx);
 
@@ -1247,6 +1344,7 @@ impl App {
             || !self.pending_images.is_empty()
             || self.lightbox_pending.is_some()
             || !self.typing.is_empty()
+            || !self.toasts.is_empty()
             || self.history_loading.is_some()
             || self.history_loading_more
             || self.animating;

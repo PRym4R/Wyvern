@@ -184,6 +184,41 @@ fn chat_scroll_to_bottom_on_history() {
     assert!(offset > 15000.0, "did not scroll to bottom, offset={:?}", offset);
 }
 
+/// Toasts lapse on their own after the TTL.
+#[test]
+fn toasts_lapse_after_their_ttl() {
+    let mut app = make_app();
+    app.toast(ToastKind::Info, "привет");
+    assert_eq!(app.toasts.len(), 1);
+    app.prune_toasts();
+    assert_eq!(app.toasts.len(), 1, "свежий тост ещё живёт");
+    app.toasts[0].born =
+        std::time::Instant::now() - (TOAST_TTL + std::time::Duration::from_secs(1));
+    app.prune_toasts();
+    assert!(app.toasts.is_empty(), "просроченный тост должен исчезнуть");
+}
+
+/// The stack keeps only the most recent toasts.
+#[test]
+fn toast_stack_is_capped() {
+    let mut app = make_app();
+    for i in 0..10 {
+        app.toast(ToastKind::Info, format!("t{}", i));
+    }
+    assert_eq!(app.toasts.len(), 4, "старые тосты вытесняются");
+    assert_eq!(app.toasts.last().unwrap().text, "t9");
+}
+
+/// Confirming "clear drafts" empties the stored drafts and says so.
+#[test]
+fn confirming_clear_drafts_empties_them() {
+    let mut app = make_app();
+    app.settings.drafts.insert("c0".into(), "черновик".into());
+    app.run_confirm(ConfirmAction::ClearDrafts);
+    assert!(app.settings.drafts.is_empty());
+    assert_eq!(app.toasts.len(), 1, "об очистке стоит сообщить тостом");
+}
+
 #[test]
 fn account_encryption_roundtrip() {
     let accs = vec![

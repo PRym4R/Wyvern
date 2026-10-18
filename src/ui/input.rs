@@ -114,7 +114,10 @@ impl App {
         }
         // Esc cancels a pending reply/edit; while a modal window is open Esc
         // belongs to that window (lightbox/quick switch/settings).
-        let modal_open = self.lightbox_url.is_some() || self.quick_switch_open || self.settings_open;
+        let modal_open = self.lightbox_url.is_some()
+            || self.quick_switch_open
+            || self.settings_open
+            || self.confirm.is_some();
         if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.edit_target.is_some() {
                 self.cancel_edit();

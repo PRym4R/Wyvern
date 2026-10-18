@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::App;
+use crate::app::{App, ConfirmAction, ConfirmDialog, ToastKind};
 use crate::ui::ERROR_RED;
 
 const CARD_WIDTH: f32 = 400.0;
@@ -260,17 +260,38 @@ impl App {
             self.select_account(token);
         }
         if let Some(i) = remove {
-            let gone = self.saved_accounts.get(i).map(|a| a.token.clone());
-            self.saved_accounts.remove(i);
-            if let Some(t) = gone {
-                if self.login_selected.as_deref() == Some(t.as_str()) {
-                    self.clear_login_selection();
-                }
-            }
-            self.refresh_active_index();
-            let pw = self.master_password.clone();
-            self.save_accounts(&pw);
+            let who = self
+                .saved_accounts
+                .get(i)
+                .map(|a| a.username.clone())
+                .unwrap_or_default();
+            self.confirm = Some(ConfirmDialog {
+                title: "Remove account".into(),
+                body: if who.is_empty() {
+                    "Remove this saved account?".into()
+                } else {
+                    format!("Remove {who} from saved accounts?")
+                },
+                confirm_label: "Remove".into(),
+                action: ConfirmAction::RemoveAccount { index: i },
+            });
         }
+    }
+
+    /// Drops a saved account from the vault. Split out so the confirmation
+    /// dialog and any future caller share one path.
+    pub(crate) fn remove_saved_account(&mut self, index: usize) {
+        let Some(gone) = self.saved_accounts.get(index).map(|a| a.token.clone()) else {
+            return;
+        };
+        self.saved_accounts.remove(index);
+        if self.login_selected.as_deref() == Some(gone.as_str()) {
+            self.clear_login_selection();
+        }
+        self.refresh_active_index();
+        let pw = self.master_password.clone();
+        self.save_accounts(&pw);
+        self.toast(ToastKind::Info, "Account removed");
     }
 
     /// Login form for a fresh token: token and vault password side by side.

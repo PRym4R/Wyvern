@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::{App, EditTarget, ReplyTarget};
-use crate::messages::ToGateway;
+use crate::app::{App, ConfirmAction, ConfirmDialog, EditTarget, ReplyTarget};
 use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 use crate::ui::markdown::render_message_text;
@@ -226,11 +225,17 @@ impl App {
             // Edit loads the message into the composer; saving there sends an
             // edit command instead of a new message.
             MessageAction::Edit => self.start_edit(msg),
-            // Delete is settled by Discord's MESSAGE_DELETE event, not here.
+            // Delete asks first; the actual send is settled by Discord's
+            // MESSAGE_DELETE event once confirmed.
             MessageAction::Delete => {
-                self.send_cmd(ToGateway::DeleteMessage {
-                    channel_id: msg.channel_id.clone(),
-                    message_id: msg.id.clone(),
+                self.confirm = Some(ConfirmDialog {
+                    title: "Delete message".into(),
+                    body: "This can't be undone.".into(),
+                    confirm_label: "Delete".into(),
+                    action: ConfirmAction::DeleteMessage {
+                        channel_id: msg.channel_id.clone(),
+                        message_id: msg.id.clone(),
+                    },
                 });
             }
         }
@@ -879,7 +884,7 @@ impl App {
                     open = false;
                 }
             });
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if !open || (self.confirm.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.lightbox_url = None;
             // Keep the high-res pixels briefly so reopening is instant.
             if self.lightbox_tex.is_some() {

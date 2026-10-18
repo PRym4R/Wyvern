@@ -5,6 +5,7 @@ mod chat;
 mod input;
 mod login;
 mod markdown;
+mod overlays;
 mod settings_window;
 mod sidebar;
 

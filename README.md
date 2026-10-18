@@ -47,7 +47,7 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 223 tests (222 + measurement)
+cargo test --release                                        # 226 tests (225 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -90,6 +90,15 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   single block: the name row and avatar are drawn once and the rest are
   indented under it. A reply, a different author, or a longer pause starts a
   new block.
+
+### Toasts and confirmations
+
+- Failures and connection changes surface as corner toasts (send, edit and
+  delete errors, reconnect/disconnect, account switch, login rejection) that
+  fade after four seconds, instead of vanishing silently once the login screen
+  is gone.
+- Irreversible actions ask first: deleting a message, removing a saved account,
+  and clearing all drafts open a modal that Esc or a backdrop click cancels.
 
 ## 0.7.0 — 2026-10-18
 

@@ -361,6 +361,25 @@ Gemini).
       после подгрузки истории геометрия «плывёт». Тест:
       `consecutive_messages_from_one_author_group`; итого 223.
 
+### Тосты и подтверждения (0.8.0)
+
+- [x] **Обратная связь вместо тишины**: `App::toasts` — очередь угловых
+      уведомлений (`Toast { text, kind, born }`), живёт `TOAST_TTL` = 4 с,
+      затухает на последней четверти, стопка ограничена четырьмя. Рисуется
+      поверх и логина, и чата (`ui::overlays::draw_toasts`), не ловит клики.
+      Источники: обрыв/реконнект (`ToApp::Status`), ошибки отправки/правки/
+      удаления (`ToApp::SendFailed`/`EditFailed`/`DeleteFailed`), отказ входа
+      (`AuthFailed`), смена аккаунта. `schedule_repaint` держит кадры, пока
+      тосты видны.
+- [x] **Подтверждение необратимого**: `ConfirmDialog` + `ConfirmAction`
+      (DeleteMessage / RemoveAccount / ClearDrafts), модалка `egui::Modal`
+      (`ui::overlays::draw_confirm`), Esc или клик по фону отменяют. Удаление
+      сообщения, удаление сохранённого аккаунта и «Clear drafts» теперь сперва
+      спрашивают; Esc принадлежит модалке и не трогает композер/настройки/
+      lightbox. Тесты: `toasts_lapse_after_their_ttl`, `toast_stack_is_capped`,
+      `confirming_clear_drafts_empties_them`, `choosing_delete_asks_before_sending`;
+      итого 226.
+
 ### По `BUGS.txt` (части 4–5), после 0.5.1
 
 Часть 4 (Б-1…Б-25) — поведение и надёжность, часть 5 (Т-1…Т-23) — цена кадра

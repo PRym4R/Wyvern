@@ -1214,19 +1214,30 @@ mod menu_tests {
         assert!(app.reply_to.is_some());
     }
 
-    /// Choosing "Delete" asks the gateway to remove that message.
+    /// Choosing "Delete" asks first and only sends once confirmed.
     #[test]
-    fn choosing_delete_sends_a_delete_command() {
+    fn choosing_delete_asks_before_sending() {
         let (_tx, rx) = mpsc::unbounded_channel::<ToApp>();
         let mut app = App::new(rx);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut cmds) = mpsc::unbounded_channel();
         app.to_gw = Some(tx);
         let msg = message("m1", "текст", true);
         let ctx = egui::Context::default();
 
         app.run_message_action(&ctx, MessageAction::Delete, &msg);
 
-        match rx.try_recv() {
+        assert!(app.confirm.is_some(), "удаление должно сперва спросить");
+        assert!(
+            cmds.try_recv().is_err(),
+            "до подтверждения команда уходить не должна"
+        );
+
+        // Confirming runs the guarded action.
+        app.run_confirm(ConfirmAction::DeleteMessage {
+            channel_id: "c0".into(),
+            message_id: "m1".into(),
+        });
+        match cmds.try_recv() {
             Ok(ToGateway::DeleteMessage { channel_id, message_id }) => {
                 assert_eq!(channel_id, "c0");
                 assert_eq!(message_id, "m1");

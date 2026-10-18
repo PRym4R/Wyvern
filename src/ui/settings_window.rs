@@ -1,5 +1,6 @@
 use eframe::egui::{self, RichText};
 
+use crate::app::{ConfirmAction, ConfirmDialog};
 use crate::settings::Settings;
 
 impl crate::app::App {
@@ -97,8 +98,12 @@ impl crate::app::App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Clear drafts").clicked() {
-                        self.settings.drafts.clear();
-                        self.write_settings();
+                        self.confirm = Some(ConfirmDialog {
+                            title: "Clear drafts".into(),
+                            body: "Discard every unsent draft in every channel?".into(),
+                            confirm_label: "Clear".into(),
+                            action: ConfirmAction::ClearDrafts,
+                        });
                     }
                     if ui.button("Reset window size").clicked() {
                         self.settings.window = None;
@@ -111,7 +116,8 @@ impl crate::app::App {
                         .color(self.theme.text_secondary),
                 );
             });
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // A confirmation on top of the settings owns Esc while it is open.
+        if !open || (self.confirm.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.settings_open = false;
         }
     }
