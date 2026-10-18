@@ -47,13 +47,73 @@ is in [`releases/0.5.2/`](releases/0.5.2/).
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 175 tests (174 + measurement)
+cargo test --release                                        # 221 tests (220 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
 ---
 
 # Changes
+
+## Unreleased
+
+### Markdown
+
+Messages render Discord's common markdown, inline and across lines: bold,
+italic, underline, strikethrough, inline `code`, fenced code blocks,
+`> ` blockquotes, spoilers (greyed out) and links — both `[label](url)` and bare
+URLs. Markup is not sent as a styled message, it is drawn by the client, and the
+height estimate accounts for the extra lines so the layout does not jump.
+
+### Composer
+
+- Multiline input: Enter sends, Shift+Enter inserts a newline.
+- The field grows with its real line count and is capped (`COMPOSER_MAX_H`),
+  scrolling beyond that. It used to be clipped to a single row because it sat in
+  a `ui.horizontal`; the layout is now `ui.horizontal_top`.
+
+### Settings
+
+- A settings window: theme (Dark / Cyberpunk / Light), UI and font scale,
+  "hide media until clicked", "notify about new messages", "keep deleted
+  messages", plus "reset scale", "clear drafts" and "reset window size".
+- Theme, window size, the last channel and per-channel drafts persist across
+  restarts in `~/.wyvern_settings.json` (override `WYVERN_SETTINGS_PATH`).
+
+### Message actions
+
+- A context menu on each message: Reply, Edit, Delete, Copy text. Own messages
+  can be edited and deleted; a pending local echo hides its actions until the
+  server confirms.
+- The composer shows a reply bar (author + preview, Cancel) and an
+  "Editing message" bar.
+
+### Lightbox and quick switch
+
+- Clicking an image opens a full-size viewer; Esc or Close dismisses it. The
+  viewer loads a separate high-resolution copy (up to 2048 px) and drops it 30
+  seconds after closing, so the chat cache stays small; GIFs reuse the chat
+  copy.
+- Quick switch (Ctrl+K) lists only the current server and DMs; typing a query
+  widens the search across all servers and tags each channel with its server.
+
+### Replies, media and the keyboard
+
+- Replies show a quote line (author + one-line preview); `referenced_message` is
+  parsed from both history and live messages, and the optimistic echo shows it
+  immediately.
+- Double-clicking a message replies to it and focuses the composer; Esc cancels a
+  pending reply, else a pending edit.
+- Files can be attached by drag-and-drop, a file-picker button, pasted paths
+  (including `file://`) and Ctrl+V of an image from the clipboard (`arboard` —
+  the key *release* is the gesture, since egui-winit swallows the press).
+- Clicking a hidden (blurred) image reveals it.
+- Kept-deleted messages persist across restarts in `~/.wyvern_deleted.json`
+  (override `WYVERN_DELETED_PATH`); a history re-fetch no longer loses them.
+
+### English UI
+
+- All user-facing strings are English now.
 
 ## 0.5.2 — 2026-10-02
 
