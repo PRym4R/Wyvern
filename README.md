@@ -1,308 +1,314 @@
 # Wyvern
 
-Лёгкий клиент Discord на Rust + egui. Токен и локальный пароль, серверы и
-каналы, история с подгрузкой вверх по скроллу, картинки и гифки,
-отладочный лог в `/tmp`. Всё работает на своей машине, своего сервера нет.
+A lightweight Discord client in Rust + egui. Token and a local password, servers
+and channels, history that pages in as you scroll up, images and GIFs, and a
+debug log in `/tmp`. Everything runs on your own machine; there is no server of
+its own.
 
-Лицензия — AGPL-3.0 (файл `LICENSE`).
+Licensed under AGPL-3.0 (see `LICENSE`).
 
-## Сборка и запуск
+## Build and run
 
 ```bash
 cargo build --release
-cp -f target/release/wyvern ./wyvern   # в репозитории лежит готовый бинарник
+cp -f target/release/wyvern ./wyvern   # a ready binary is committed in the repo
 ./wyvern
 ```
 
-Токен вставляется в поле входа. Если отмечено «Запомнить этот аккаунт»,
-токен шифруется паролем в `~/.wyvern_accounts.json` (AES-256-GCM, ключ из
-PBKDF2). Путь можно переопределить переменной `WYVERN_ACCOUNTS_PATH` —
-тесты и запуски в песочнице так не трогают настоящее хранилище.
+The token goes into the login field. If "Remember this account" is ticked, the
+token is encrypted with a password in `~/.wyvern_accounts.json` (AES-256-GCM,
+key derived via PBKDF2). The path can be overridden with
+`WYVERN_ACCOUNTS_PATH` — test and sandbox runs then leave the real vault alone.
 
-## Отладочный лог
+## Debug log
 
-Каждый кадр пишет геометрию панелей в `/tmp/wyvern_layout.log`, при
-переполнении файл переезжает на `.1` и начинается заново. События гейтвея и
-загрузки картинок пишутся туда же, так что по логу видно, что клиент видит.
-Дамп сообщений в `/tmp` — только при `WYVERN_DUMP=1`.
+Each frame writes panel geometry to `/tmp/wyvern_layout.log`; on overflow the
+file is rotated to `.1` and starts over. Gateway events and image downloads are
+written there too, so the log shows what the client sees. A message dump into
+`/tmp` happens only with `WYVERN_DUMP=1`.
 
-## Что где лежит
+## Layout
 
-| Файл | Что внутри |
+| File | Contents |
 |---|---|
-| `src/main.rs` | запуск окна, ассеты, паника в лог |
-| `src/app.rs` | состояние приложения, каналы, сообщения, вход |
-| `src/gateway.rs` | WebSocket-гейтвей и разбор истории/сообщений |
-| `src/media.rs` | загрузка, распаковка и кэш картинок и гифок |
-| `src/models.rs` | структуры данных, кэш с лимитом по байтам |
-| `src/ui/*` | экраны: вход, сайдбар, чат, вложения, ввод |
-| `src/crypto.rs` | шифрование хранилища аккаунтов |
-| `src/memcheck.rs` | замер памяти и аллокаций (тест с `--ignored`) |
+| `src/main.rs` | window startup, assets, panics to the log |
+| `src/app.rs` | application state, channels, messages, login |
+| `src/gateway.rs` | WebSocket gateway and history/message parsing |
+| `src/media.rs` | downloading, decoding and caching images and GIFs |
+| `src/models.rs` | data structures, byte-budget cache |
+| `src/ui/*` | screens: login, sidebar, chat, attachments, input |
+| `src/crypto.rs` | account vault encryption |
+| `src/memcheck.rs` | memory and allocation measurement (test with `--ignored`) |
 
-Полный список идей с цифрами — в [TODO.md](TODO.md), план релизов
-0.6.0 → 1.0.0 — в [ROADMAP.md](ROADMAP.md). Снимок исходников этой версии —
-в [`releases/0.5.2/`](releases/0.5.2/).
+The full list of ideas with numbers is in [TODO.md](TODO.md); the release plan
+0.6.0 → 1.0.0 is in [ROADMAP.md](ROADMAP.md). A source snapshot of this version
+is in [`releases/0.5.2/`](releases/0.5.2/).
 
-## Тесты и замеры
+## Tests and measurements
 
 ```bash
-cargo test --release                                        # 175 тестов (174 + замер)
-cargo test --release -- --ignored --nocapture memcheck       # замер памяти
+cargo test --release                                        # 175 tests (174 + measurement)
+cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
 ---
 
-# Изменения
+# Changes
 
 ## 0.5.2 — 2026-10-02
 
-Закрыты части 4 и 5 `BUGS.txt` (Б-1…Б-25 и Т-1…Т-23) — поведение, надёжность
-и цена кадра, — плюс то, что нашлось на живом клиенте после 0.5.1.
+Closed parts 4 and 5 of `BUGS.txt` (B-1…B-25 and T-1…T-23) — behaviour,
+reliability and per-frame cost — plus what surfaced on the live client after
+0.5.1.
 
-### Гифки и картинки
+### GIFs and images
 
-- **Длинная гифка играет целиком.** Жёсткий потолок в 16 кадров убран: число
-  кадров считается по структуре файла, а граница — по памяти (32 МБ на гифку).
-  Длинную ужимаем, но проигрываем до конца, а не обрываем на середине.
-- **Видимая картинка или гифка не мигает.** Кэш помнит, что рисовалось в этом
-  и прошлом кадре, и не вытесняет это; раньше соседняя догрузившаяся картинка
-  выбивала видимую, и её качали заново.
-- **Готовые загрузки больше не копятся.** Результат забирался только при
-  отрисовке своей картинки, и та, которую прокрутили за экран, оставляла в
-  `pending_images` распакованные пиксели. На длинном чате с гифками это
-  вырастало в сотни мегабайт RSS. Теперь каждым кадром всё готовое уходит в
-  кэш, где память ограничена бюджетом и LRU.
+- **A long GIF plays to the end.** The hard 16-frame cap is gone: the frame count
+  is read from the file structure, and the limit is memory (32 MB per GIF). Long
+  ones are downscaled but played through, not cut off in the middle.
+- **A visible image or GIF no longer flickers.** The cache remembers what was
+  drawn this frame and the previous one and does not evict it; before, a
+  neighbouring image that finished loading could push out the visible one, and
+  it would be downloaded again.
+- **Finished downloads no longer pile up.** The result was collected only while
+  drawing its own image, so one scrolled off screen left decoded pixels in
+  `pending_images`. On a long chat with GIFs this grew to hundreds of megabytes
+  of RSS. Now everything ready goes into the cache every frame, where memory is
+  bounded by the budget and LRU.
 
-### Ввод и чат
+### Input and chat
 
-- **Счётчик `n/2000`** показывается, только когда есть что считать; на пустом
-  поле «0/2000» больше не висит. Слишком длинный текст не уходит (Discord не
-  отвергает его кодом 400 после «отправки»), поле при этом не чистится.
-- **Отладочные команды** переехали под `/debug `: обычный текст «/quit»
-  больше не закрывает клиент, «/add» не создаёт канал-призрак.
-- Сообщение закрытого канала больше не копится и не дёргает чат; правка,
-  удаление и переименование канала применяются сразу; дубли истории переживают
-  реконнект.
+- **The `n/2000` counter** is shown only when there is something to count;
+  "0/2000" no longer hangs over an empty field. Overlong text is not sent
+  (Discord doesn't reject it with code 400 after "sending"), and the field is
+  not cleared.
+- **Debug commands** moved under `/debug `: plain text "/quit" no longer closes
+  the client, and "/add" doesn't create a ghost channel.
+- A closed channel's message no longer accumulates or jolts the chat; channel
+  edits, deletions and renames apply immediately; duplicate history survives a
+  reconnect.
 
-### Надёжность и скорость
+### Reliability and speed
 
-- **Списки**: друзья догружаются после 429, аватары и иконки не
-  перезапрашиваются каждый кадр, смена аккаунта забывает картинки и отказы
-  прежнего.
-- **Гейтвей** разбирает очередь порциями (200 событий за кадр) — всплеск после
-  реконнекта больше не подвешивает кадр; в покое окно спит, а не крутит
-  20 кадров в секунду.
-- **Отпечаток клиента** в IDENTIFY совпадает с `X-Super-Properties`: Discord
-  больше не видит две разные системы у одного клиента.
-- Меньше клонов на кадр: панели и чат рисуют по своему списку, а не по копии.
+- **Lists**: friends load after a 429, avatars and icons aren't re-requested
+  every frame, and switching accounts forgets the previous one's images and
+  failures.
+- **The gateway** drains its queue in batches (200 events per frame) — a burst
+  after a reconnect no longer stalls the frame; when idle the window sleeps
+  instead of running 20 frames per second.
+- **The client fingerprint** in IDENTIFY matches `X-Super-Properties`: Discord
+  no longer sees two different systems for one client.
+- Fewer clones per frame: panels and the chat draw from their own list, not a
+  copy.
 
 ## 0.5.1 — 2026-09-28
 
-Починены поломки, которые 0.5.0 принёс на живой клиент.
+Fixed the breakages that 0.5.0 brought to the live client.
 
-- **Чат копировался при прокрутке вверх**: под каждым новым запросом истории
-  появлялись одни и те же сообщения, и прокрутка вверх циклически показывала
-  одно и то же. Discord отдаёт страницу от новых к старым, а приложение
-  хранило её как прислали — из-за этого первой в списке оказывалась самая новая
-  строка, и `before` для догрузки уходил от неё. Discord отвечал той же
-  страницей, она подставлялась в начало списка, и так до потолка в 500
-  сообщений. Теперь страница разворачивается в порядке хранения: список всегда
-  идёт от старых к новым, от его первой строки берётся `before`, а потолок
-  выбрасывает самые старые.
-- **Сообщение могло задвоиться**: гейтвей шлёт живую копию всего, что появилось
-  после подписки, а та же строка уже успела попасть в страницу истории. Дубль
-  рисуется дважды. Теперь повтор по `id` пропускается.
-- **Чат вообще нельзя было листать.** Пока пользователь внизу, мы просили egui
-  держать список на низу — и тут же затирали результат колеса на «дно», то есть
-  стирали прокрутку каждый кадр. Смещение уехать не могло. Теперь egui
-  придерживается низа только когда мы сами туда едем, а «пользователь
-  прокрутил» определяется по тому, что список встал не туда, куда просили, и
-  не на настоящий низ. Есть тест с настоящим колесом: доводит список и до
-  начала истории, и до последнего сообщения.
-- **При прокрутке вверх нарисованный кадр стоял на месте**: колесо крутилось, а
-  на экране оставалось то же самое. Кадр рисуется на том смещении, которое мы
-  попросили, а колесо egui применяет уже после отрисовки — так что «просили»
-  всегда было на кадр позади. Якорь вида брался именно от «просили» и
-  закреплял следующий кадр на прошлом месте. С быстрым колесом это было не
-  видно (якорь успевали сбрасывать, список дёргался через кадр), с медленным —
-  трекпад, хвост сглаживания — якорь доживал и список стоял. Теперь якорь
-  берётся от того места, где чат встал на самом деле.
-- Чат не докручивался до конца и сам отползал от последнего сообщения. Длина
-  списка меняется на ходу — уточняются высоты, приходят картинки, — а низ
-  пересчитывался только в тот кадр, когда что-то приходило. Теперь, пока
-  пользователь внизу, низ держится сам; ушёл вверх — вид больше не дёргается.
-- Кадр, который перематывает вниз, рисовал верх канала: список открывался на
-  прошлом смещении, а не на том, для которого было посчитано окно сообщений.
-  При загрузке страницы это было видно как вспышка.
-- Оценка высоты сообщения врала на 14% в плюс на каждом сообщении, и длина
-  списка плыла по мере прокрутки — из-за этого низ и уезжал. Константы сняты
-  замером на живом egui, есть тест, который не даёт им разойтись снова.
-- Картинка больше не меняет высоту сообщения на ±180 px в момент загрузки:
-  Discord присылает размер вместе со ссылкой, место резервируется по нему.
+- **The chat duplicated when scrolling up**: under every new history request the
+  same messages appeared, and scrolling up cycled through the same pages.
+  Discord returns a page from newest to oldest, but the app stored it as
+  received — so the newest row ended up first, and `before` for the next page
+  was taken from it. Discord answered with the same page, it was prepended, and
+  so on up to the 500-message cap. Now the page is reversed into storage order:
+  the list always goes oldest to newest, `before` is taken from its first row,
+  and the cap drops the oldest.
+- **A message could double**: the gateway sends a live copy of everything after
+  the subscription, and the same row had already landed in a history page. The
+  duplicate was drawn twice. Now a repeat by `id` is skipped.
+- **The chat could not be scrolled at all.** While the user is at the bottom we
+  asked egui to keep the list pinned to the bottom — and immediately overwrote
+  the wheel result back to "bottom", i.e. erased the scroll every frame. The
+  offset could never move. Now egui holds the bottom only when we are moving
+  there ourselves, and "the user scrolled" is detected by the list ending up
+  somewhere other than where we asked and not at the real bottom. There is a
+  test with a real wheel: it drives the list to the start of history and to the
+  last message.
+- **When scrolling up the drawn frame stayed put**: the wheel turned but the
+  screen showed the same thing. The frame is drawn at the offset we asked for,
+  while egui applies the wheel after drawing — so "asked" was always a frame
+  behind. The view anchor was taken from "asked" and pinned the next frame in
+  the old place. With a fast wheel this wasn't visible (the anchor was reset in
+  time, the list jittered every other frame); with a slow one — a trackpad, the
+  tail of smoothing — the anchor survived and the list stood still. Now the
+  anchor is taken from where the chat actually ended up.
+- The chat didn't scroll all the way down and crept away from the last message.
+  The list length changes on the fly — heights are refined, images arrive — but
+  the bottom was recalculated only on the frame when something arrived. Now,
+  while the user is at the bottom, the bottom holds itself; once gone up, the
+  view no longer jitters.
+- A frame that rewinds to the bottom drew the top of the channel: the list
+  opened at the old offset, not the one the message window had been computed
+  for. When loading a page this showed as a flash.
+- The message height estimate was off by +14% on every message, and the list
+  length drifted as you scrolled — that is why the bottom kept sliding. The
+  constants come from a measurement on live egui, and a test keeps them from
+  diverging again.
+- An image no longer changes a message's height by ±180 px when it loads:
+  Discord sends the size along with the link, and the space is reserved from it.
 
 ## 0.5.0 — 2026-09-27
 
-История в чатах подгружается вверх по мере прокрутки, как в Discord, а
-список сообщений рисуется виртуализированно: в кадр попадает только то,
-что видно. Отрисовка чата облегчилась в пять раз.
+History in chats pages in as you scroll up, like Discord, and the message list is
+drawn virtualized: only what's visible makes it into a frame. Chat rendering got
+five times lighter.
 
-### Исправлено
+### Fixed
 
-- **Чат не показывал новые сообщения.** Якорь прокрутки брался до того, как
-  список перематывался вниз, и закреплял вид вверху канала. Из-за этого чат
-  открывался на начале истории, новое сообщение приходило «внизу» уже
-  нарисованного, а история вверх грузилась повторными страницами, пока
-  не упиралась в потолок.
+- **The chat didn't show new messages.** The scroll anchor was taken before the
+  list was rewound to the bottom and pinned the view to the top of the channel.
+  Because of this the chat opened at the start of history, a new message arrived
+  "below" what was drawn, and history-up loaded repeated pages until it hit the
+  cap.
 
-### История постранично
+### Paged history
 
-- Канал открывается сразу с 50 последних сообщений, дальше — по мере
-  прокрутки вверх, ещё по 50. Раньше история бралась вся сразу, и длинный
-  канал целиком висел в памяти.
-- Дошли до самого старого сообщения — клиент запоминает, что дальше пусто,
-  и больше в API за историей не ходит. Пока список целиком влезает в окно,
-  история не запрашивается вовсе: прокручивать нечего.
-- Вид держится на конкретном сообщении у верхней границы окна, а не на
-  номере строки. Подгрузилась страница вверх — сообщение, на котором стоял
-  взгляд, осталось на том же месте экрана; прокрутку вручную якорь
-  отпускает.
-- Потолок на канал поднят с 300 до 500 сообщений: теперь, что история
-  копится вверх, это единственный ограничитель памяти.
+- A channel opens straight away with the last 50 messages, then pages in 50 more
+  as you scroll up. Before, the whole history was taken at once, and a long
+  channel hung entirely in memory.
+- Once the oldest message is reached, the client remembers there's nothing more
+  and stops hitting the API for history. While the list fits entirely in the
+  window, history isn't requested at all: there's nothing to scroll.
+- The view holds on a specific message at the top edge of the window, not on a
+  row number. When a page loads above, the message you were looking at stays at
+  the same place on screen; manual scrolling releases the anchor.
+- The per-channel cap was raised from 300 to 500 messages: now that history
+  accumulates upward, that is the only memory limit.
 
-### Виртуализация списка
+### List virtualization
 
-- Высота каждого сообщения измеряется при первой отрисовке и лежит в кэше
-  по id; ещё не нарисованные оцениваются по длине текста. Окно видимых
-  находится делением пополам по префиксным суммам, а не перебором канала.
-- Пропущенные сообщения не рисуются совсем, но место под них остаётся:
-  иначе список схлопнулся бы в видимую часть и полоса прокрутки врала бы
-  про длину истории.
-- Вокруг окна рисуется запас в 600 пикселей, чтобы между кадрами колеса
-  мыши не оставалось серых полос.
-- Пока картинка не скачалась, под неё резервируется заглушка 180×360
-  ровно того же размера, что и потом нарисуется. Без неё высота сообщения
-  скакала бы на сотни пикселей, как только картинка докачивалась.
+- Each message's height is measured on first draw and lives in a cache keyed by
+  id; not-yet-drawn ones are estimated by text length. The window of visible
+  ones is found by binary search over prefix sums rather than scanning the
+  channel.
+- Skipped messages aren't drawn at all, but space is kept for them: otherwise
+  the list would collapse to the visible part and the scrollbar would lie about
+  the history length.
+- A 600-pixel margin is drawn around the window so no grey bands are left
+  between wheel frames.
+- Until an image has downloaded, a placeholder of exactly the size it will be
+  drawn at (180×360) is reserved for it. Without it the message height would
+  jump by hundreds of pixels as soon as the image arrived.
 
-### Скорость — аллокаций на кадр в 5× меньше
+### Speed — 5× fewer allocations per frame
 
-Замер на 300 сообщениях, 32 картинках, гифке и 189 каналах
+Measurement on 300 messages, 32 images, a GIF and 189 channels
 (`cargo test --release -- --ignored --nocapture memcheck`):
 
-| Что | 0.4.0 | 0.5.0 |
+| What | 0.4.0 | 0.5.0 |
 |---|---|---|
-| 10 кадров отрисовки (чат + списки) | 112 534 | **32 827** |
-| — из них только чат | 95 929 | **18 106** |
-| — из них только списки | 14 080 | 14 080 |
-| RSS процесса | 84.9 МБ | **80.4 МБ** |
-| Всего аллокаций за тест | 294 701 | 137 170 |
+| 10 render frames (chat + lists) | 112 534 | **32 827** |
+| — of which chat only | 95 929 | **18 106** |
+| — of which lists only | 14 080 | 14 080 |
+| Process RSS | 84.9 MB | **80.4 MB** |
+| Total allocations over the test | 294 701 | 137 170 |
 
-### Тесты
+### Tests
 
-- 44 → 57 тестов. Появились проверки геометрии на живом egui: полоса
-  прокрутки не врёт про длину истории, при прокрутке не остаётся пустот,
-  подгрузка вверх не сдвигает взгляд, новое сообщение тянет вниз только
-  из нижнего положения, а история запрашивается ровно один раз. Именно
-  они нашли баг с якорем, из-за которого чат не показывал новые сообщения.
+- 44 → 57 tests. Geometry checks on live egui appeared: the scrollbar doesn't
+  lie about the history length, no gaps remain while scrolling, loading above
+  doesn't shift the view, a new message pulls down only from the bottom
+  position, and history is requested exactly once. It was these that found the
+  anchor bug that kept the chat from showing new messages.
 
 ## 0.4.0 — 2026-09-27
 
-Небольшие правки поверх большой переработки: клиент перестал съедать память,
-перестал делать лишнюю работу на каждом кадре и снова грузит картинки.
+Small fixes on top of a big rework: the client stopped eating memory, stopped
+doing extra work every frame, and loads images again.
 
-### Исправлено
+### Fixed
 
-- **Картинки и гифки не грузились вообще.** Потолок на 3 одновременные
-  загрузки считал слоты через `fetch_add` и увеличивал счётчик даже при
-  отказе. За пару кадров счётчик уходил за предел навсегда, а опуститься
-  обратно мог только при успешной загрузке — она уже не начиналась. Слот
-  берётся `fetch_update`, отпускается сам на любом выходе, включая падение
-  потока. Проверено сквозным тестом: 6 картинок при лимите 3 грузятся все,
-  на старом коде — ровно 3 и дальше тишина.
-- **История канала не показывалась:** гейтвей грузил её в общей очереди и
-  блокировал остальные команды. Загрузка вынесена из очереди, пагинация
-  берёт `before` от самого старого сообщения (были дубли и вчетверо больше
-  запросов), поздний ответ по уже закрытому каналу больше не снимает
-  надпись «Loading messages…».
-- **«Неверный пароль» при верном пароле:** пустое хранилище больше не
-  считается неверным паролем, лишние пробелы прощаются, в ошибке видно путь
-  к файлу и время его изменения.
-- **Тесты писали в настоящий `~/.wyvern_accounts.json`** — путь хранилища
-  переопределяется в `App`, а не в переменной окружения, поэтому тесты
-  можно гонять параллельно.
-- **Утечка незабранных загрузок:** при смене канала загрузки прежнего
-  канала навсегда оставались в `pending_images` вместе с распакованными
-  пикселями (мегабайты на картинку).
-- Битая или слишком большая картинка больше не крутит вечный спиннер, а
-  пишет «не удалось загрузить».
+- **Images and GIFs didn't load at all.** The 3-concurrent-download cap counted
+  slots via `fetch_add` and incremented the counter even on refusal. Within a
+  couple of frames the counter was permanently over the limit, and it could only
+  come back down on a successful download — which never started. The slot is now
+  taken with `fetch_update` and released on any exit, including a thread panic.
+  Verified end-to-end: 6 images with a limit of 3 all load; on the old code,
+  exactly 3 and then silence.
+- **Channel history wasn't shown:** the gateway loaded it in the shared queue and
+  blocked other commands. Loading was moved out of the queue, pagination takes
+  `before` from the oldest message (there were duplicates and four times as many
+  requests), and a late response for an already closed channel no longer clears
+  the "Loading messages…" label.
+- **"Wrong password" on a correct password:** an empty vault is no longer
+  treated as a wrong password, extra spaces are forgiven, and the error shows the
+  file path and its modification time.
+- **Tests wrote to the real `~/.wyvern_accounts.json`** — the vault path is
+  overridden in `App`, not via an environment variable, so tests can run in
+  parallel.
+- **Leak of unclaimed downloads:** on a channel switch, the previous channel's
+  downloads stayed in `pending_images` forever along with decoded pixels
+  (megabytes per image).
+- A broken or too-large image no longer spins a forever spinner but shows
+  "failed to load".
 
-### Память — 3× меньше
+### Memory — 3× less
 
-Замер на 300 сообщениях, 32 картинках, гифке и 189 каналах
+Measurement on 300 messages, 32 images, a GIF and 189 channels
 (`cargo test --release -- --ignored --nocapture memcheck`):
 
-| Что | Было | Стало |
+| What | Before | After |
 |---|---|---|
-| RSS процесса | 255.2 МБ | **84.9 МБ** |
-| Кэш картинок | 216.0 МБ | 47.3 МБ |
-| Пик разбора истории | 5.64 МБ | 0.54 МБ |
-| Сообщения в памяти | 2.62 МБ | 0.44 МБ |
-| Всего аллокаций за тест | 384 539 | 294 701 |
+| Process RSS | 255.2 MB | **84.9 MB** |
+| Image cache | 216.0 MB | 47.3 MB |
+| History parse peak | 5.64 MB | 0.54 MB |
+| Messages in memory | 2.62 MB | 0.44 MB |
+| Total allocations over the test | 384 539 | 294 701 |
 
-- Кэш картинок ограничен **байтами** (48 МБ + 32 штуки), а не числом
-  элементов: больше 48 МБ он не занимает при любых картинках.
-- Размеры картинок считаются от отображаемых: в чате максимум 360×360,
-  значит 768 пикселей (с запасом на HiDPI) вместо 1536; гифка 448 вместо
-  640. В те же 48 МБ влезает 28 картинок вместо 16.
-- Эмбеды больше не хранят кусок JSON (`Vec<Value>`), а только
+- The image cache is bounded by **bytes** (48 MB + 32 items), not by item count:
+  it never takes more than 48 MB whatever the images.
+- Image sizes are computed from the displayed size: in chat a maximum of
+  360×360, hence 768 pixels (with headroom for HiDPI) instead of 1536; a GIF 448
+  instead of 640. The same 48 MB now holds 28 images instead of 16.
+- Embeds no longer store a JSON chunk (`Vec<Value>`), only
   `{ image_url, description }`.
-- Гифки играют целиком: раньше `collect_frames()` распаковывал гифку
-  целиком (500 кадров по 1000×1000 — это 2 ГБ), потом был потолок в 16
-  кадров и длинная гифка обрывалась на середине. Теперь число кадров
-  считается по структуре файла, а граница — по памяти (32 МБ на гифку):
-  длинную ужимаем, но проигрываем до конца.
-- Картинка или гифка, которая сейчас на экране, не вытесняется из кэша,
-  пока её видно. Раньше соседняя, только что догрузившаяся картинка могла
-  выбить видимую, и в следующем кадре её качали заново — она мигала, а чат
-  дёргался.
-- **Готовые загрузки больше не копятся.** Результат забирался только при
-  отрисовке своей картинки, и та, которую успели прокрутить за экран,
-  навсегда оставляла в `pending_images` распакованные пиксели: на длинном
-  чате с гифками это выросло в 269 МБ RSS. Теперь каждым кадром всё
-  готовое уходит в кэш, где память ограничена бюджетом и LRU.
-- **Счётчик «n/2000» показывается, только когда есть что считать.** На
-  пустом поле «0/2000» выглядел застывшим индикатором; место под него
-  зарезервировано, чтобы поле не прыгало по ширине.
-- Потолок на размер исходника: распаковка идёт по исходным пикселям, а
-  Discord принимает до 10000×10000. Слишком большая картинка отсекается до
-  выделения памяти.
-- Списки в боковой панели больше не клонируются на каждом кадре.
+- GIFs play to the end: before, `collect_frames()` decoded the whole GIF (500
+  frames of 1000×1000 is 2 GB), then there was a 16-frame cap and a long GIF was
+  cut off in the middle. Now the frame count is read from the file structure and
+  the limit is memory (32 MB per GIF): long ones are downscaled but played to the
+  end.
+- An image or GIF currently on screen is not evicted from the cache while it's
+  visible. Before, a neighbouring image that had just loaded could push out the
+  visible one, and next frame it was downloaded again — it flickered and the chat
+  jittered.
+- **Finished downloads no longer pile up.** The result was collected only while
+  drawing its own image, and one scrolled off screen left decoded pixels in
+  `pending_images` forever: on a long chat with GIFs this grew to 269 MB of RSS.
+  Now everything ready goes into the cache every frame, where memory is bounded
+  by the budget and LRU.
+- **The "n/2000" counter is shown only when there is something to count.** On an
+  empty field "0/2000" looked like a frozen indicator; space is reserved for it
+  so the field doesn't jump in width.
+- A cap on source size: decoding goes by source pixels, and Discord accepts up
+  to 10000×10000. A too-large image is rejected before allocating memory.
+- Lists in the sidebar are no longer cloned every frame.
 
-### Скорость
+### Speed
 
-- История разбирается сразу в сообщения (serde-структуры вместо дерева
-  `serde_json::Value` на всю страницу): 52 216 → 4 517 аллокаций. Если
-  формат неожиданный, страница разбирается запасным терпимым способом —
-  история канала не пропадёт из-за одной странной строки.
-- Живое сообщение и страница истории разбираются одной функцией, тест
-  сверяет их результат: разъехаться они больше не могут.
-- Имя, текст и время сообщения берутся ссылкой, а не копией; убран
-  отдельный проход по всем сообщениям ради аватарок; проверка «это
-  картинка?» больше не делает `to_lowercase()` и `to_string()` на каждый URL
-  на каждом кадре.
-- Отрисовка: 133 612 → 112 534 аллокаций на 10 кадров.
+- History is parsed straight into messages (serde structs instead of a
+  `serde_json::Value` tree for the whole page): 52 216 → 4 517 allocations. If
+  the format is unexpected, the page is parsed by a tolerant fallback — a
+  channel's history won't disappear because of one odd row.
+- A live message and a history page are parsed by one function, and a test
+  compares their result: they can no longer diverge.
+- A message's name, text and time are taken by reference rather than by copy; a
+  separate pass over all messages just for avatars is gone; the "is this an
+  image?" check no longer does `to_lowercase()` and `to_string()` on every URL
+  every frame.
+- Rendering: 133 612 → 112 534 allocations over 10 frames.
 
-### Разработка
+### Development
 
-- Версия видна в заголовке окна: бинарник в корне репозитория пересобирают
-  не всегда, и по заголовку сразу понятно, какой именно запущен.
-- В GUI убрана отладочная строка (`CHAT-AREA w=646 h=1001 …`), в логе она
-  осталась.
-- `main.rs` разбит на модули (был один файл на 2591 строку).
-- Тесты: 19 → 44, плюс замер памяти; предупреждений компилятора 0.
-- Лог `/tmp/wyvern_layout.log` больше не растёт бесконечно (ротация на
-  2 МБ), дамп сообщений — только по `WYVERN_DUMP=1`.
+- The version is visible in the window title: the binary at the repo root isn't
+  always rebuilt, and the title makes it clear which one is running.
+- A debug line removed from the GUI (`CHAT-AREA w=646 h=1001 …`); it stays in the
+  log.
+- `main.rs` split into modules (was a single 2591-line file).
+- Tests: 19 → 44, plus a memory measurement; 0 compiler warnings.
+- The `/tmp/wyvern_layout.log` no longer grows forever (2 MB rotation); the
+  message dump only with `WYVERN_DUMP=1`.
 
-## 0.3.0 — до 2026-09-01
+## 0.3.0 — before 2026-09-01
 
-Первая загрузка: клиент одним файлом `main.rs`, вход по токену, серверы,
-каналы, история, картинки.
+First upload: the client as a single `main.rs` file, token login, servers,
+channels, history, images.
