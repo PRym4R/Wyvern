@@ -24,7 +24,7 @@ const MAX_AVATAR_CACHE: usize = 192;
 /// Max image attachments cached (each costs megabytes of VRAM/RAM).
 const MAX_IMAGE_CACHE: usize = 32;
 /// Byte budget for the image cache; counting images alone is meaningless since each can be megabytes.
-const IMAGE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
+const IMAGE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
 /// Byte budget for avatars (small textures, but they still add up).
 const AVATAR_CACHE_BUDGET: usize = 8 * 1024 * 1024;
 /// Max failed image URLs remembered to avoid refetching them.
