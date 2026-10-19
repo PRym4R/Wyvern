@@ -79,7 +79,8 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   a channel clears its badge and sends a best-effort read receipt.
 - **Channel categories and announcements**: guild channels are grouped under
   collapsible category headers (uncategorized channels at the top, children by
-  position); announcement channels show a 📢 marker.
+  position); announcement channels show a 📢 marker. Voice channels are listed
+  greyed out with 🔊 but stay inert, since the client doesn't connect to voice.
 
 ## 0.7.0 — 2026-10-18
 
