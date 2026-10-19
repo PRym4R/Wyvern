@@ -189,3 +189,27 @@ fn unknown_last_channel_falls_back_to_default() {
     assert!(!app.restore_last_channel(), "исчезнувший канал не восстанавливаем");
     assert_eq!(app.selected_channel, None);
 }
+
+/// Every theme must keep the body text clearly separated from all surfaces;
+/// contrast is the whole point of a theme.
+#[test]
+fn every_theme_has_readable_text() {
+    fn luma(c: eframe::egui::Color32) -> f32 {
+        (0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32) / 255.0
+    }
+    for (i, name) in crate::models::THEME_NAMES.iter().enumerate() {
+        let t = crate::models::theme_by_index(i as u8);
+        let text = luma(t.text);
+        for (label, surface) in [
+            ("bg", t.bg),
+            ("panel", t.panel_bg),
+            ("channel", t.channel_bg),
+            ("input", t.input_bg),
+        ] {
+            assert!(
+                (text - luma(surface)).abs() > 0.25,
+                "тема {name}: текст плохо читается на {label}"
+            );
+        }
+    }
+}

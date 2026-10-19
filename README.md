@@ -46,7 +46,7 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 264 tests (261 + 3 ignored)
+cargo test --release                                        # 265 tests (262 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

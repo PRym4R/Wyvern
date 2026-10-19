@@ -448,6 +448,14 @@ impl App {
                 let panel_resp = egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(self.theme.channel_bg))
                     .show(ctx, |ui| {
+                        if let Some((_, chat_end)) = crate::models::theme_gradient(self.theme_index) {
+                            crate::ui::paint_vertical_gradient(
+                                ui.painter(),
+                                ui.max_rect(),
+                                self.theme.channel_bg,
+                                chat_end,
+                            );
+                        }
                         ui.set_min_width(0.0);
 
                         // Send failures are shown here: the status field only

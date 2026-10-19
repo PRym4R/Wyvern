@@ -526,7 +526,7 @@ impl App {
             chat_anchor: None,
             want_older: false,
             autoselected: false,
-            theme_index: 1,
+            theme_index: 0,
             last_render_key: String::new(),
             scroll_to_bottom: true,
             debug_frames: 0,
@@ -537,9 +537,8 @@ impl App {
     /// `path` is where they get written back; `None` keeps the app read-only.
     pub(crate) fn with_settings(mut self, settings: Settings, path: Option<std::path::PathBuf>) -> Self {
         if let Some(idx) = settings.theme_index {
-            if idx <= 2 {
-                self.theme_index = idx;
-            }
+            // Unknown indices fall back to Dark when the theme is resolved.
+            self.theme_index = idx;
         }
         self.settings = settings;
         self.settings_path = path;
@@ -1782,11 +1781,7 @@ impl App {
         // Apply the UI scale from settings (1.0 = default).
         ctx.set_zoom_factor(self.settings.ui_scale.unwrap_or(1.0));
 
-        self.theme = match self.theme_index {
-            0 => Theme::dark(),
-            1 => Theme::cyberpunk(),
-            _ => Theme::light(),
-        };
+        self.theme = crate::models::theme_by_index(self.theme_index);
 
         // Animation flag is rebuilt each frame by rendering if an animated image is visible.
         self.animating = false;

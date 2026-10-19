@@ -21,6 +21,14 @@ impl App {
             .exact_width(72.0)
             .frame(egui::Frame::new().fill(self.theme.bg))
             .show(ctx, |ui| {
+                if let Some((win_end, _)) = crate::models::theme_gradient(self.theme_index) {
+                    crate::ui::paint_vertical_gradient(
+                        ui.painter(),
+                        ui.max_rect(),
+                        self.theme.bg,
+                        win_end,
+                    );
+                }
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     let home_btn = ui.add_sized(
@@ -103,10 +111,18 @@ impl App {
                             .corner_radius(24.0),
                     );
                     if ubtn.clicked() {
-                        self.theme_index = (self.theme_index + 1) % 3;
+                        let count = crate::models::THEME_NAMES.len() as u8;
+                        self.theme_index = (self.theme_index + 1) % count;
+                        // Apply now so the rest of this frame already uses it.
+                        self.theme = crate::models::theme_by_index(self.theme_index);
                         self.write_settings();
+                        ui.ctx().request_repaint();
                     }
-                    ubtn.on_hover_text("Toggle theme");
+                    let theme_name = crate::models::THEME_NAMES
+                        .get(self.theme_index as usize)
+                        .copied()
+                        .unwrap_or("Dark");
+                    ubtn.on_hover_text(format!("Theme: {theme_name} (click to cycle)"));
 
                     let sbtn = ui.add_sized(
                         [48.0, 42.0],
@@ -230,6 +246,14 @@ impl App {
             .max_width(360.0)
             .frame(egui::Frame::new().fill(self.theme.panel_bg));
         let resp = panel.show(ctx, |ui| {
+                if let Some((win_end, _)) = crate::models::theme_gradient(self.theme_index) {
+                    crate::ui::paint_vertical_gradient(
+                        ui.painter(),
+                        ui.max_rect(),
+                        self.theme.panel_bg,
+                        win_end,
+                    );
+                }
                 ui.set_min_width(ui.available_width());
 
                 match self.selected_guild {

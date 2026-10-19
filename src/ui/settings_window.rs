@@ -71,11 +71,65 @@ impl crate::app::App {
             0 => {
                 ui.heading("Theme");
                 let mut changed = false;
-                changed |= ui.radio_value(&mut self.theme_index, 0u8, "Dark").changed();
-                changed |= ui.radio_value(&mut self.theme_index, 1u8, "Cyberpunk").changed();
-                changed |= ui.radio_value(&mut self.theme_index, 2u8, "Light").changed();
+                for (i, name) in crate::models::THEME_NAMES.iter().enumerate() {
+                    let idx = i as u8;
+                    let t = crate::models::theme_by_index(idx);
+                    ui.horizontal(|ui| {
+                        changed |= ui.radio_value(&mut self.theme_index, idx, *name).changed();
+                        // Mini preview: window, channel pane, accent and text lines.
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(168.0, 24.0), egui::Sense::hover());
+                        let p = ui.painter();
+                        let grad = crate::models::theme_gradient(idx);
+                        match grad {
+                            Some((win_end, _)) => {
+                                crate::ui::paint_vertical_gradient(p, rect, t.bg, win_end);
+                            }
+                            None => {
+                                p.rect_filled(rect, 3.0, t.bg);
+                            }
+                        }
+                        let inner = rect.shrink(3.0);
+                        let pane_w = inner.width() * 0.32;
+                        let pane = egui::Rect::from_min_size(
+                            inner.min,
+                            egui::vec2(pane_w, inner.height()),
+                        );
+                        match grad {
+                            Some((_, chat_end)) => {
+                                crate::ui::paint_vertical_gradient(
+                                    p,
+                                    pane,
+                                    t.channel_bg,
+                                    chat_end,
+                                );
+                            }
+                            None => {
+                                p.rect_filled(pane, 2.0, t.channel_bg);
+                            }
+                        }
+                        let x0 = inner.min.x + pane_w + 6.0;
+                        let bar_w = (inner.width() - pane_w - 12.0).max(4.0);
+                        for (dy, w, color) in [
+                            (4.0, bar_w * 0.55, t.accent),
+                            (11.0, bar_w, t.text),
+                            (16.0, bar_w * 0.75, t.text_secondary),
+                        ] {
+                            p.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x0, inner.min.y + dy),
+                                    egui::vec2(w, 3.0),
+                                ),
+                                1.0,
+                                color,
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
                 if changed {
                     self.write_settings();
+                    ui.ctx().request_repaint();
                 }
             }
             1 => {

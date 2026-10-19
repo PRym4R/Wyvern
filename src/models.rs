@@ -373,44 +373,260 @@ impl Theme {
             bg: Color32::from_rgb(49, 51, 56),
             panel_bg: Color32::from_rgb(42, 44, 48),
             channel_bg: Color32::from_rgb(30, 31, 34),
-            text: Color32::from_rgb(220, 221, 222),
-            text_secondary: Color32::from_rgb(114, 118, 125),
+            text: Color32::from_rgb(230, 232, 235),
+            text_secondary: Color32::from_rgb(148, 155, 164),
             accent: Color32::from_rgb(88, 101, 242),
             input_bg: Color32::from_rgb(64, 68, 75),
             message_hover: Color32::from_rgb(50, 52, 57),
-            divider: Color32::from_rgb(66, 68, 72),
+            divider: Color32::from_rgb(72, 75, 82),
             self_bg: Color32::from_rgb(55, 58, 64),
         }
     }
 
     pub(crate) fn cyberpunk() -> Self {
         Self {
-            bg: Color32::from_rgb(16, 12, 32),
-            panel_bg: Color32::from_rgb(22, 17, 42),
-            channel_bg: Color32::from_rgb(28, 22, 52),
-            text: Color32::from_rgb(223, 226, 255),
-            text_secondary: Color32::from_rgb(140, 142, 185),
-            accent: Color32::from_rgb(0, 229, 255),
-            input_bg: Color32::from_rgb(34, 28, 62),
-            message_hover: Color32::from_rgb(32, 25, 58),
-            divider: Color32::from_rgb(60, 52, 110),
-            self_bg: Color32::from_rgb(36, 29, 66),
+            bg: Color32::from_rgb(18, 6, 38),
+            panel_bg: Color32::from_rgb(26, 10, 52),
+            channel_bg: Color32::from_rgb(34, 12, 66),
+            text: Color32::from_rgb(245, 236, 255),
+            text_secondary: Color32::from_rgb(180, 160, 220),
+            accent: Color32::from_rgb(255, 45, 149),
+            input_bg: Color32::from_rgb(42, 18, 82),
+            message_hover: Color32::from_rgb(38, 15, 72),
+            divider: Color32::from_rgb(80, 40, 130),
+            self_bg: Color32::from_rgb(46, 20, 88),
         }
     }
 
     pub(crate) fn light() -> Self {
         Self {
             bg: Color32::from_rgb(232, 234, 237),
-            panel_bg: Color32::from_rgb(242, 243, 245),
+            panel_bg: Color32::from_rgb(245, 246, 248),
             channel_bg: Color32::from_rgb(255, 255, 255),
-            text: Color32::from_rgb(30, 31, 34),
-            text_secondary: Color32::from_rgb(120, 122, 128),
+            text: Color32::from_rgb(28, 30, 34),
+            text_secondary: Color32::from_rgb(96, 102, 112),
             accent: Color32::from_rgb(70, 96, 220),
-            input_bg: Color32::from_rgb(228, 230, 234),
-            message_hover: Color32::from_rgb(240, 241, 244),
-            divider: Color32::from_rgb(220, 222, 226),
-            self_bg: Color32::from_rgb(235, 237, 241),
+            input_bg: Color32::from_rgb(226, 229, 234),
+            message_hover: Color32::from_rgb(238, 240, 244),
+            divider: Color32::from_rgb(212, 216, 222),
+            self_bg: Color32::from_rgb(232, 235, 240),
         }
+    }
+
+    /// Deep navy with a soft electric-blue accent.
+    pub(crate) fn midnight() -> Self {
+        Self {
+            bg: Color32::from_rgb(15, 20, 28),
+            panel_bg: Color32::from_rgb(19, 26, 36),
+            channel_bg: Color32::from_rgb(11, 15, 22),
+            text: Color32::from_rgb(219, 228, 240),
+            text_secondary: Color32::from_rgb(125, 140, 163),
+            accent: Color32::from_rgb(76, 141, 255),
+            input_bg: Color32::from_rgb(28, 38, 52),
+            message_hover: Color32::from_rgb(24, 34, 48),
+            divider: Color32::from_rgb(36, 48, 64),
+            self_bg: Color32::from_rgb(26, 37, 50),
+        }
+    }
+
+    /// Arctic blue-grey, the Nord palette.
+    pub(crate) fn nord() -> Self {
+        Self {
+            bg: Color32::from_rgb(46, 52, 64),
+            panel_bg: Color32::from_rgb(41, 46, 57),
+            channel_bg: Color32::from_rgb(36, 41, 51),
+            text: Color32::from_rgb(236, 239, 244),
+            text_secondary: Color32::from_rgb(143, 155, 176),
+            accent: Color32::from_rgb(136, 192, 208),
+            input_bg: Color32::from_rgb(59, 66, 82),
+            message_hover: Color32::from_rgb(52, 59, 73),
+            divider: Color32::from_rgb(67, 76, 94),
+            self_bg: Color32::from_rgb(59, 66, 82),
+        }
+    }
+
+    /// Dracula: purple night with a lavender accent.
+    pub(crate) fn dracula() -> Self {
+        Self {
+            bg: Color32::from_rgb(40, 42, 54),
+            panel_bg: Color32::from_rgb(33, 34, 44),
+            channel_bg: Color32::from_rgb(30, 31, 41),
+            text: Color32::from_rgb(248, 248, 242),
+            text_secondary: Color32::from_rgb(154, 160, 181),
+            accent: Color32::from_rgb(255, 121, 198),
+            input_bg: Color32::from_rgb(52, 55, 70),
+            message_hover: Color32::from_rgb(47, 50, 65),
+            divider: Color32::from_rgb(68, 71, 90),
+            self_bg: Color32::from_rgb(56, 59, 77),
+        }
+    }
+
+    /// Tokyo Night: ink blue with a neon periwinkle accent.
+    pub(crate) fn tokyo_night() -> Self {
+        Self {
+            bg: Color32::from_rgb(26, 27, 38),
+            panel_bg: Color32::from_rgb(22, 22, 30),
+            channel_bg: Color32::from_rgb(31, 35, 53),
+            text: Color32::from_rgb(192, 202, 245),
+            text_secondary: Color32::from_rgb(127, 138, 181),
+            accent: Color32::from_rgb(122, 162, 247),
+            input_bg: Color32::from_rgb(41, 46, 66),
+            message_hover: Color32::from_rgb(36, 40, 59),
+            divider: Color32::from_rgb(59, 66, 97),
+            self_bg: Color32::from_rgb(42, 47, 69),
+        }
+    }
+
+    /// True-black OLED theme with an electric-violet accent.
+    pub(crate) fn amoled() -> Self {
+        Self {
+            bg: Color32::from_rgb(0, 0, 0),
+            panel_bg: Color32::from_rgb(5, 5, 7),
+            channel_bg: Color32::from_rgb(10, 10, 13),
+            text: Color32::from_rgb(242, 242, 245),
+            text_secondary: Color32::from_rgb(138, 138, 150),
+            accent: Color32::from_rgb(179, 136, 255),
+            input_bg: Color32::from_rgb(20, 20, 24),
+            message_hover: Color32::from_rgb(18, 18, 22),
+            divider: Color32::from_rgb(36, 36, 44),
+            self_bg: Color32::from_rgb(23, 23, 29),
+        }
+    }
+
+    /// Catppuccin Mocha: warm purple-grey with a mauve accent.
+    pub(crate) fn catppuccin() -> Self {
+        Self {
+            bg: Color32::from_rgb(30, 30, 46),
+            panel_bg: Color32::from_rgb(24, 24, 37),
+            channel_bg: Color32::from_rgb(17, 17, 27),
+            text: Color32::from_rgb(205, 214, 244),
+            text_secondary: Color32::from_rgb(166, 173, 200),
+            accent: Color32::from_rgb(166, 227, 161),
+            input_bg: Color32::from_rgb(49, 50, 68),
+            message_hover: Color32::from_rgb(41, 42, 58),
+            divider: Color32::from_rgb(69, 71, 90),
+            self_bg: Color32::from_rgb(49, 50, 68),
+        }
+    }
+
+    /// Gruvbox: warm retro colours with an orange accent.
+    pub(crate) fn gruvbox() -> Self {
+        Self {
+            bg: Color32::from_rgb(40, 40, 40),
+            panel_bg: Color32::from_rgb(29, 32, 33),
+            channel_bg: Color32::from_rgb(50, 48, 47),
+            text: Color32::from_rgb(235, 219, 178),
+            text_secondary: Color32::from_rgb(168, 153, 132),
+            accent: Color32::from_rgb(254, 128, 25),
+            input_bg: Color32::from_rgb(60, 56, 54),
+            message_hover: Color32::from_rgb(50, 48, 47),
+            divider: Color32::from_rgb(80, 73, 69),
+            self_bg: Color32::from_rgb(60, 56, 54),
+        }
+    }
+
+    /// Aurora: teal dawn fading into deep blue.
+    pub(crate) fn aurora() -> Self {
+        Self {
+            bg: Color32::from_rgb(7, 26, 28),
+            panel_bg: Color32::from_rgb(8, 30, 38),
+            channel_bg: Color32::from_rgb(8, 22, 30),
+            text: Color32::from_rgb(217, 247, 239),
+            text_secondary: Color32::from_rgb(127, 179, 168),
+            accent: Color32::from_rgb(53, 224, 181),
+            input_bg: Color32::from_rgb(13, 38, 48),
+            message_hover: Color32::from_rgb(11, 32, 41),
+            divider: Color32::from_rgb(22, 64, 74),
+            self_bg: Color32::from_rgb(14, 42, 52),
+        }
+    }
+
+    /// Sunset: violet dusk fading into wine red.
+    pub(crate) fn sunset() -> Self {
+        Self {
+            bg: Color32::from_rgb(27, 11, 42),
+            panel_bg: Color32::from_rgb(32, 16, 48),
+            channel_bg: Color32::from_rgb(30, 12, 46),
+            text: Color32::from_rgb(255, 233, 226),
+            text_secondary: Color32::from_rgb(201, 154, 168),
+            accent: Color32::from_rgb(255, 138, 76),
+            input_bg: Color32::from_rgb(46, 21, 63),
+            message_hover: Color32::from_rgb(42, 18, 56),
+            divider: Color32::from_rgb(74, 33, 64),
+            self_bg: Color32::from_rgb(51, 22, 63),
+        }
+    }
+
+    /// Ocean: navy surface fading into deep teal.
+    pub(crate) fn ocean() -> Self {
+        Self {
+            bg: Color32::from_rgb(4, 18, 31),
+            panel_bg: Color32::from_rgb(6, 26, 43),
+            channel_bg: Color32::from_rgb(5, 24, 39),
+            text: Color32::from_rgb(220, 243, 255),
+            text_secondary: Color32::from_rgb(127, 168, 190),
+            accent: Color32::from_rgb(53, 208, 186),
+            input_bg: Color32::from_rgb(10, 34, 51),
+            message_hover: Color32::from_rgb(8, 29, 45),
+            divider: Color32::from_rgb(19, 64, 80),
+            self_bg: Color32::from_rgb(11, 37, 54),
+        }
+    }
+}
+
+/// Themes in selection order. The index is persisted in `Settings.theme_index`,
+/// so existing entries must never be reordered.
+pub(crate) const THEME_NAMES: [&str; 13] = [
+    "Dark",
+    "Cyberpunk",
+    "Light",
+    "Midnight",
+    "Nord",
+    "Dracula",
+    "Tokyo Night",
+    "AMOLED",
+    "Catppuccin",
+    "Gruvbox",
+    "Aurora",
+    "Sunset",
+    "Ocean",
+];
+
+/// Resolves a persisted theme index; unknown indices fall back to Dark.
+pub(crate) fn theme_by_index(index: u8) -> Theme {
+    match index {
+        1 => Theme::cyberpunk(),
+        2 => Theme::light(),
+        3 => Theme::midnight(),
+        4 => Theme::nord(),
+        5 => Theme::dracula(),
+        6 => Theme::tokyo_night(),
+        7 => Theme::amoled(),
+        8 => Theme::catppuccin(),
+        9 => Theme::gruvbox(),
+        10 => Theme::aurora(),
+        11 => Theme::sunset(),
+        12 => Theme::ocean(),
+        _ => Theme::dark(),
+    }
+}
+
+/// Bottom colours `(window, chat)` for gradient themes; `None` for solid ones.
+pub(crate) fn theme_gradient(index: u8) -> Option<(Color32, Color32)> {
+    match index {
+        10 => Some((
+            Color32::from_rgb(10, 35, 64),
+            Color32::from_rgb(11, 36, 64),
+        )),
+        11 => Some((
+            Color32::from_rgb(58, 16, 32),
+            Color32::from_rgb(66, 18, 42),
+        )),
+        12 => Some((
+            Color32::from_rgb(6, 42, 58),
+            Color32::from_rgb(8, 58, 74),
+        )),
+        _ => None,
     }
 }
 
