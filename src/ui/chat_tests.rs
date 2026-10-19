@@ -119,6 +119,7 @@ mod geometry_tests {
             topic: None,
             position: 0,
             parent_id: None,
+            last_message_id: None,
         });
         app.selected_channel = Some(0);
         let msgs: Vec<Arc<ChatMessage>> = (0..n).map(|i| Arc::new(message(i))).collect();
@@ -891,6 +892,7 @@ mod geometry_tests {
             topic: None,
             position: 0,
             parent_id: None,
+            last_message_id: None,
         });
         let ctx = egui::Context::default();
 

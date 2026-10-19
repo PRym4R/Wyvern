@@ -20,6 +20,7 @@ fn make_app() -> App {
             topic: None,
             position: i,
             parent_id: None,
+            last_message_id: None,
         });
     }
     a.selected_guild = None;
@@ -246,6 +247,7 @@ fn note_unread_ignores_own_and_open_channel() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.chat_at_bottom = true;
@@ -545,6 +547,7 @@ fn late_history_keeps_current_channel_loading() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.channels.push(ChatChannel {
         id: "c2".into(),
@@ -554,6 +557,7 @@ fn late_history_keeps_current_channel_loading() {
         topic: None,
         position: 1,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(1);
     app.open_channel("c2");
@@ -639,6 +643,7 @@ fn older_page_is_prepended_without_duplicates() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -698,6 +703,7 @@ fn boundary_message_is_not_duplicated() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -739,6 +745,7 @@ fn older_history_requested_once_at_a_time() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -775,6 +782,7 @@ fn discord_page_is_stored_oldest_first_and_paged_from_the_oldest() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -829,6 +837,7 @@ fn exhausted_channel_stops_asking() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -859,6 +868,7 @@ fn new_message_scrolls_only_when_at_bottom() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -893,6 +903,7 @@ fn own_message_is_replaced_not_duplicated() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -956,6 +967,7 @@ fn local_echo_id_never_goes_to_pagination() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -990,6 +1002,7 @@ fn failed_history_clears_the_spinner_and_explains() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1029,6 +1042,7 @@ fn failed_older_page_clears_its_own_spinner() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1069,6 +1083,7 @@ fn failed_history_of_other_channel_leaves_current_alone() {
             topic: None,
             position: 0,
             parent_id: None,
+            last_message_id: None,
         });
     }
     app.selected_channel = Some(1);
@@ -1327,6 +1342,7 @@ fn app_with_channel(cmd_tx: mpsc::UnboundedSender<ToGateway>) -> App {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app
@@ -1348,6 +1364,7 @@ fn older_page_survives_the_memory_ceiling() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     // List full: 500 messages, m0 through m499.
@@ -1433,6 +1450,7 @@ fn stale_older_page_into_cleared_list_asks_first_page_again() {
             topic: None,
             position: 0,
             parent_id: None,
+            last_message_id: None,
         });
     }
     app.selected_channel = Some(0);
@@ -1513,6 +1531,7 @@ fn failed_send_removes_echo_and_returns_text() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1559,6 +1578,7 @@ fn failed_send_does_not_overwrite_new_draft() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1593,6 +1613,7 @@ fn sending_clears_the_previous_failure_notice() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1623,6 +1644,7 @@ fn live_message_already_in_history_is_not_doubled() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     app.open_channel("c1");
@@ -1948,6 +1970,7 @@ fn channel_update_renames_channel() {
         topic: Some("тема".into()),
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
 
     tx.send(ToApp::ChannelUpdated {
@@ -1983,6 +2006,7 @@ fn gateway_backlog_is_drained_in_bounded_batches() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
 
@@ -2024,6 +2048,7 @@ fn app_with_events() -> (App, mpsc::UnboundedSender<ToApp>) {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
     (app, tx)
@@ -2182,6 +2207,7 @@ fn channel_layout_nests_text_under_categories() {
         topic: None,
         position: pos,
         parent_id: parent.map(|s| s.to_string()),
+        last_message_id: None,
     };
     app.channels.push(ch("loose1", "general", 0, 0, None));
     app.channels.push(ch("cat", "Text Channels", 4, 1, None));
@@ -2199,4 +2225,54 @@ fn channel_layout_nests_text_under_categories() {
     assert_eq!(groups.len(), 1);
     assert_eq!(app.channels[groups[0].0].name, "Text Channels");
     assert_eq!(names(&groups[0].1), vec!["chat", "news", "Voice"]);
+}
+
+fn add_channel(app: &mut App, id: &str, last: Option<&str>) {
+    app.channels.push(ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        guild_id: None,
+        channel_type: 0,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: last.map(|s| s.to_string()),
+    });
+}
+
+#[test]
+fn ready_read_restores_mention_badge() {
+    let mut app = make_app();
+    add_channel(&mut app, "cc", Some("200"));
+    app.ready_read.insert(
+        "cc".into(),
+        ReadyRead { last_message_id: Some("100".into()), mention_count: 3 },
+    );
+    app.apply_ready_read("cc");
+    assert_eq!(app.channel_badge("cc"), (3, 3), "должно восстановить 3 упоминания");
+}
+
+#[test]
+fn ready_read_marks_unread_dot() {
+    let mut app = make_app();
+    add_channel(&mut app, "cc", Some("200"));
+    app.ready_read.insert(
+        "cc".into(),
+        ReadyRead { last_message_id: Some("100".into()), mention_count: 0 },
+    );
+    app.apply_ready_read("cc");
+    assert!(app.unread_dot.contains("cc"), "канал новее позиции чтения — точка");
+    assert_eq!(app.channel_badge("cc"), (0, 0), "счётчик неизвестен, только точка");
+}
+
+#[test]
+fn ready_read_caught_up_has_no_dot() {
+    let mut app = make_app();
+    add_channel(&mut app, "cc", Some("200"));
+    app.ready_read.insert(
+        "cc".into(),
+        ReadyRead { last_message_id: Some("200".into()), mention_count: 0 },
+    );
+    app.apply_ready_read("cc");
+    assert!(!app.unread_dot.contains("cc"), "прочитано — точки нет");
 }

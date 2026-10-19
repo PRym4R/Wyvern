@@ -44,6 +44,15 @@ fn debug_to_disk_from_env() -> bool {
     )
 }
 
+/// Whether snowflake id `a` is newer than `b` (numeric compare; falls back to
+/// string order if either side is not numeric).
+fn snowflake_gt(a: &str, b: &str) -> bool {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x > y,
+        _ => a > b,
+    }
+}
+
 /// Trims a channel to the cap, dropping the end the user isn't viewing: oldest
 /// when `keep_newest`, newest when loading older history. Returns count dropped.
 fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>, keep_newest: bool) -> usize {
@@ -66,6 +75,13 @@ pub(crate) struct ReplyTarget {
     pub(crate) message_id: String,
     pub(crate) author_name: String,
     pub(crate) preview: String,
+}
+
+/// Read state for a channel as reported by READY.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadyRead {
+    pub(crate) last_message_id: Option<String>,
+    pub(crate) mention_count: u32,
 }
 
 /// Message being edited in the composer. The text itself lives in `input`;
@@ -125,6 +141,10 @@ pub(crate) struct App {
     pub(crate) unread: HashMap<String, u32>,
     /// Unread messages that mention us, a subset of `unread`, shown in red.
     pub(crate) mentions: HashMap<String, u32>,
+    /// Read state from READY, kept until the matching channel shows up.
+    pub(crate) ready_read: HashMap<String, ReadyRead>,
+    /// Channels known unread from READY with an unknown count; shown as a dot.
+    pub(crate) unread_dot: std::collections::HashSet<String>,
     pub(crate) input: String,
     /// Natural height of the multiline composer, measured last frame; drives the panel height.
     pub(crate) composer_h: f32,
@@ -284,6 +304,8 @@ impl App {
             typing: HashMap::new(),
             unread: HashMap::new(),
             mentions: HashMap::new(),
+            ready_read: HashMap::new(),
+            unread_dot: std::collections::HashSet::new(),
             input: String::new(),
             composer_h: 0.0,
             reply_to: None,
@@ -651,11 +673,14 @@ impl App {
                     }
                 }
                 ToApp::Channel(ch) => {
+                    let id = ch.id.clone();
                     if !self.channels.iter().any(|x| x.id == ch.id) {
                         self.channels.push(ch);
                     }
+                    self.apply_ready_read(&id);
                 }
                 ToApp::GuildChannels { guild_id, channels } => {
+                    let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
                     let before = self.channels.len();
                     for ch in channels {
                         if !self.channels.iter().any(|x| x.id == ch.id) {
@@ -689,6 +714,9 @@ impl App {
                             }
                         }
                     }
+                    for id in ids {
+                        self.apply_ready_read(&id);
+                    }
                 }
                 ToApp::DMChannel(ch) => {
                     self.push_debug(format!("Opening DM '{}' id={}", ch.name, &ch.id[..ch.id.len().min(14)]));
@@ -704,6 +732,18 @@ impl App {
                     self.scroll_to_bottom = true;
                     let cid = self.channels[idx].id.clone();
                     self.open_channel(&cid);
+                }
+                ToApp::ReadStates(states) => {
+                    for s in states {
+                        self.ready_read.insert(
+                            s.channel_id.clone(),
+                            ReadyRead { last_message_id: s.last_message_id, mention_count: s.mention_count },
+                        );
+                    }
+                    let ids: Vec<String> = self.ready_read.keys().cloned().collect();
+                    for id in ids {
+                        self.apply_ready_read(&id);
+                    }
                 }
                 ToApp::Friends(list) => {
                     self.friends = list;
@@ -950,6 +990,7 @@ impl App {
         // Opening a channel reads it; the badge goes now, the ack follows history.
         self.unread.remove(channel_id);
         self.mentions.remove(channel_id);
+        self.unread_dot.remove(channel_id);
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
         self.write_settings();
     }
@@ -1295,6 +1336,7 @@ impl App {
     pub(crate) fn ack_channel(&mut self, channel_id: &str) {
         self.unread.remove(channel_id);
         self.mentions.remove(channel_id);
+        self.unread_dot.remove(channel_id);
         let newest = self
             .messages
             .get(channel_id)
@@ -1318,13 +1360,38 @@ impl App {
         )
     }
 
+    /// Applies one READY read state to a known channel: mention count wins,
+    /// otherwise an unread dot when the channel is newer than our read position.
+    pub(crate) fn apply_ready_read(&mut self, channel_id: &str) {
+        if self.current_channel_id() == Some(channel_id) {
+            return;
+        }
+        let Some(state) = self.ready_read.get(channel_id).cloned() else { return };
+        if state.mention_count > 0 {
+            let cur = self.unread.get(channel_id).copied().unwrap_or(0);
+            self.unread.insert(channel_id.to_string(), cur.max(state.mention_count));
+            self.mentions.insert(channel_id.to_string(), state.mention_count);
+            return;
+        }
+        let channel_last = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .and_then(|c| c.last_message_id.clone());
+        if let (Some(channel_last), Some(read_last)) = (channel_last, state.last_message_id) {
+            if snowflake_gt(&channel_last, &read_last) {
+                self.unread_dot.insert(channel_id.to_string());
+            }
+        }
+    }
+
     /// Totals across a guild's channels, for the server-list badge.
     pub(crate) fn guild_badge(&self, guild_id: &str) -> (u32, u32) {
         let mut unread = 0;
         let mut mentions = 0;
         for ch in self.channels.iter().filter(|c| c.guild_id.as_deref() == Some(guild_id)) {
             let (u, m) = self.channel_badge(&ch.id);
-            unread += u;
+            unread += u.max(if self.unread_dot.contains(&ch.id) { 1 } else { 0 });
             mentions += m;
         }
         (unread, mentions)

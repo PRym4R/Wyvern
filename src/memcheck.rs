@@ -303,6 +303,7 @@ fn memcheck_report() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.selected_channel = Some(0);
 
@@ -340,6 +341,7 @@ fn memcheck_report() {
             topic: None,
             position: i as i32,
             parent_id: None,
+            last_message_id: None,
         });
     }
     app.selected_guild = Some(0);

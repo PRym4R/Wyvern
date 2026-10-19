@@ -1,6 +1,14 @@
 use crate::models::{ChatChannel, ChatMessage, Guild, UserProfile};
 
 #[derive(Clone, Debug)]
+pub(crate) struct ReadState {
+    pub(crate) channel_id: String,
+    /// Newest message id we had acknowledged in the channel, if any.
+    pub(crate) last_message_id: Option<String>,
+    pub(crate) mention_count: u32,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ToApp {
     Ready { username: String, user_id: String, avatar: Option<String> },
     Message(ChatMessage),
@@ -30,6 +38,9 @@ pub(crate) enum ToApp {
     Channel(ChatChannel),
     GuildChannels { guild_id: String, channels: Vec<ChatChannel> },
     DMChannel(ChatChannel),
+    /// Per-channel read state from READY (`last_message_id` / `mention_count`).
+    /// Restores unread and mention badges on startup instead of starting blank.
+    ReadStates(Vec<ReadState>),
     Friends(Vec<UserProfile>),
     Status(String),
     /// Discord rejected the token (close codes 4004/4007/4013/4014);

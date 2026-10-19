@@ -10,7 +10,7 @@ use tokio::time;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::messages::{ToApp, ToGateway};
+use crate::messages::{ReadState, ToApp, ToGateway};
 use crate::models::{ChatChannel, Guild};
 use crate::util::{client_properties, super_props};
 
@@ -464,6 +464,22 @@ async fn gw_inner(
                                 session.seq = seq;
                                 let _ = event_tx.send(ToApp::Ready { username: u, user_id: uid, avatar });
 
+                                // Restore unread/mention badges from the read
+                                // states Discord sends with READY.
+                                if let Some(rs) = d["read_state"].as_array() {
+                                    let states: Vec<ReadState> = rs
+                                        .iter()
+                                        .filter_map(|r| {
+                                            let channel_id = r["id"].as_str()?.to_string();
+                                            let last_message_id = r["last_message_id"].as_str().map(|s| s.to_string());
+                                            let mention_count = r["mention_count"].as_u64().unwrap_or(0) as u32;
+                                            Some(ReadState { channel_id, last_message_id, mention_count })
+                                        })
+                                        .collect();
+                                    let _ = event_tx.send(ToApp::Debug(format!("READY: {} read states", states.len())));
+                                    let _ = event_tx.send(ToApp::ReadStates(states));
+                                }
+
                                 if let Some(guilds) = d["guilds"].as_array() {
                                     let _ = event_tx.send(ToApp::Debug(format!("READY: {} guilds", guilds.len())));
                                     for g in guilds {
@@ -532,6 +548,7 @@ async fn gw_inner(
                                                                                     topic: c["topic"].as_str().map(|s| s.to_string()),
                                                                                     position: c["position"].as_i64().unwrap_or(0) as i32,
                                                                                     parent_id: c["parent_id"].as_str().map(|s| s.to_string()),
+                                                                                    last_message_id: c["last_message_id"].as_str().map(|s| s.to_string()),
                                                                                 });
                                                                             }
                                                                         }
@@ -635,6 +652,7 @@ async fn gw_inner(
                                             topic: None,
                                             position: 0,
                                             parent_id: None,
+                                            last_message_id: None,
                                         }));
                                     }
                                 }
@@ -724,6 +742,7 @@ async fn gw_inner(
                                             topic,
                                             position: pos,
                                             parent_id: ch["parent_id"].as_str().map(|s| s.to_string()),
+                                            last_message_id: ch["last_message_id"].as_str().map(|s| s.to_string()),
                                         }));
                                     }
                                 }
@@ -745,6 +764,7 @@ async fn gw_inner(
                                         topic: None,
                                         position: 0,
                                         parent_id: None,
+                                        last_message_id: None,
                                     }));
                                 } else {
                                     let _ = event_tx.send(ToApp::Channel(ChatChannel {
@@ -755,6 +775,7 @@ async fn gw_inner(
                                         topic: d["topic"].as_str().map(|s| s.to_string()),
                                         position: d["position"].as_i64().unwrap_or(0) as i32,
                                         parent_id: d["parent_id"].as_str().map(|s| s.to_string()),
+                                        last_message_id: d["last_message_id"].as_str().map(|s| s.to_string()),
                                     }));
                                 }
                             }

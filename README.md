@@ -43,7 +43,7 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 231 tests (230 + measurement)
+cargo test --release                                        # 234 tests (233 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -73,7 +73,9 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   via a modal (Esc or backdrop cancels).
 - **Unread and mentions**: channels accumulate unread badges; a ping turns the
   row bold with a red `@n` count; servers aggregate over their channels. Opening
-  a channel clears its badge and sends a best-effort read receipt.
+  a channel clears its badge and sends a best-effort read receipt. Badges are
+  restored from Discord's `read_state` on login: mention counts exactly, other
+  channels as a `•` dot when newer than the last read id.
 - **Channel categories and announcements**: guild channels are grouped under
   collapsible category headers (uncategorized channels at the top, children by
   position); announcement channels show a 📢 marker. Voice channels are listed

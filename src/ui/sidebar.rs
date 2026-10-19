@@ -188,17 +188,20 @@ impl App {
         };
         let is_sel = self.selected_channel == Some(i);
         let (unread, mentions) = self.channel_badge(&ch.id);
+        let dot = unread == 0 && mentions == 0 && self.unread_dot.contains(&ch.id);
         let label = if mentions > 0 {
             format!("{} {}  @{}", prefix, ch.name, mentions)
         } else if unread > 0 {
             format!("{} {}  ({})", prefix, ch.name, unread)
+        } else if dot {
+            format!("{} {}  •", prefix, ch.name)
         } else {
             format!("{} {}", prefix, ch.name)
         };
         let mut text = RichText::new(&label).size(14.0);
         text = if is_sel || mentions > 0 {
             text.color(Color32::WHITE).strong()
-        } else if unread > 0 {
+        } else if unread > 0 || dot {
             text.color(self.theme.text)
         } else {
             text.color(self.theme.text_secondary)
@@ -354,17 +357,20 @@ impl App {
                                         .map(|c| c.id == cid)
                                         .unwrap_or(false);
                                     let (unread, mentions) = self.channel_badge(&cid);
+                                    let dot = unread == 0 && mentions == 0 && self.unread_dot.contains(&cid);
                                     let label = if mentions > 0 {
                                         format!("{}  @{}", cname, mentions)
                                     } else if unread > 0 {
                                         format!("{}  ({})", cname, unread)
+                                    } else if dot {
+                                        format!("{}  •", cname)
                                     } else {
                                         cname.clone()
                                     };
                                     let mut text = RichText::new(&label).size(14.0);
                                     text = if is_sel || mentions > 0 {
                                         text.color(Color32::WHITE).strong()
-                                    } else if unread > 0 {
+                                    } else if unread > 0 || dot {
                                         text.color(self.theme.text)
                                     } else {
                                         text.color(self.theme.text_secondary)
@@ -513,6 +519,7 @@ mod tests {
                 topic: None,
                 position: i,
                 parent_id: None,
+                last_message_id: None,
             });
         }
         app.selected_guild = Some(0);

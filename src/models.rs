@@ -237,6 +237,9 @@ pub(crate) struct ChatChannel {
     pub(crate) position: i32,
     /// Category (type 4) this channel sits under; `None` for top-level and DMs.
     pub(crate) parent_id: Option<String>,
+    /// Newest message id known for the channel, from Discord; used to compute
+    /// unread state against `read_state` on startup.
+    pub(crate) last_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

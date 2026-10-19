@@ -123,6 +123,7 @@ fn last_channel_is_restored_when_known() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.settings.last_channel = Some("c7".into());
 
@@ -161,6 +162,7 @@ fn unknown_last_channel_falls_back_to_default() {
         topic: None,
         position: 0,
         parent_id: None,
+        last_message_id: None,
     });
     app.settings.last_channel = Some("gone".into());
 

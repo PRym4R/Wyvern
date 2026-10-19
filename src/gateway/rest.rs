@@ -331,6 +331,7 @@ pub(super) async fn open_dm(
                 topic: None,
                 position: 0,
                 parent_id: None,
+                last_message_id: None,
             }));
         }
         Err(e) => {
