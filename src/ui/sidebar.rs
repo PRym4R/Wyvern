@@ -340,9 +340,9 @@ impl App {
                             ui.label(RichText::new("DMs").strong().size(15.0).color(self.theme.text));
                             ui.add_space(4.0);
                             ui.separator();
-                            let dm_count = self.channels.len();
+                            let dm_order = self.dm_indices();
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for i in 0..dm_count {
+                                for i in dm_order {
                                     let (cid, cname) = match self.channels.get(i) {
                                         Some(ch)
                                             if ch.guild_id.is_none()

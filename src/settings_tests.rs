@@ -114,6 +114,27 @@ fn reopening_the_same_channel_keeps_the_text() {
 #[test]
 fn last_channel_is_restored_when_known() {
     let mut app = offline_app();
+    app.channels.push(ChatChannel {
+        id: "c7".into(),
+        name: "dm".into(),
+        guild_id: None,
+        channel_type: 1,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: None,
+    });
+    app.settings.last_channel = Some("c7".into());
+
+    assert!(app.restore_last_channel(), "ЛС из настроек должна восстанавливаться");
+    assert_eq!(app.selected_channel, Some(0));
+    assert_eq!(app.selected_guild, None);
+    assert_eq!(app.current_channel_id(), Some("c7"));
+}
+
+#[test]
+fn guild_channel_is_not_restored_on_startup() {
+    let mut app = offline_app();
     app.guilds.push(Guild { id: "g1".into(), name: "G".into(), icon: None });
     app.channels.push(ChatChannel {
         id: "c7".into(),
@@ -127,10 +148,9 @@ fn last_channel_is_restored_when_known() {
     });
     app.settings.last_channel = Some("c7".into());
 
-    assert!(app.restore_last_channel(), "канал из настроек должен восстанавливаться");
-    assert_eq!(app.selected_channel, Some(0));
-    assert_eq!(app.selected_guild, Some(0));
-    assert_eq!(app.current_channel_id(), Some("c7"));
+    assert!(!app.restore_last_channel(), "запуск не должен открывать серверный канал");
+    assert_eq!(app.selected_channel, None);
+    assert_eq!(app.selected_guild, None);
 }
 
 #[test]

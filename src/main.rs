@@ -15,6 +15,7 @@ mod gateway;
 mod media;
 mod messages;
 mod models;
+mod net;
 mod settings;
 mod ui;
 mod util;

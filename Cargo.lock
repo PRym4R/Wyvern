@@ -5035,6 +5035,7 @@ dependencies = [
  "futures-util",
  "image",
  "mimalloc",
+ "native-tls",
  "pbkdf2",
  "rand 0.8.8",
  "reqwest",
@@ -5042,6 +5043,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-native-tls",
  "tokio-tungstenite",
 ]
 

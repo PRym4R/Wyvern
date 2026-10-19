@@ -2276,3 +2276,133 @@ fn ready_read_caught_up_has_no_dot() {
     app.apply_ready_read("cc");
     assert!(!app.unread_dot.contains("cc"), "прочитано — точки нет");
 }
+
+#[test]
+fn dm_indices_sorts_by_activity() {
+    let mut app = make_app();
+    app.channels.clear();
+    for (id, last) in [("a", "100"), ("b", "300"), ("c", "200")] {
+        app.channels.push(ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            guild_id: None,
+            channel_type: 1,
+            topic: None,
+            position: 0,
+            parent_id: None,
+            last_message_id: Some(last.into()),
+        });
+    }
+    let order: Vec<&str> = app.dm_indices().iter().map(|&i| app.channels[i].id.as_str()).collect();
+    assert_eq!(order, vec!["b", "c", "a"], "свежие ЛС должны быть выше");
+}
+
+#[test]
+fn dm_indices_excludes_guilds_and_idle_last() {
+    let mut app = make_app();
+    app.channels.clear();
+    app.channels.push(ChatChannel {
+        id: "g".into(),
+        name: "g".into(),
+        guild_id: Some("srv".into()),
+        channel_type: 0,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: Some("999".into()),
+    });
+    app.channels.push(ChatChannel {
+        id: "idle".into(),
+        name: "idle".into(),
+        guild_id: None,
+        channel_type: 1,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: None,
+    });
+    app.channels.push(ChatChannel {
+        id: "hot".into(),
+        name: "hot".into(),
+        guild_id: None,
+        channel_type: 3,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: Some("500".into()),
+    });
+    let order: Vec<&str> = app.dm_indices().iter().map(|&i| app.channels[i].id.as_str()).collect();
+    assert_eq!(order, vec!["hot", "idle"], "сервер исключён, без активности — в конце");
+}
+
+#[test]
+fn touch_activity_keeps_newest() {
+    let mut app = make_app();
+    app.channels.clear();
+    add_channel(&mut app, "cc", Some("100"));
+    app.touch_activity("cc", "50");
+    assert_eq!(app.channels[0].last_message_id.as_deref(), Some("100"), "старое не перетирает новое");
+    app.touch_activity("cc", "200");
+    assert_eq!(app.channels[0].last_message_id.as_deref(), Some("200"), "новое обновляет");
+    app.touch_activity("cc", "");
+    assert_eq!(app.channels[0].last_message_id.as_deref(), Some("200"), "пустой id игнорируется");
+}
+
+#[test]
+fn autoselect_prefers_dms_over_servers() {
+    let mut app = make_app();
+    app.channels.clear();
+    app.channels.push(ChatChannel {
+        id: "srv-chan".into(),
+        name: "general".into(),
+        guild_id: Some("g1".into()),
+        channel_type: 0,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: Some("10".into()),
+    });
+    app.channels.push(ChatChannel {
+        id: "dm1".into(),
+        name: "friend".into(),
+        guild_id: None,
+        channel_type: 1,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: Some("20".into()),
+    });
+    app.autoselected = false;
+    app.selected_guild = None;
+    app.selected_channel = None;
+
+    app.maybe_autoselect();
+
+    let sel = app.selected_channel.expect("должна выбраться ЛС");
+    assert!(app.channels[sel].guild_id.is_none(), "на старте открываем ЛС, а не сервер");
+    assert_eq!(app.channels[sel].id, "dm1");
+}
+
+#[test]
+fn autoselect_waits_without_dms() {
+    let mut app = make_app();
+    app.channels.clear();
+    app.channels.push(ChatChannel {
+        id: "srv-chan".into(),
+        name: "general".into(),
+        guild_id: Some("g1".into()),
+        channel_type: 0,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: Some("10".into()),
+    });
+    app.autoselected = false;
+    app.selected_guild = None;
+    app.selected_channel = None;
+
+    app.maybe_autoselect();
+
+    assert!(app.selected_channel.is_none(), "без ЛС ничего не открываем");
+    assert!(!app.autoselected, "ждём появления ЛС");
+}

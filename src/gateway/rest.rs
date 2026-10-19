@@ -58,7 +58,7 @@ pub(super) fn api_client() -> Result<reqwest::Client, String> {
 }
 
 pub(crate) fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::net::with_proxy(reqwest::Client::builder())
         .timeout(timeout)
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))

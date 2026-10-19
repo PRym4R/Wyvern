@@ -236,6 +236,8 @@ pub(crate) struct App {
     pub(crate) draft_channel: Option<String>,
     /// Settings window open.
     pub(crate) settings_open: bool,
+    /// Selected section in the settings window's left tab list.
+    pub(crate) settings_section: usize,
     /// Image URLs revealed by click while `blur_media` is on (this session).
     pub(crate) revealed_images: HashSet<String>,
     /// Ids of deleted messages kept in the list (drawn red) when `keep_deleted` is on.
@@ -364,6 +366,7 @@ impl App {
             settings_path: None,
             draft_channel: None,
             settings_open: false,
+            settings_section: 0,
             revealed_images: HashSet::new(),
             deleted_ids: HashSet::new(),
             deleted_store: DeletedStore::default(),
@@ -406,6 +409,7 @@ impl App {
         }
         self.settings = settings;
         self.settings_path = path;
+        crate::net::set_proxy(self.settings.proxy.as_deref().unwrap_or(""));
         self
     }
     /// Attach the on-disk deleted-message store; `None` keeps it read-only.
@@ -528,7 +532,8 @@ impl App {
             }
         }
     }
-    /// Reopen the channel from the previous session if it is already known.
+    /// Reopen the DM from the previous session if it is already known. Guild
+    /// channels are ignored: startup lands on the DM view, not a server.
     pub(crate) fn restore_last_channel(&mut self) -> bool {
         let Some(remembered) = self.settings.last_channel.clone() else {
             return false;
@@ -536,17 +541,38 @@ impl App {
         let Some(idx) = self.channels.iter().position(|c| c.id == remembered) else {
             return false;
         };
-        let guild = self.channels[idx].guild_id.clone();
+        if self.channels[idx].guild_id.is_some() {
+            return false;
+        }
         let name = self.channels[idx].name.clone();
-        self.selected_guild = guild
-            .as_ref()
-            .and_then(|gid| self.guilds.iter().position(|g| &g.id == gid));
+        self.selected_guild = None;
         self.selected_channel = Some(idx);
+        self.show_friends = false;
         self.autoselected = true;
         self.scroll_to_bottom = true;
         self.open_channel(&remembered);
         self.push_debug(format!("Restored last channel {}", name));
         true
+    }
+
+    /// Picks what to show once channels start arriving: the remembered DM, the
+    /// most recent DM, or nothing (staying on the DM/home view). Never opens a
+    /// server on its own.
+    pub(crate) fn maybe_autoselect(&mut self) {
+        if self.autoselected || self.selected_guild.is_some() || self.selected_channel.is_some() {
+            return;
+        }
+        if self.restore_last_channel() {
+            return;
+        }
+        self.show_friends = false;
+        if let Some(&idx) = self.dm_indices().first() {
+            self.selected_channel = Some(idx);
+            let cid = self.channels[idx].id.clone();
+            self.open_channel(&cid);
+            self.autoselected = true;
+        }
+        // With no DMs yet, wait for the next channel event.
     }
     /// Remember the window size each frame so the next launch can reuse it.
     fn remember_window(&mut self, ctx: &egui::Context) {
@@ -613,11 +639,15 @@ impl App {
                     }
                     self.push_debug("READY received!".into());
                 }
-                // Live messages for a channel that isn't open have nowhere to go; open_channel reloads its history anyway.
-                ToApp::Message(_msg) if self.current_channel_id() != Some(_msg.channel_id.as_str()) => {
+                // Live messages for a channel that isn't open aren't stored (memory),
+                // but still count toward unread and the DM activity order.
+                ToApp::Message(msg) if self.current_channel_id() != Some(msg.channel_id.as_str()) => {
+                    self.note_unread(&msg);
+                    self.touch_activity(&msg.channel_id, &msg.id);
                 }
                 ToApp::Message(msg) => {
                     let cid = msg.channel_id.clone();
+                    let mid = msg.id.clone();
                     // A message can arrive both live and in a history page; a duplicate would render twice.
                     let duplicate = !msg.id.is_empty()
                         && self.messages.get(&cid).is_some_and(|e| {
@@ -634,7 +664,7 @@ impl App {
                                 self.notify_desktop(&msg);
                             }
                             self.note_unread(&msg);
-                            let entry = self.messages.entry(cid).or_default();
+                            let entry = self.messages.entry(cid.clone()).or_default();
                             entry.push(Arc::new(msg));
                             // A new own message while viewing the newest: drop the oldest.
                             trim_messages(entry, true);
@@ -644,6 +674,7 @@ impl App {
                             self.scroll_to_bottom = true;
                         }
                     }
+                    self.touch_activity(&cid, &mid);
                 }
                 ToApp::MessageUpdated(msg) => self.update_message(msg),
                 ToApp::MessageDeleted { channel_id, message_id } => {
@@ -678,6 +709,7 @@ impl App {
                         self.channels.push(ch);
                     }
                     self.apply_ready_read(&id);
+                    self.maybe_autoselect();
                 }
                 ToApp::GuildChannels { guild_id, channels } => {
                     let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
@@ -691,29 +723,7 @@ impl App {
                         self.push_debug(format!("Guild {}: +{} channels", guild_id, self.channels.len() - before));
                     }
 
-                    if !self.autoselected && self.selected_guild.is_none() && self.selected_channel.is_none() && !self.channels.is_empty() && !self.restore_last_channel() {
-                        let guild_idx = self.guilds.iter().position(|g| g.id == guild_id)
-                            .or_else(|| self.guilds.iter().position(|g| {
-                                self.channels.iter().any(|c| c.guild_id.as_deref() == Some(g.id.as_str()))
-                            }))
-                            .unwrap_or(0);
-                        self.selected_guild = Some(guild_idx);
-                        self.autoselected = true;
-
-                        let gid = self.guilds.get(guild_idx).map(|g| g.id.clone());
-                        if let Some(gid) = gid {
-                            let chan_idx = self.channels.iter().position(|c| {
-                                c.guild_id.as_deref() == Some(gid.as_str())
-                                    && matches!(c.channel_type, 0 | 5)
-                            });
-                            if let Some(chan_idx) = chan_idx {
-                                self.selected_channel = Some(chan_idx);
-                                let cid = self.channels[chan_idx].id.clone();
-                                self.open_channel(&cid);
-                                self.push_debug(format!("Auto-selected channel {}", self.channels[chan_idx].name));
-                            }
-                        }
-                    }
+                    self.maybe_autoselect();
                     for id in ids {
                         self.apply_ready_read(&id);
                     }
@@ -1331,6 +1341,20 @@ impl App {
         }
     }
 
+    /// Records a channel's newest message id so the DM list can order by activity.
+    pub(crate) fn touch_activity(&mut self, channel_id: &str, message_id: &str) {
+        if message_id.is_empty() {
+            return;
+        }
+        let newest = message_id.parse::<u128>().unwrap_or(0);
+        if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+            let current = ch.last_message_id.as_deref().unwrap_or("").parse::<u128>().unwrap_or(0);
+            if newest > current {
+                ch.last_message_id = Some(message_id.to_string());
+            }
+        }
+    }
+
     /// Clears a channel's local badge and tells Discord it was read up to its
     /// newest message. The network call is best-effort.
     pub(crate) fn ack_channel(&mut self, channel_id: &str) {
@@ -1367,6 +1391,16 @@ impl App {
             return;
         }
         let Some(state) = self.ready_read.get(channel_id).cloned() else { return };
+        // When Discord didn't give the channel a newest id, use the read
+        // position as a baseline so DM ordering still has something to sort on.
+        if let Some(read_last) = state.last_message_id.clone() {
+            if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
+                let current = ch.last_message_id.as_deref().unwrap_or("").parse::<u128>().unwrap_or(0);
+                if read_last.parse::<u128>().unwrap_or(0) > current {
+                    ch.last_message_id = Some(read_last);
+                }
+            }
+        }
         if state.mention_count > 0 {
             let cur = self.unread.get(channel_id).copied().unwrap_or(0);
             self.unread.insert(channel_id.to_string(), cur.max(state.mention_count));
@@ -1450,6 +1484,33 @@ impl App {
             })
             .collect();
         (loose, groups)
+    }
+
+    /// DM and group-DM channel indices, most recent activity first (by the
+    /// channel's newest message id), ties broken by name. Channels with no
+    /// known activity sort last.
+    pub(crate) fn dm_indices(&self) -> Vec<usize> {
+        let key = |i: usize| {
+            self.channels[i]
+                .last_message_id
+                .as_deref()
+                .unwrap_or("")
+                .parse::<u128>()
+                .unwrap_or(0)
+        };
+        let mut idx: Vec<usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.guild_id.is_none() && matches!(c.channel_type, 1 | 3))
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|&a, &b| {
+            key(b)
+                .cmp(&key(a))
+                .then_with(|| self.channels[a].name.cmp(&self.channels[b].name))
+        });
+        idx
     }
 
     /// Takes the open channel's messages for the frame so rendering owns the Vec and

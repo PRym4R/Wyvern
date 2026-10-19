@@ -43,7 +43,7 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 234 tests (233 + measurement)
+cargo test --release                                        # 243 tests (242 + measurement)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 ```
 
@@ -80,6 +80,15 @@ cargo test --release -- --ignored --nocapture memcheck       # memory measuremen
   collapsible category headers (uncategorized channels at the top, children by
   position); announcement channels show a 📢 marker. Voice channels are listed
   greyed out with 🔊 but stay inert, since the client doesn't connect to voice.
+- **DM ordering and proxy**: the DM list is ordered by the newest message
+  (most recent first) instead of alphabetically. A proxy URL (http, https or
+  socks5) can be set in Settings; it applies to API/media requests immediately
+  and to the gateway on its next connection.
+- **Settings window and startup**: Settings is a full-client overlay with
+  vertical tabs (Theme, Interface, Media, History, Network, Advanced). The app
+  now opens on the DM/home view and selects the most recent conversation,
+  instead of an arbitrary server; the remembered channel is only restored when
+  it is a DM.
 
 ## 0.7.0 — 2026-10-18
 

@@ -7,8 +7,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_tungstenite::connect_async;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{client_async, connect_async};
+use tokio_tungstenite::MaybeTlsStream;
 
 use crate::messages::{ReadState, ToApp, ToGateway};
 use crate::models::{ChatChannel, Guild};
@@ -304,6 +308,140 @@ fn identify_payload(token: &str) -> serde_json::Value {
     })
 }
 
+/// A parsed proxy URL: scheme, authority and optional basic-auth credentials.
+struct ProxySpec {
+    scheme: String,
+    host: String,
+    port: u16,
+    auth: Option<(String, String)>,
+}
+
+fn parse_proxy(url: &str) -> Result<ProxySpec, Box<dyn std::error::Error>> {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s.to_lowercase(), r),
+        None => ("http".to_string(), url),
+    };
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((u, h)) => (Some(u.to_string()), h.to_string()),
+        None => (None, rest.to_string()),
+    };
+    let hostport = hostport.trim_end_matches('/').to_string();
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse::<u16>()?),
+        _ => (hostport, default_proxy_port(&scheme)),
+    };
+    let auth = userinfo
+        .and_then(|u| u.split_once(':').map(|(a, b)| (a.to_string(), b.to_string())));
+    Ok(ProxySpec { scheme, host, port, auth })
+}
+
+fn default_proxy_port(scheme: &str) -> u16 {
+    match scheme {
+        "https" => 443,
+        "socks5" | "socks5h" | "socks" => 1080,
+        _ => 8080,
+    }
+}
+
+/// Opens the gateway socket, tunnelling through the proxy when one is set.
+async fn connect_gateway(
+    proxy: Option<&str>,
+) -> Result<tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error>> {
+    let Some(url) = proxy.filter(|p| !p.trim().is_empty()) else {
+        let (ws, _) = connect_async(GATEWAY_URL).await?;
+        return Ok(ws);
+    };
+    let spec = parse_proxy(url)?;
+    let host = "gateway.discord.gg";
+    let port = 443u16;
+    let stream = match spec.scheme.as_str() {
+        "socks5" | "socks5h" | "socks" => socks5_connect(&spec, host, port).await?,
+        _ => http_connect(&spec, host, port).await?,
+    };
+    let connector = tokio_native_tls::TlsConnector::from(native_tls::TlsConnector::new()?);
+    let tls = connector.connect(host, stream).await?;
+    let request = GATEWAY_URL.into_client_request()?;
+    let (ws, _) = client_async(request, MaybeTlsStream::NativeTls(tls)).await?;
+    Ok(ws)
+}
+
+/// Establishes a TCP tunnel to `host:port` through an HTTP proxy (CONNECT).
+async fn http_connect(
+    spec: &ProxySpec,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect((spec.host.as_str(), spec.port)).await?;
+    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some((user, pass)) = &spec.auth {
+        use base64::Engine as _;
+        let cred = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        req.push_str(&format!("Proxy-Authorization: Basic {cred}\r\n"));
+    }
+    req.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            return Err("proxy closed during CONNECT".into());
+        }
+        buf.push(byte[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 16384 {
+            return Err("proxy CONNECT response too long".into());
+        }
+    }
+    let status = String::from_utf8_lossy(&buf);
+    let line = status.lines().next().unwrap_or("");
+    if !line.contains(" 200") {
+        return Err(format!("proxy CONNECT rejected: {line}").into());
+    }
+    Ok(stream)
+}
+
+/// Establishes a TCP tunnel to `host:port` through a SOCKS5 proxy (no auth).
+async fn socks5_connect(
+    spec: &ProxySpec,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect((spec.host.as_str(), spec.port)).await?;
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting[0] != 0x05 || greeting[1] != 0x00 {
+        return Err("socks5: proxy requires authentication".into());
+    }
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await?;
+
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head).await?;
+    if head[1] != 0x00 {
+        return Err(format!("socks5: connect failed, code {}", head[1]).into());
+    }
+    let skip = match head[3] {
+        0x01 => 4 + 2,
+        0x04 => 16 + 2,
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            len[0] as usize + 2
+        }
+        _ => return Err("socks5: bad address type".into()),
+    };
+    let mut discard = vec![0u8; skip];
+    stream.read_exact(&mut discard).await?;
+    Ok(stream)
+}
+
 async fn gw_inner(
     cmd_rx: &mut mpsc::UnboundedReceiver<ToGateway>,
     event_tx: EventTx,
@@ -318,7 +456,8 @@ async fn gw_inner(
         let _ = event_tx.send(ToApp::Debug("Connecting to gateway...".into()));
     }
 
-    let (ws_stream, _) = connect_async(GATEWAY_URL).await?;
+    let proxy = crate::net::proxy();
+    let ws_stream = connect_gateway(proxy.as_deref()).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let hello = read.next().await.ok_or("no hello")??;
@@ -913,3 +1052,34 @@ async fn gw_inner(
 
 #[cfg(test)]
 include!("gateway_tests.rs");
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn parse_proxy_reads_host_and_port() {
+        let s = parse_proxy("http://127.0.0.1:8080").unwrap();
+        assert_eq!(s.scheme, "http");
+        assert_eq!(s.host, "127.0.0.1");
+        assert_eq!(s.port, 8080);
+        assert!(s.auth.is_none());
+    }
+
+    #[test]
+    fn parse_proxy_reads_scheme_auth_and_default_port() {
+        let s = parse_proxy("socks5://user:pass@proxy.local").unwrap();
+        assert_eq!(s.scheme, "socks5");
+        assert_eq!(s.host, "proxy.local");
+        assert_eq!(s.port, 1080);
+        assert_eq!(s.auth, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn parse_proxy_without_scheme_is_http() {
+        let s = parse_proxy("127.0.0.1:3128").unwrap();
+        assert_eq!(s.scheme, "http");
+        assert_eq!(s.host, "127.0.0.1");
+        assert_eq!(s.port, 3128);
+    }
+}

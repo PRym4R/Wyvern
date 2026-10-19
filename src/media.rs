@@ -52,7 +52,7 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
 fn http() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
+        crate::net::with_proxy_blocking(reqwest::blocking::Client::builder())
             .timeout(Duration::from_secs(20))
             .pool_max_idle_per_host(8)
             .build()

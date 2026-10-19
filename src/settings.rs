@@ -25,6 +25,8 @@ pub(crate) struct Settings {
     pub(crate) notifications: bool,
     /// Keep deleted messages in the list, drawn in red, instead of removing them.
     pub(crate) keep_deleted: bool,
+    /// Outbound proxy URL (http/https/socks5); empty or absent means direct.
+    pub(crate) proxy: Option<String>,
 }
 
 impl Settings {
