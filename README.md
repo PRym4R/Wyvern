@@ -39,15 +39,17 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 | `src/ui/*` | screens: login, sidebar, chat, attachments, input, overlays, settings |
 | `src/crypto.rs` | account vault encryption |
 | `src/ss.rs` | native Shadowsocks (SIP002 parsing, AEAD ciphers, stream) |
-| `src/ssbridge.rs` | loopback SOCKS5 bridge that terminates an `ss://` proxy |
+| `src/vless.rs` | native VLESS (TLS + WebSocket/TCP, lazy response stripping) |
+| `src/proxybridge.rs` | loopback SOCKS5 bridge that terminates `ss://` / `vless://` |
 | `src/memcheck.rs` | memory and allocation measurement (test with `--ignored`) |
 
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 256 tests (254 + 2 ignored)
+cargo test --release                                        # 263 tests (260 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
+WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke
 ```
 
 ---
@@ -64,6 +66,11 @@ WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_prox
   form), runs an `aes-128/256-gcm` / `chacha20-ietf-poly1305` AEAD client, and
   exposes a loopback SOCKS5 bridge so API, media and gateway traffic all flow
   through the server. No external core binary is required.
+- **Native VLESS**: `vless://` links (TLS + WebSocket or TCP; Reality/XTLS are
+  rejected with a clear message) are terminated the same way, including a pasted
+  link imported straight into the form. Targets are resolved locally so servers
+  with broken outbound DNS still work, and the response header is stripped lazily
+  during pumping.
 
 ## 0.8.0 — 2026-10-18
 

@@ -2,7 +2,7 @@
 //!
 //! We implement the client half of the Shadowsocks AEAD protocol in Rust so no
 //! external core binary is needed: a `ss://` proxy is terminated locally by
-//! [`crate::ssbridge`], which speaks SOCKS5 to the rest of the app and forwards
+//! [`crate::proxybridge`], which speaks SOCKS5 to the rest of the app and forwards
 //! each connection through [`connect`] here.
 //!
 //! Supported ciphers (the ones free providers actually hand out):
@@ -54,7 +54,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Percent-decodes `%XX` sequences; invalid escapes are kept verbatim.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let hex = |b: u8| match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
@@ -456,7 +456,7 @@ mod tests {
         let Ok(url) = std::env::var("WYVERN_SS_URL") else {
             return;
         };
-        let proxy = crate::ssbridge::resolve_proxy(&url);
+        let proxy = crate::proxybridge::resolve_proxy(&url);
         assert!(proxy.starts_with("socks5h://"), "bridge not started: {proxy}");
         let client = reqwest::blocking::Client::builder()
             .proxy(reqwest::Proxy::all(&proxy).unwrap())
@@ -469,6 +469,6 @@ mod tests {
             "unexpected body: {:.120}",
             body
         );
-        crate::ssbridge::stop();
+        crate::proxybridge::stop();
     }
 }

@@ -2436,3 +2436,35 @@ fn proxy_form_http_without_port() {
     assert_eq!(host, "proxy.local");
     assert!(port.is_empty());
 }
+
+#[test]
+fn proxy_kind_maps_vless() {
+    assert_eq!(proxy_kind_index("vless"), 4);
+    assert_eq!(proxy_kind_scheme(4), "vless");
+}
+
+#[test]
+fn proxy_form_parses_vless_link() {
+    let link =
+        "vless://e579c385-15fd-4900-8e6c-e0a55fb14d19@uk5.example.org:8443?security=tls&type=ws&path=/x";
+    let (kind, host, port, user, pass) = parse_proxy_fields(link);
+    assert_eq!(kind, 4, "vless");
+    assert_eq!(host, "uk5.example.org");
+    assert_eq!(port, "8443");
+    assert!(user.is_empty(), "у vless нет логина");
+    assert!(pass.is_empty(), "у vless нет пароля");
+}
+
+#[test]
+fn proxy_form_loads_vless_link_verbatim() {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    let link =
+        "vless://e579c385-15fd-4900-8e6c-e0a55fb14d19@uk5.example.org:8443?security=tls&type=ws&path=/x";
+    app.settings.proxy = Some(link.to_string());
+    app.load_proxy_form();
+    assert_eq!(app.proxy_kind, 4, "тип распознан как vless");
+    assert_eq!(app.proxy_host, "uk5.example.org");
+    assert_eq!(app.proxy_port, "8443");
+    assert_eq!(app.proxy_link, link, "ссылка сохраняется целиком для round-trip");
+}

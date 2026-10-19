@@ -7,7 +7,7 @@ use crate::settings::Settings;
 const SECTIONS: [&str; 6] = ["Theme", "Interface", "Media", "History", "Network", "Advanced"];
 
 /// Proxy kinds for the Network tab dropdown.
-const PROXY_KINDS: [&str; 4] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadowsocks"];
+const PROXY_KINDS: [&str; 5] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadowsocks", "VLESS"];
 
 impl crate::app::App {
     /// Settings window: a full-client overlay with tabs down the left.
@@ -162,7 +162,7 @@ impl crate::app::App {
                     .show(ui, |ui| {
                         ui.label("Type");
                         egui::ComboBox::from_id_salt("proxy_kind")
-                            .selected_text(PROXY_KINDS[self.proxy_kind.min(3)])
+                            .selected_text(PROXY_KINDS[self.proxy_kind.min(4)])
                             .show_ui(ui, |ui| {
                                 for (i, label) in PROXY_KINDS.iter().enumerate() {
                                     changed |= ui
@@ -193,36 +193,39 @@ impl crate::app::App {
                         ui.end_row();
 
                         let ss = self.proxy_kind == 3;
-                        ui.label(if ss { "Method" } else { "Username" });
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.proxy_user)
-                                .hint_text(if ss {
-                                    "e.g. chacha20-ietf-poly1305"
-                                } else {
-                                    "optional"
-                                })
-                                .desired_width(320.0),
-                        );
-                        changed |= r.changed();
-                        commit |= r.lost_focus();
-                        ui.end_row();
+                        let vless = self.proxy_kind == 4;
+                        if !vless {
+                            ui.label(if ss { "Method" } else { "Username" });
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.proxy_user)
+                                    .hint_text(if ss {
+                                        "e.g. chacha20-ietf-poly1305"
+                                    } else {
+                                        "optional"
+                                    })
+                                    .desired_width(320.0),
+                            );
+                            changed |= r.changed();
+                            commit |= r.lost_focus();
+                            ui.end_row();
 
-                        ui.label("Password");
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.proxy_pass)
-                                .hint_text(if ss { "required" } else { "optional" })
-                                .password(true)
-                                .desired_width(320.0),
-                        );
-                        changed |= r.changed();
-                        commit |= r.lost_focus();
-                        ui.end_row();
+                            ui.label("Password");
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.proxy_pass)
+                                    .hint_text(if ss { "required" } else { "optional" })
+                                    .password(true)
+                                    .desired_width(320.0),
+                            );
+                            changed |= r.changed();
+                            commit |= r.lost_focus();
+                            ui.end_row();
+                        }
 
-                        ui.label("ss:// link");
+                        ui.label("Link");
                         ui.horizontal(|ui| {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.proxy_link)
-                                    .hint_text("paste an ss:// link to fill the fields")
+                                    .hint_text("paste an ss:// or vless:// link to fill the fields")
                                     .desired_width(250.0),
                             );
                             if ui.button("Import").clicked()
@@ -263,10 +266,11 @@ impl crate::app::App {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "HTTP, SOCKS5 (with optional username/password) and Shadowsocks \
-                         (aes-128/256-gcm, chacha20-ietf-poly1305) are supported. API and media \
-                         requests use it right away; the gateway reconnects to switch. Shadowsocks \
-                         runs natively — paste an ss:// link above to fill the fields.",
+                        "HTTP, SOCKS5 (with optional username/password), Shadowsocks \
+                         (aes-128/256-gcm, chacha20-ietf-poly1305) and VLESS (TLS + WebSocket/TCP) \
+                         are supported. API and media requests use it right away; the gateway \
+                         reconnects to switch. Shadowsocks and VLESS run natively — paste an \
+                         ss:// or vless:// link above to fill the fields.",
                     )
                     .size(11.0)
                     .color(self.theme.text_secondary),

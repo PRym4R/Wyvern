@@ -54,12 +54,13 @@ fn snowflake_gt(a: &str, b: &str) -> bool {
 }
 
 /// Form index for a proxy scheme: 0 HTTP, 1 SOCKS5, 2 SOCKS5 (remote DNS),
-/// 3 Shadowsocks.
+/// 3 Shadowsocks, 4 VLESS.
 fn proxy_kind_index(scheme: &str) -> usize {
     match scheme.to_lowercase().as_str() {
         "socks5" => 1,
         "socks5h" | "socks" => 2,
         "ss" => 3,
+        "vless" => 4,
         _ => 0,
     }
 }
@@ -69,6 +70,7 @@ fn proxy_kind_scheme(kind: usize) -> &'static str {
         1 => "socks5",
         2 => "socks5h",
         3 => "ss",
+        4 => "vless",
         _ => "http",
     }
 }
@@ -85,6 +87,13 @@ fn parse_proxy_fields(url: &str) -> (usize, String, String, String, String) {
     if scheme.eq_ignore_ascii_case("ss") {
         if let Ok(s) = crate::ss::parse_url(trimmed) {
             return (3, s.host, s.port.to_string(), s.method, s.password);
+        }
+    }
+    // VLESS links carry credentials and transport options, so keep the raw link
+    // as the source of truth and only mirror host/port into the form.
+    if scheme.eq_ignore_ascii_case("vless") {
+        if let Ok(c) = crate::vless::parse_url(trimmed) {
+            return (4, c.host, c.port.to_string(), String::new(), String::new());
         }
     }
     let (userinfo, hostport) = match rest.rsplit_once('@') {
@@ -535,7 +544,7 @@ impl App {
         self.settings = settings;
         self.settings_path = path;
         self.load_proxy_form();
-        let effective = crate::ssbridge::resolve_proxy(self.settings.proxy.as_deref().unwrap_or(""));
+        let effective = crate::proxybridge::resolve_proxy(self.settings.proxy.as_deref().unwrap_or(""));
         crate::net::set_proxy(&effective);
         self
     }
@@ -547,13 +556,15 @@ impl App {
     }
     /// Fill the proxy form fields from the saved proxy URL.
     pub(crate) fn load_proxy_form(&mut self) {
-        let (kind, host, port, user, pass) =
-            parse_proxy_fields(self.settings.proxy.as_deref().unwrap_or(""));
+        let saved = self.settings.proxy.clone().unwrap_or_default();
+        let (kind, host, port, user, pass) = parse_proxy_fields(&saved);
         self.proxy_kind = kind;
         self.proxy_host = host;
         self.proxy_port = port;
         self.proxy_user = user;
         self.proxy_pass = pass;
+        // VLESS keeps its raw link so the query options survive a round-trip.
+        self.proxy_link = if kind == 4 { saved.trim().to_string() } else { String::new() };
     }
     /// Recompose the proxy URL from the form, apply it and persist.
     pub(crate) fn apply_proxy_form(&mut self) {
@@ -562,22 +573,42 @@ impl App {
     }
     /// Apply the form to the running client without touching disk (per keystroke).
     pub(crate) fn apply_proxy_form_live(&mut self) {
-        let url = compose_proxy(
-            self.proxy_kind,
-            &self.proxy_host,
-            &self.proxy_port,
-            &self.proxy_user,
-            &self.proxy_pass,
-        );
-        let effective = crate::ssbridge::resolve_proxy(url.as_deref().unwrap_or(""));
+        let url = if self.proxy_kind == 4 {
+            let link = self.proxy_link.trim();
+            (!link.is_empty()).then(|| link.to_string())
+        } else {
+            compose_proxy(
+                self.proxy_kind,
+                &self.proxy_host,
+                &self.proxy_port,
+                &self.proxy_user,
+                &self.proxy_pass,
+            )
+        };
+        let effective = crate::proxybridge::resolve_proxy(url.as_deref().unwrap_or(""));
         crate::net::set_proxy(&effective);
         self.settings.proxy = url;
     }
-    /// Imports a pasted `ss://` link into the proxy form (populating method,
-    /// password, host and port) and applies it.
+    /// Imports a pasted `ss://` or `vless://` link into the proxy form and
+    /// applies it.
     pub(crate) fn import_proxy_link(&mut self) {
         let link = self.proxy_link.trim().to_string();
         if link.is_empty() {
+            return;
+        }
+        if link.to_lowercase().starts_with("vless://") {
+            match crate::vless::parse_url(&link) {
+                Ok(c) => {
+                    self.proxy_kind = 4;
+                    self.proxy_host = c.host;
+                    self.proxy_port = c.port.to_string();
+                    self.proxy_user.clear();
+                    self.proxy_pass.clear();
+                    self.proxy_link = link;
+                    self.apply_proxy_form();
+                }
+                Err(e) => self.push_debug(format!("vless: не удалось разобрать ссылку: {e}")),
+            }
             return;
         }
         match crate::ss::parse_url(&link) {
