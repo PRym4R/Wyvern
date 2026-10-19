@@ -125,8 +125,6 @@ pub(crate) struct App {
     pub(crate) unread: HashMap<String, u32>,
     /// Unread messages that mention us, a subset of `unread`, shown in red.
     pub(crate) mentions: HashMap<String, u32>,
-    /// Category ids whose children are hidden in the sidebar.
-    pub(crate) collapsed_categories: HashSet<String>,
     pub(crate) input: String,
     /// Natural height of the multiline composer, measured last frame; drives the panel height.
     pub(crate) composer_h: f32,
@@ -286,7 +284,6 @@ impl App {
             typing: HashMap::new(),
             unread: HashMap::new(),
             mentions: HashMap::new(),
-            collapsed_categories: HashSet::new(),
             input: String::new(),
             composer_h: 0.0,
             reply_to: None,
@@ -1333,14 +1330,16 @@ impl App {
         (unread, mentions)
     }
 
-    /// Sidebar order for a guild: loose text channels first, then one group per
-    /// category (its channel indices, by position). Channels whose parent is a
-    /// thread rather than a category are left out, as before.
+    /// Sidebar order for a guild: loose text/voice channels first, then one
+    /// group per category (its channel indices, by position). Channels whose
+    /// parent is a thread rather than a category are left out, as before.
     pub(crate) fn guild_channel_layout(
         &self,
         guild_id: &str,
     ) -> (Vec<usize>, Vec<(usize, Vec<usize>)>) {
-        let text_like = |ch: &ChatChannel| matches!(ch.channel_type, 0 | 5);
+        // Text, voice and announcement channels are shown; categories only as
+        // headers.
+        let shown = |ch: &ChatChannel| matches!(ch.channel_type, 0 | 2 | 5);
         let in_guild = |ch: &ChatChannel| ch.guild_id.as_deref() == Some(guild_id);
         let mut loose: Vec<usize> = self
             .channels
@@ -1348,7 +1347,7 @@ impl App {
             .enumerate()
             .filter(|(_, ch)| {
                 in_guild(ch)
-                    && text_like(ch)
+                    && shown(ch)
                     && ch
                         .parent_id
                         .as_deref()
@@ -1375,7 +1374,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter(|(_, ch)| {
-                        in_guild(ch) && text_like(ch) && ch.parent_id.as_deref() == Some(cat_id)
+                        in_guild(ch) && shown(ch) && ch.parent_id.as_deref() == Some(cat_id)
                     })
                     .map(|(i, _)| i)
                     .collect();

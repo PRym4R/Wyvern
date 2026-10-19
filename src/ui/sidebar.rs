@@ -175,11 +175,17 @@ impl App {
                 });
             });
     }
-    /// One text/announcement channel row with its unread badge; opens the
-    /// channel when clicked.
+    /// One channel row with its unread badge. Text and announcement channels
+    /// open on click; a voice channel is shown greyed out and non-clickable
+    /// (we don't connect to voice).
     fn draw_channel_row(&mut self, ui: &mut egui::Ui, i: usize) {
         let Some(ch) = self.channels.get(i) else { return };
-        let prefix = if ch.channel_type == 5 { "📢" } else { "#" };
+        let voice = ch.channel_type == 2;
+        let prefix = match ch.channel_type {
+            2 => "🔊",
+            5 => "📢",
+            _ => "#",
+        };
         let is_sel = self.selected_channel == Some(i);
         let (unread, mentions) = self.channel_badge(&ch.id);
         let label = if mentions > 0 {
@@ -197,11 +203,14 @@ impl App {
         } else {
             text.color(self.theme.text_secondary)
         };
-        let response = ui.add_sized(
-            [ui.available_width(), 32.0],
-            egui::Button::new(text)
-                .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT }),
-        );
+        let button = egui::Button::new(text)
+            .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT });
+        // Voice rows stay visible but inert, so they don't pretend to open.
+        let response = ui
+            .add_enabled_ui(!voice, |ui| {
+                ui.add_sized([ui.available_width(), 32.0], button)
+            })
+            .inner;
         if response.clicked() {
             let cid = ch.id.clone();
             self.selected_channel = Some(i);
@@ -247,28 +256,26 @@ impl App {
                                 self.draw_channel_row(ui, i);
                             }
                             for (ci, kids) in groups {
-                                let Some(cat) = self.channels.get(ci) else { continue };
-                                let collapsed = self.collapsed_categories.contains(&cat.id);
-                                let arrow = if collapsed { "▸" } else { "▾" };
-                                let header = format!("{} {}", arrow, cat.name.to_uppercase());
-                                let resp = ui.add_sized(
-                                    [ui.available_width(), 26.0],
-                                    egui::Button::new(
-                                        RichText::new(header).size(12.0).color(self.theme.text_secondary),
-                                    )
-                                    .fill(Color32::TRANSPARENT),
-                                );
-                                if resp.clicked() {
-                                    let cid = cat.id.clone();
-                                    if !self.collapsed_categories.insert(cid.clone()) {
-                                        self.collapsed_categories.remove(&cid);
-                                    }
-                                }
-                                if !collapsed {
-                                    for i in kids {
-                                        self.draw_channel_row(ui, i);
-                                    }
-                                }
+                                let Some((cat_id, cat_name)) = self
+                                    .channels
+                                    .get(ci)
+                                    .map(|c| (c.id.clone(), c.name.clone()))
+                                else {
+                                    continue;
+                                };
+                                // egui draws the fold triangle itself, so the
+                                // header never depends on a font having a glyph.
+                                let header = RichText::new(cat_name.to_uppercase())
+                                    .size(12.0)
+                                    .color(self.theme.text_secondary);
+                                egui::CollapsingHeader::new(header)
+                                    .id_salt(("category", cat_id))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for i in kids {
+                                            self.draw_channel_row(ui, i);
+                                        }
+                                    });
                             }
                         });
                     }

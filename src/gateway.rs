@@ -521,9 +521,9 @@ async fn gw_inner(
                                                                         let mut channels: Vec<ChatChannel> = Vec::new();
                                                                         for c in arr {
                                                                             let ctype = c["type"].as_i64().unwrap_or(0);
-                                                                            // Text, announcement (5), threads, and the
-                                                                            // categories (4) that group them.
-                                                                            if matches!(ctype, 0 | 4 | 5 | 11 | 12) {
+                                                                            // Text, voice (2), announcement (5), threads,
+                                                                            // and the categories (4) that group them.
+                                                                            if matches!(ctype, 0 | 2 | 4 | 5 | 11 | 12) {
                                                                                 channels.push(ChatChannel {
                                                                                     id: c["id"].as_str().unwrap_or("").to_string(),
                                                                                     name: c["name"].as_str().unwrap_or("unknown").to_string(),

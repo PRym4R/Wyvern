@@ -2187,6 +2187,8 @@ fn channel_layout_nests_text_under_categories() {
     app.channels.push(ch("cat", "Text Channels", 4, 1, None));
     app.channels.push(ch("c1", "chat", 0, 0, Some("cat")));
     app.channels.push(ch("a1", "news", 5, 1, Some("cat")));
+    // Voice channels are shown too, nested with the rest.
+    app.channels.push(ch("v1", "Voice", 2, 2, Some("cat")));
     // A thread's parent is not a category: it must not show up anywhere.
     app.channels.push(ch("thread", "thread", 11, 0, Some("c1")));
     app.channels.push(ch("loose2", "offtopic", 0, 2, None));
@@ -2196,5 +2198,5 @@ fn channel_layout_nests_text_under_categories() {
     assert_eq!(names(&loose), vec!["general", "offtopic"]);
     assert_eq!(groups.len(), 1);
     assert_eq!(app.channels[groups[0].0].name, "Text Channels");
-    assert_eq!(names(&groups[0].1), vec!["chat", "news"]);
+    assert_eq!(names(&groups[0].1), vec!["chat", "news", "Voice"]);
 }
