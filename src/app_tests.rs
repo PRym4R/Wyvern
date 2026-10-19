@@ -2406,3 +2406,33 @@ fn autoselect_waits_without_dms() {
     assert!(app.selected_channel.is_none(), "без ЛС ничего не открываем");
     assert!(!app.autoselected, "ждём появления ЛС");
 }
+
+#[test]
+fn proxy_form_roundtrip() {
+    let url = compose_proxy(1, "127.0.0.1", "1080", "user", "p@ss:word").unwrap();
+    assert_eq!(url, "socks5://user:p%40ss%3Aword@127.0.0.1:1080", "кодируем логин/пароль");
+    let (kind, host, port, user, pass) = parse_proxy_fields(&url);
+    assert_eq!(kind, 1, "socks5");
+    assert_eq!(host, "127.0.0.1");
+    assert_eq!(port, "1080");
+    assert_eq!(user, "user");
+    assert_eq!(pass, "p@ss:word", "пароль декодируется обратно");
+}
+
+#[test]
+fn proxy_form_empty_host_is_direct() {
+    assert!(compose_proxy(0, "  ", "8080", "", "").is_none(), "без хоста — прямое соединение");
+    let (kind, host, _, _, _) = parse_proxy_fields("");
+    assert_eq!(kind, 0);
+    assert!(host.is_empty());
+}
+
+#[test]
+fn proxy_form_http_without_port() {
+    let url = compose_proxy(0, "proxy.local", "", "", "").unwrap();
+    assert_eq!(url, "http://proxy.local", "порт можно не указывать");
+    let (kind, host, port, _, _) = parse_proxy_fields(&url);
+    assert_eq!(kind, 0);
+    assert_eq!(host, "proxy.local");
+    assert!(port.is_empty());
+}

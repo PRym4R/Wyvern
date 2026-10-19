@@ -6,6 +6,9 @@ use crate::settings::Settings;
 /// Tabs shown down the left of the settings window.
 const SECTIONS: [&str; 6] = ["Theme", "Interface", "Media", "History", "Network", "Advanced"];
 
+/// Proxy kinds for the Network tab dropdown.
+const PROXY_KINDS: [&str; 4] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadowsocks"];
+
 impl crate::app::App {
     /// Settings window: a full-client overlay with tabs down the left.
     pub(crate) fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -149,27 +152,121 @@ impl crate::app::App {
             }
             4 => {
                 ui.heading("Network");
-                ui.label("Outbound proxy URL (leave empty for a direct connection).");
-                ui.add_space(4.0);
-                let mut proxy = self.settings.proxy.clone().unwrap_or_default();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut proxy)
-                        .hint_text("http://127.0.0.1:8080 or socks5://127.0.0.1:1080")
-                        .desired_width(420.0),
-                );
-                if resp.changed() {
-                    let trimmed = proxy.trim().to_string();
-                    self.settings.proxy = if trimmed.is_empty() { None } else { Some(trimmed.clone()) };
-                    crate::net::set_proxy(&trimmed);
+                ui.label("Route Discord traffic through a proxy. Leave the host empty for a direct connection.");
+                ui.add_space(6.0);
+                let mut changed = false;
+                let mut commit = false;
+                egui::Grid::new("proxy_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Type");
+                        egui::ComboBox::from_id_salt("proxy_kind")
+                            .selected_text(PROXY_KINDS[self.proxy_kind.min(3)])
+                            .show_ui(ui, |ui| {
+                                for (i, label) in PROXY_KINDS.iter().enumerate() {
+                                    changed |= ui
+                                        .selectable_value(&mut self.proxy_kind, i, *label)
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Host");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.proxy_host)
+                                .hint_text("127.0.0.1 or proxy.example.com")
+                                .desired_width(320.0),
+                        );
+                        changed |= r.changed();
+                        commit |= r.lost_focus();
+                        ui.end_row();
+
+                        ui.label("Port");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.proxy_port)
+                                .hint_text("8080")
+                                .desired_width(120.0),
+                        );
+                        changed |= r.changed();
+                        commit |= r.lost_focus();
+                        ui.end_row();
+
+                        let ss = self.proxy_kind == 3;
+                        ui.label(if ss { "Method" } else { "Username" });
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.proxy_user)
+                                .hint_text(if ss {
+                                    "e.g. chacha20-ietf-poly1305"
+                                } else {
+                                    "optional"
+                                })
+                                .desired_width(320.0),
+                        );
+                        changed |= r.changed();
+                        commit |= r.lost_focus();
+                        ui.end_row();
+
+                        ui.label("Password");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.proxy_pass)
+                                .hint_text(if ss { "required" } else { "optional" })
+                                .password(true)
+                                .desired_width(320.0),
+                        );
+                        changed |= r.changed();
+                        commit |= r.lost_focus();
+                        ui.end_row();
+
+                        ui.label("ss:// link");
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.proxy_link)
+                                    .hint_text("paste an ss:// link to fill the fields")
+                                    .desired_width(250.0),
+                            );
+                            if ui.button("Import").clicked()
+                                || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                self.import_proxy_link();
+                                commit = true;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                if changed {
+                    self.apply_proxy_form_live();
                 }
-                if resp.lost_focus() {
+                if commit {
                     self.write_settings();
                 }
+                if ui.button("Clear proxy").clicked() {
+                    self.proxy_kind = 0;
+                    self.proxy_host.clear();
+                    self.proxy_port.clear();
+                    self.proxy_user.clear();
+                    self.proxy_pass.clear();
+                    self.proxy_link.clear();
+                    self.apply_proxy_form();
+                }
                 ui.add_space(6.0);
+                let active = self
+                    .settings
+                    .proxy
+                    .clone()
+                    .unwrap_or_else(|| "none (direct)".into());
+                ui.label(
+                    RichText::new(format!("Active: {active}"))
+                        .size(12.0)
+                        .color(self.theme.text),
+                );
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Applies to API and media requests right away; the gateway uses it on \
-                         its next connection. Styles: http, https, socks5 (no auth).",
+                        "HTTP, SOCKS5 (with optional username/password) and Shadowsocks \
+                         (aes-128/256-gcm, chacha20-ietf-poly1305) are supported. API and media \
+                         requests use it right away; the gateway reconnects to switch. Shadowsocks \
+                         runs natively — paste an ss:// link above to fill the fields.",
                     )
                     .size(11.0)
                     .color(self.theme.text_secondary),

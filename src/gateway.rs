@@ -411,11 +411,39 @@ async fn socks5_connect(
     port: u16,
 ) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect((spec.host.as_str(), spec.port)).await?;
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    // Offer no-auth, and username/password when credentials are configured.
+    let mut methods = vec![0x05u8, 0x01, 0x00];
+    if spec.auth.is_some() {
+        methods[1] = 0x02;
+        methods.push(0x02);
+    }
+    stream.write_all(&methods).await?;
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting).await?;
-    if greeting[0] != 0x05 || greeting[1] != 0x00 {
-        return Err("socks5: proxy requires authentication".into());
+    if greeting[0] != 0x05 {
+        return Err("socks5: bad version".into());
+    }
+    match greeting[1] {
+        0x00 => {}
+        0x02 => {
+            // RFC 1929 username/password authentication.
+            let (user, pass) = spec.auth.as_ref().ok_or("socks5: proxy wants auth, no credentials set")?;
+            let (ub, pb) = (user.as_bytes(), pass.as_bytes());
+            if ub.len() > 255 || pb.len() > 255 {
+                return Err("socks5: credentials too long".into());
+            }
+            let mut auth = vec![0x01, ub.len() as u8];
+            auth.extend_from_slice(ub);
+            auth.push(pb.len() as u8);
+            auth.extend_from_slice(pb);
+            stream.write_all(&auth).await?;
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).await?;
+            if resp[1] != 0x00 {
+                return Err("socks5: authentication failed".into());
+            }
+        }
+        _ => return Err("socks5: no acceptable auth method".into()),
     }
     let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
     req.extend_from_slice(host.as_bytes());

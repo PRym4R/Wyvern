@@ -38,18 +38,32 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 | `src/models.rs` | data structures, byte-budget cache |
 | `src/ui/*` | screens: login, sidebar, chat, attachments, input, overlays, settings |
 | `src/crypto.rs` | account vault encryption |
+| `src/ss.rs` | native Shadowsocks (SIP002 parsing, AEAD ciphers, stream) |
+| `src/ssbridge.rs` | loopback SOCKS5 bridge that terminates an `ss://` proxy |
 | `src/memcheck.rs` | memory and allocation measurement (test with `--ignored`) |
 
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 243 tests (242 + measurement)
+cargo test --release                                        # 256 tests (254 + 2 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
+WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 ```
 
 ---
 
 # Changes
+
+## 0.9.0 — 2026-10-19
+
+- **Proxy form**: the Network tab gets a proper form — type (HTTP, SOCKS5,
+  SOCKS5 remote-DNS, Shadowsocks), host, port, username and password — applied
+  live as you type. SOCKS5 now negotiates RFC 1929 username/password auth.
+- **Native Shadowsocks**: `ss://` proxies are terminated in-process. The client
+  parses SIP002 and legacy links (or an imported `ss://` link pasted into the
+  form), runs an `aes-128/256-gcm` / `chacha20-ietf-poly1305` AEAD client, and
+  exposes a loopback SOCKS5 bridge so API, media and gateway traffic all flow
+  through the server. No external core binary is required.
 
 ## 0.8.0 — 2026-10-18
 

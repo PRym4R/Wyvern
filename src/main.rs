@@ -17,6 +17,8 @@ mod messages;
 mod models;
 mod net;
 mod settings;
+mod ss;
+mod ssbridge;
 mod ui;
 mod util;
 

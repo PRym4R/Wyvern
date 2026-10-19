@@ -53,6 +53,117 @@ fn snowflake_gt(a: &str, b: &str) -> bool {
     }
 }
 
+/// Form index for a proxy scheme: 0 HTTP, 1 SOCKS5, 2 SOCKS5 (remote DNS),
+/// 3 Shadowsocks.
+fn proxy_kind_index(scheme: &str) -> usize {
+    match scheme.to_lowercase().as_str() {
+        "socks5" => 1,
+        "socks5h" | "socks" => 2,
+        "ss" => 3,
+        _ => 0,
+    }
+}
+
+fn proxy_kind_scheme(kind: usize) -> &'static str {
+    match kind {
+        1 => "socks5",
+        2 => "socks5h",
+        3 => "ss",
+        _ => "http",
+    }
+}
+
+/// Splits a saved proxy URL into the form fields `(kind, host, port, user, pass)`.
+fn parse_proxy_fields(url: &str) -> (usize, String, String, String, String) {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return (0, String::new(), String::new(), String::new(), String::new());
+    }
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("http", trimmed));
+    // Shadowsocks URLs carry the cipher in a base64/plain userinfo, so let the
+    // dedicated parser fill the form (method -> Username, password -> Password).
+    if scheme.eq_ignore_ascii_case("ss") {
+        if let Ok(s) = crate::ss::parse_url(trimmed) {
+            return (3, s.host, s.port.to_string(), s.method, s.password);
+        }
+    }
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+    let (user, pass) = userinfo
+        .and_then(|u| u.split_once(':').map(|(a, b)| (url_decode(a), url_decode(b))))
+        .unwrap_or_default();
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.to_string()),
+        None => (hostport.to_string(), String::new()),
+    };
+    (proxy_kind_index(scheme), host, port, user, pass)
+}
+
+/// Percent-encodes the characters that would break a `user:pass@host` URL.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Reverses [`url_encode`] for the user/password form fields.
+fn url_decode(s: &str) -> String {
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Builds a proxy URL from the form, or `None` when no host is given.
+fn compose_proxy(kind: usize, host: &str, port: &str, user: &str, pass: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let mut url = format!("{}://", proxy_kind_scheme(kind));
+    let user = user.trim();
+    if !user.is_empty() {
+        url.push_str(&url_encode(user));
+        if !pass.is_empty() {
+            url.push(':');
+            url.push_str(&url_encode(pass));
+        }
+        url.push('@');
+    }
+    url.push_str(host);
+    let port = port.trim();
+    if !port.is_empty() {
+        url.push(':');
+        url.push_str(port);
+    }
+    Some(url)
+}
+
 /// Trims a channel to the cap, dropping the end the user isn't viewing: oldest
 /// when `keep_newest`, newest when loading older history. Returns count dropped.
 fn trim_messages(entry: &mut Vec<Arc<ChatMessage>>, keep_newest: bool) -> usize {
@@ -238,6 +349,14 @@ pub(crate) struct App {
     pub(crate) settings_open: bool,
     /// Selected section in the settings window's left tab list.
     pub(crate) settings_section: usize,
+    /// Proxy form fields, kept in sync with `Settings::proxy`.
+    pub(crate) proxy_kind: usize,
+    pub(crate) proxy_host: String,
+    pub(crate) proxy_port: String,
+    pub(crate) proxy_user: String,
+    pub(crate) proxy_pass: String,
+    /// Scratch field for pasting a full `ss://` link to import into the form.
+    pub(crate) proxy_link: String,
     /// Image URLs revealed by click while `blur_media` is on (this session).
     pub(crate) revealed_images: HashSet<String>,
     /// Ids of deleted messages kept in the list (drawn red) when `keep_deleted` is on.
@@ -367,6 +486,12 @@ impl App {
             draft_channel: None,
             settings_open: false,
             settings_section: 0,
+            proxy_kind: 0,
+            proxy_host: String::new(),
+            proxy_port: String::new(),
+            proxy_user: String::new(),
+            proxy_pass: String::new(),
+            proxy_link: String::new(),
             revealed_images: HashSet::new(),
             deleted_ids: HashSet::new(),
             deleted_store: DeletedStore::default(),
@@ -409,7 +534,9 @@ impl App {
         }
         self.settings = settings;
         self.settings_path = path;
-        crate::net::set_proxy(self.settings.proxy.as_deref().unwrap_or(""));
+        self.load_proxy_form();
+        let effective = crate::ssbridge::resolve_proxy(self.settings.proxy.as_deref().unwrap_or(""));
+        crate::net::set_proxy(&effective);
         self
     }
     /// Attach the on-disk deleted-message store; `None` keeps it read-only.
@@ -417,6 +544,54 @@ impl App {
         self.deleted_store = store;
         self.deleted_path = path;
         self
+    }
+    /// Fill the proxy form fields from the saved proxy URL.
+    pub(crate) fn load_proxy_form(&mut self) {
+        let (kind, host, port, user, pass) =
+            parse_proxy_fields(self.settings.proxy.as_deref().unwrap_or(""));
+        self.proxy_kind = kind;
+        self.proxy_host = host;
+        self.proxy_port = port;
+        self.proxy_user = user;
+        self.proxy_pass = pass;
+    }
+    /// Recompose the proxy URL from the form, apply it and persist.
+    pub(crate) fn apply_proxy_form(&mut self) {
+        self.apply_proxy_form_live();
+        self.write_settings();
+    }
+    /// Apply the form to the running client without touching disk (per keystroke).
+    pub(crate) fn apply_proxy_form_live(&mut self) {
+        let url = compose_proxy(
+            self.proxy_kind,
+            &self.proxy_host,
+            &self.proxy_port,
+            &self.proxy_user,
+            &self.proxy_pass,
+        );
+        let effective = crate::ssbridge::resolve_proxy(url.as_deref().unwrap_or(""));
+        crate::net::set_proxy(&effective);
+        self.settings.proxy = url;
+    }
+    /// Imports a pasted `ss://` link into the proxy form (populating method,
+    /// password, host and port) and applies it.
+    pub(crate) fn import_proxy_link(&mut self) {
+        let link = self.proxy_link.trim().to_string();
+        if link.is_empty() {
+            return;
+        }
+        match crate::ss::parse_url(&link) {
+            Ok(s) => {
+                self.proxy_kind = 3;
+                self.proxy_host = s.host;
+                self.proxy_port = s.port.to_string();
+                self.proxy_user = s.method;
+                self.proxy_pass = s.password;
+                self.proxy_link.clear();
+                self.apply_proxy_form();
+            }
+            Err(e) => self.push_debug(format!("ss: не удалось разобрать ссылку: {e}")),
+        }
     }
     /// Write settings to disk if a path is configured; a failure is logged, not fatal.
     pub(crate) fn write_settings(&mut self) {
