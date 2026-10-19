@@ -40,9 +40,6 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 | `src/crypto.rs` | account vault encryption |
 | `src/memcheck.rs` | memory and allocation measurement (test with `--ignored`) |
 
-The full list of ideas with numbers is in [TODO.md](TODO.md); the release plan is
-in [ROADMAP.md](ROADMAP.md).
-
 ## Tests and measurements
 
 ```bash
