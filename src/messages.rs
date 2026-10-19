@@ -78,6 +78,10 @@ pub(crate) enum ToGateway {
     /// Tell Discord the channel was read up to `message_id`. Best-effort: the
     /// local unread badge is cleared regardless of the reply.
     AckMessage { channel_id: String, message_id: String },
+    /// Subscribe to a guild (op 14) so Discord sends non-stateful events
+    /// (MESSAGE_CREATE, TYPING_START, ...) for large guilds. Without it the
+    /// gateway silently withholds new messages while REST history still works.
+    SubscribeGuild { guild_id: String, channel_id: String },
     OpenDM { user_id: String },
     Shutdown,
 }

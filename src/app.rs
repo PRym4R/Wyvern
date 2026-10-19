@@ -1207,6 +1207,19 @@ impl App {
         self.unread.remove(channel_id);
         self.mentions.remove(channel_id);
         self.unread_dot.remove(channel_id);
+        // Large guilds only deliver non-stateful events (new messages) once the
+        // client subscribes to the guild; do it for the channel being opened.
+        let guild_id = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .and_then(|c| c.guild_id.clone());
+        if let Some(guild_id) = guild_id {
+            self.send_cmd(ToGateway::SubscribeGuild {
+                guild_id,
+                channel_id: channel_id.to_string(),
+            });
+        }
         self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
         self.write_settings();
     }

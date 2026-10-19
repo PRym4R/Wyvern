@@ -308,6 +308,25 @@ fn identify_payload(token: &str) -> serde_json::Value {
     })
 }
 
+/// OP 14 "guild subscribe". Large guilds withhold non-stateful events
+/// (MESSAGE_CREATE, TYPING_START, ...) until the client subscribes to the
+/// guild; without it new messages stay invisible while REST history works.
+fn guild_subscribe_payload(guild_id: &str, channel_id: &str) -> serde_json::Value {
+    let mut channels = serde_json::Map::new();
+    channels.insert(channel_id.to_string(), json!([[0, 99]]));
+    json!({
+        "op": 14,
+        "d": {
+            "guild_id": guild_id,
+            "typing": true,
+            "threads": true,
+            "activities": true,
+            "members": [],
+            "channels": channels,
+        }
+    })
+}
+
 /// A parsed proxy URL: scheme, authority and optional basic-auth credentials.
 struct ProxySpec {
     scheme: String,
@@ -1053,6 +1072,12 @@ async fn gw_inner(
                         tokio::spawn(async move {
                             ack_message(httpc, tkc, ev, channel_id, message_id).await;
                         });
+                    }
+                    ToGateway::SubscribeGuild { guild_id, channel_id } => {
+                        let p = guild_subscribe_payload(&guild_id, &channel_id);
+                        if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
+                            break;
+                        }
                     }
                     ToGateway::OpenDM { user_id } => {
                         // Same as sending: the request must not freeze the

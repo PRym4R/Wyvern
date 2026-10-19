@@ -399,7 +399,7 @@ mod session_tests {
 
 #[cfg(test)]
 mod identify_tests {
-    use super::identify_payload;
+    use super::{guild_subscribe_payload, identify_payload};
 
     /// IDENTIFY must carry the real client fingerprint, the same object as
     /// `X-Super-Properties`.
@@ -416,6 +416,21 @@ mod identify_tests {
             p["d"]["properties"],
             crate::util::client_properties(),
             "IDENTIFY и X-Super-Properties должны нести один отпечаток"
+        );
+    }
+
+    /// The guild subscription must be OP 14 and ask for the opened channel's
+    /// first member range, which is what makes a large guild start sending
+    /// MESSAGE_CREATE.
+    #[test]
+    fn guild_subscribe_carries_the_channel_range() {
+        let p = guild_subscribe_payload("111", "222");
+        assert_eq!(p["op"].as_i64(), Some(14), "подписка на гильдию — это OP 14");
+        assert_eq!(p["d"]["guild_id"], "111", "у подписки чужая гильдия");
+        assert_eq!(
+            p["d"]["channels"]["222"],
+            serde_json::json!([[0, 99]]),
+            "подписка должна покрывать первый диапазон участников канала"
         );
     }
 }
