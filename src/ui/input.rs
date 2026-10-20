@@ -61,7 +61,49 @@ fn typing_summary(names: &[String]) -> String {
     }
 }
 
+/// Label above the composer. DMs already show the person's name in the left
+/// list, so only guild channels get named here.
+fn composer_label(guild_id: Option<&str>, name: &str) -> Option<String> {
+    guild_id.map(|_| format!("# {name}"))
+}
+
 impl App {
+    /// Open the native file chooser on a worker thread and remember its result.
+    pub(crate) fn pick_attachments(&mut self, ctx: &egui::Context) {
+        if self.pending_file_pick.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::file_picker::pick_files());
+        });
+        self.pending_file_pick = Some(rx);
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// Reap the file dialog's selection; called once per frame from `run_frame`.
+    pub(crate) fn poll_picked_files(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pending_file_pick.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(paths) => {
+                for path in paths {
+                    if std::path::Path::new(&path).is_file()
+                        && !self.pending_attachments.contains(&path)
+                    {
+                        self.pending_attachments.push(path);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pending_file_pick = Some(rx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
     pub(crate) fn draw_input_bar(&mut self, ctx: &egui::Context) {
         let dropped: Vec<String> = ctx
             .input(|i| {
@@ -126,10 +168,10 @@ impl App {
             }
         }
         let has_channel = self.selected_channel.is_some();
-        let ch_name = self.selected_channel
+        let ch_name = self
+            .selected_channel
             .and_then(|i| self.channels.get(i))
-            .map(|c| format!("# {}", c.name))
-            .unwrap_or_else(|| "No channel selected".into());
+            .and_then(|c| composer_label(c.guild_id.as_deref(), &c.name));
 
         let _input_resp = egui::TopBottomPanel::bottom("input_panel")
             .min_height((self.composer_h.clamp(0.0, COMPOSER_MAX_H) + COMPOSER_CHROME).max(56.0))
@@ -220,8 +262,10 @@ impl App {
                 }
                 ui.horizontal_top(|ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new(ch_name).strong().size(13.0).color(self.theme.text_secondary));
-                    ui.add_space(8.0);
+                    if let Some(name) = &ch_name {
+                        ui.label(RichText::new(name).strong().size(13.0).color(self.theme.text_secondary));
+                        ui.add_space(8.0);
+                    }
 
                     if !has_channel {
                         ui.label(RichText::new("← select a channel on the left").italics()
@@ -243,6 +287,16 @@ impl App {
                                 egui::FontId::proportional(12.0),
                                 if fits { self.theme.text_secondary } else { ERROR_RED },
                             );
+                        }
+                        ui.add_space(6.0);
+                        let attach = ui
+                            .add(
+                                egui::Button::new(RichText::new("📎").size(16.0))
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Attach files");
+                        if attach.clicked() {
+                            self.pick_attachments(ui.ctx());
                         }
                         ui.add_space(6.0);
                         let field_w = input_width(ui.available_width());
@@ -1143,6 +1197,40 @@ mod tests {
             egui::Shape::Text(t) => t.galley.text().contains(needle),
             _ => false,
         })
+    }
+
+    /// The file dialog may return directories or duplicates; only real files
+    /// are queued, once each.
+    #[test]
+    fn picked_files_only_add_regular_files_once() {
+        let (mut app, ctx) = narrow_app();
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("wyvern-pick-{}.txt", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let file = file.to_string_lossy().to_string();
+        let dir = dir.to_string_lossy().to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![file.clone(), dir, file.clone()]).unwrap();
+        drop(tx);
+        app.pending_file_pick = Some(rx);
+        app.poll_picked_files(&ctx);
+
+        assert_eq!(
+            app.pending_attachments, vec![file.clone()],
+            "должен остаться ровно один настоящий файл"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// DMs already label the person on the left; the composer only names guild channels.
+    #[test]
+    fn composer_label_hides_dm_names() {
+        assert_eq!(composer_label(None, "alice"), None, "ник в ЛС у поля ввода не нужен");
+        assert_eq!(
+            composer_label(Some("guild"), "general").as_deref(),
+            Some("# general")
+        );
     }
 
     /// The typing line names one, two, three or "several" people.

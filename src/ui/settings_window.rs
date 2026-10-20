@@ -12,23 +12,34 @@ const PROXY_KINDS: [&str; 5] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadow
 impl crate::app::App {
     /// Settings window: a full-client overlay with tabs down the left.
     pub(crate) fn draw_settings(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
+        // Keep running the animation while closing, so reopening doesn't snap.
+        let anim_time = if self.animations_enabled() { 0.22 } else { 0.0 };
+        let anim = ctx.animate_bool_with_time_and_easing(
+            egui::Id::new("settings_anim"),
+            self.settings_open,
+            anim_time,
+            crate::ui::ease_out_cubic,
+        );
+        if !self.settings_open && anim < 0.001 {
             return;
         }
         let screen = ctx.screen_rect();
+        // Slide up from slightly below while fading in.
+        let rect = screen.translate(egui::vec2(0.0, (1.0 - anim) * 16.0));
         let mut close = false;
         egui::Window::new("Settings")
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
             .movable(false)
-            .fixed_rect(screen)
+            .fixed_rect(rect)
             .frame(
                 egui::Frame::default()
-                    .fill(self.theme.panel_bg)
+                    .fill(self.theme.panel_bg.gamma_multiply(anim))
                     .inner_margin(egui::Margin::symmetric(14, 12)),
             )
             .show(ctx, |ui| {
+                ui.set_opacity(anim);
                 ui.horizontal(|ui| {
                     ui.heading(RichText::new("Settings").color(self.theme.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -154,6 +165,15 @@ impl crate::app::App {
                 }
                 if ui.button("Reset window size").clicked() {
                     self.settings.window = None;
+                    self.write_settings();
+                }
+                ui.add_space(8.0);
+                let mut animations = self.settings.animations.unwrap_or(true);
+                if ui
+                    .checkbox(&mut animations, "Animate selections, toasts and settings")
+                    .changed()
+                {
+                    self.settings.animations = Some(animations);
                     self.write_settings();
                 }
             }

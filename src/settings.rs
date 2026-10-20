@@ -27,6 +27,8 @@ pub(crate) struct Settings {
     pub(crate) keep_deleted: bool,
     /// Outbound proxy URL (http/https/socks5); empty or absent means direct.
     pub(crate) proxy: Option<String>,
+    /// Animate selections, toasts, settings and image fade-ins; `None` means on.
+    pub(crate) animations: Option<bool>,
 }
 
 impl Settings {

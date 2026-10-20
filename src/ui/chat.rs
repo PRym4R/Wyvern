@@ -884,7 +884,16 @@ impl App {
                     let max = ui.ctx().screen_rect().size() * 0.85;
                     let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
                     let disp = egui::vec2(size.x * scale, size.y * scale);
-                    ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)));
+                    let img = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp))
+                            .sense(egui::Sense::click()),
+                    );
+                    img.context_menu(|ui| {
+                        if ui.button("Copy image").clicked() {
+                            self.copy_original_image(ui.ctx(), &url);
+                            ui.close_menu();
+                        }
+                    });
                 } else {
                     ui.spinner();
                 }

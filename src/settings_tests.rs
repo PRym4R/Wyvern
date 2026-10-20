@@ -26,6 +26,7 @@ fn settings_round_trip_through_a_file() {
     s.blur_media = true;
     s.notifications = true;
     s.keep_deleted = true;
+    s.animations = Some(false);
 
     s.save_to(&path).expect("настройки должны записаться");
     assert!(
@@ -151,6 +152,15 @@ fn guild_channel_is_not_restored_on_startup() {
     assert!(!app.restore_last_channel(), "запуск не должен открывать серверный канал");
     assert_eq!(app.selected_channel, None);
     assert_eq!(app.selected_guild, None);
+}
+
+#[test]
+fn animations_default_to_on() {
+    assert!(Settings::default().animations.is_none(), "absence of the field means default");
+    let mut app = offline_app();
+    assert!(app.animations_enabled(), "по умолчанию анимации включены");
+    app.settings.animations = Some(false);
+    assert!(!app.animations_enabled(), "настройка должна выключать анимации");
 }
 
 #[test]

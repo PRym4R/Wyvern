@@ -520,6 +520,22 @@ mod tests {
             "тело сверх потолка должно отсекаться, а не читаться целиком"
         );
     }
+
+    /// Right-click "Copy image" must keep the source resolution.
+    #[test]
+    fn copy_decodes_at_the_original_size() {
+        let img = RgbaImage::from_pixel(9, 4, Rgba([10, 20, 30, 255]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let ci = decode_original(&png).expect("PNG должен декодироваться");
+        assert_eq!(ci.size, [9, 4], "копия не должна уменьшать исходник");
+        assert_eq!(
+            ci.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
+    }
 }
 
 #[cfg(test)]

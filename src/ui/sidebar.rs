@@ -15,6 +15,7 @@ impl App {
         self.show_friends = show_friends;
     }
     pub(crate) fn draw_server_list(&mut self, ctx: &egui::Context) {
+        let anim_time = if self.animations_enabled() { 0.22 } else { 0.0 };
         egui::SidePanel::left("servers")
             .resizable(false)
             .default_width(72.0)
@@ -31,10 +32,16 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
+                    let home_sel = ui.ctx().animate_bool_with_time_and_easing(
+                        egui::Id::new("home_sel"),
+                        self.selected_guild.is_none(),
+                        anim_time,
+                        crate::ui::ease_out_cubic,
+                    );
                     let home_btn = ui.add_sized(
                         [48.0, 48.0],
                         egui::Button::new(RichText::new("@").size(20.0).color(Color32::WHITE))
-                            .fill(if self.selected_guild.is_none() { self.theme.accent } else { self.theme.input_bg })
+                            .fill(self.theme.input_bg.lerp_to_gamma(self.theme.accent, home_sel))
                             .corner_radius(24.0),
                     );
                     if home_btn.clicked() {
@@ -56,7 +63,12 @@ impl App {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (i, guild) in guilds.iter().enumerate() {
                         ui.vertical_centered(|ui| {
-                            let is_sel = self.selected_guild == Some(i);
+                            let guild_sel = ui.ctx().animate_bool_with_time_and_easing(
+                                egui::Id::new(("guild_sel", &guild.id)),
+                                self.selected_guild == Some(i),
+                                anim_time,
+                                crate::ui::ease_out_cubic,
+                            );
                             let icon_tex = guild.icon.as_ref()
                                 .and_then(|h| self.download_guild_icon(ctx, &guild.id, h));
                             let btn = if let Some(tex) = icon_tex {
@@ -72,7 +84,7 @@ impl App {
                                 ui.add_sized(
                                     [48.0, 48.0],
                                     egui::Button::new(RichText::new(&label).size(16.0).color(Color32::WHITE))
-                                        .fill(if is_sel { self.theme.accent } else { self.theme.input_bg })
+                                        .fill(self.theme.input_bg.lerp_to_gamma(self.theme.accent, guild_sel))
                                         .corner_radius(24.0),
                                 )
                             };
@@ -80,6 +92,17 @@ impl App {
                                 self.selected_guild = Some(i);
                                 self.selected_channel = None;
                                 self.show_friends = false;
+                            }
+                            if guild_sel > 0.001 {
+                                let bar = egui::Rect::from_center_size(
+                                    egui::pos2(btn.rect.left() - 6.0, btn.rect.center().y),
+                                    egui::vec2(3.0, 8.0 + 20.0 * guild_sel),
+                                );
+                                ui.painter().rect_filled(
+                                    bar,
+                                    1.5,
+                                    self.theme.accent.gamma_multiply(guild_sel),
+                                );
                             }
                             let (unread, mentions) = self.guild_badge(&guild.id);
                             if unread > 0 {
@@ -197,12 +220,19 @@ impl App {
     fn draw_channel_row(&mut self, ui: &mut egui::Ui, i: usize) {
         let Some(ch) = self.channels.get(i) else { return };
         let voice = ch.channel_type == 2;
+        let anim_time = if self.animations_enabled() { 0.22 } else { 0.0 };
         let prefix = match ch.channel_type {
             2 => "🔊",
             5 => "📢",
             _ => "#",
         };
         let is_sel = self.selected_channel == Some(i);
+        let sel = ui.ctx().animate_bool_with_time_and_easing(
+            egui::Id::new(("chan_sel", &ch.id)),
+            is_sel,
+            anim_time,
+            crate::ui::ease_out_cubic,
+        );
         let (unread, mentions) = self.channel_badge(&ch.id);
         let dot = unread == 0 && mentions == 0 && self.unread_dot.contains(&ch.id);
         let label = if mentions > 0 {
@@ -214,16 +244,21 @@ impl App {
         } else {
             format!("{} {}", prefix, ch.name)
         };
-        let mut text = RichText::new(&label).size(14.0);
-        text = if is_sel || mentions > 0 {
-            text.color(Color32::WHITE).strong()
+        let base = if mentions > 0 {
+            Color32::WHITE
         } else if unread > 0 || dot {
-            text.color(self.theme.text)
+            self.theme.text
         } else {
-            text.color(self.theme.text_secondary)
+            self.theme.text_secondary
         };
+        let mut text = RichText::new(&label)
+            .size(14.0)
+            .color(base.lerp_to_gamma(Color32::WHITE, sel));
+        if is_sel || mentions > 0 {
+            text = text.strong();
+        }
         let button = egui::Button::new(text)
-            .fill(if is_sel { self.theme.accent } else { Color32::TRANSPARENT });
+            .fill(Color32::TRANSPARENT.lerp_to_gamma(self.theme.accent, sel));
         // Voice rows stay visible but inert, so they don't pretend to open.
         let response = ui
             .add_enabled_ui(!voice, |ui| {
@@ -458,6 +493,60 @@ mod tests {
         assert!(!app.show_friends);
         // Toggling the view doesn't drop the open channel.
         assert_eq!(app.selected_channel, Some(1), "переключатель вида не должен сбрасывать выбор");
+    }
+
+    /// A freshly selected server must ease in, not snap.
+    #[test]
+    fn server_selection_eases_in_across_frames() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.guilds.push(crate::models::Guild {
+            id: "g0".into(),
+            name: "Guild".into(),
+            icon: None,
+        });
+
+        let ctx = egui::Context::default();
+        let input = |t: f64| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 600.0),
+            )),
+            time: Some(t),
+            ..Default::default()
+        };
+        let bar_height = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Rect(r) if (r.rect.width() - 3.0).abs() < 0.01 => {
+                        Some(r.rect.height())
+                    }
+                    _ => None,
+                })
+                .fold(0.0_f32, f32::max)
+        };
+
+        app.selected_guild = None;
+        let settle = ctx.run(input(0.0), |ctx| app.draw_server_list(ctx));
+        assert_eq!(bar_height(&settle), 0.0, "без выбора бара быть не должно");
+
+        app.selected_guild = Some(0);
+        let early = bar_height(&ctx.run(input(0.016), |ctx| app.draw_server_list(ctx)));
+        let later = bar_height(&ctx.run(input(0.05), |ctx| app.draw_server_list(ctx)));
+        assert!(early > 8.0, "бар должен появиться сразу: {early}");
+        assert!(early < 28.0, "бар не должен быть максимальным на первом кадре: {early}");
+        assert!(later > early, "бар должен расти: {early} -> {later}");
+
+        app.settings.animations = Some(false);
+        app.selected_guild = None;
+        let _ = ctx.run(input(0.1), |ctx| app.draw_server_list(ctx));
+        app.selected_guild = Some(0);
+        let snapped = bar_height(&ctx.run(input(0.12), |ctx| app.draw_server_list(ctx)));
+        assert!(
+            (snapped - 28.0).abs() < 0.01,
+            "с выключенными анимациями бар должен появляться сразу: {snapped}"
+        );
     }
 
     /// The server panel must not clone the guild list every frame.

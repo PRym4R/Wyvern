@@ -51,7 +51,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 272 tests (269 + 3 ignored)
+cargo test --release                                        # 282 tests (279 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke
@@ -60,6 +60,20 @@ WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_prox
 ---
 
 # Changes
+
+## 0.9.3 — 2026-10-20
+
+- **Animations**: toasts slide up and fade in (and still fade out); the
+  selected server grows a rounded accent bar instead of snapping; server and
+  channel highlights cross-fade; the settings overlay fades and slides into
+  place; freshly downloaded images fade in over the reserved placeholder
+  instead of popping. Settings → Interface has an `Animate …` checkbox that
+  turns all of it off (including egui's own widget fades).
+- **Images and files**: right-click an image (in chat or the lightbox) to copy
+  the original-resolution pixels to the clipboard; the composer's 📎 opens the
+  native file chooser (zenity/kdialog/yad on Linux, the PowerShell dialog on
+  Windows) and queues the selection for upload. DMs no longer repeat the
+  person's name above the composer — it's already in the left list.
 
 ## 0.9.2 — 2026-10-20
 

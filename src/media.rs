@@ -60,6 +60,27 @@ fn http() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Download an image and decode it at its original resolution for the clipboard.
+fn fetch_original_image(url: &str) -> Option<egui::ColorImage> {
+    let resp = http().get(url).send().ok()?;
+    let bytes = read_limited(resp, MAX_DOWNLOAD_BYTES)?;
+    decode_original(&bytes)
+}
+
+/// Decode original-size pixels; `decode_static` enforces the source limits.
+pub(crate) fn decode_original(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let rgba = App::decode_static(bytes)?.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 || !source_size_allowed(w, h) {
+        return None;
+    }
+    let pixels = rgba.into_raw();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        &pixels,
+    ))
+}
+
 /// Shrink the image if it exceeds the target dimension.
 fn shrink(img: image::DynamicImage, max_dim: u32) -> image::DynamicImage {
     if img.width() > max_dim || img.height() > max_dim {
@@ -611,6 +632,50 @@ fn decode_lightbox_payload(bytes: &[u8]) -> Option<ImagePayload> {
             self.pending_attachments.push(path);
         }
         self.push_debug("CLIP: картинка вставлена из буфера".to_string());
+    }
+
+    /// Copy the original-resolution image at `url` to the system clipboard.
+    ///
+    /// The fetch runs on a worker thread; `poll_copy_image` finishes the copy
+    /// on the UI thread because eframe/arboard owns the clipboard there.
+    pub(crate) fn copy_original_image(&mut self, ctx: &egui::Context, url: &str) {
+        if self.pending_copy_image.is_some() {
+            self.toast(crate::app::ToastKind::Warn, "An image copy is already in progress");
+            return;
+        }
+        let url = url.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fetch_original_image(&url).map(|image| (url, image));
+            let _ = tx.send(result);
+        });
+        self.pending_copy_image = Some(rx);
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    /// Reap a finished copy; called once per frame from `run_frame`.
+    pub(crate) fn poll_copy_image(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.pending_copy_image.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some((_, image))) => {
+                ctx.copy_image(image);
+                self.toast(crate::app::ToastKind::Info, "Image copied");
+                self.push_debug("CLIP: изображение скопировано в исходном размере".to_string());
+            }
+            Ok(None) => {
+                self.toast(crate::app::ToastKind::Error, "Could not copy image");
+                self.push_debug("CLIP: не удалось скачать изображение".to_string());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.pending_copy_image = Some(rx);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.toast(crate::app::ToastKind::Error, "Could not copy image");
+            }
+        }
     }
 
 /// Reap finished downloads even for images no longer on screen.

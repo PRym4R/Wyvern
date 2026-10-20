@@ -14,6 +14,7 @@ mod memcheck;
 mod app;
 mod crypto;
 mod deleted;
+mod file_picker;
 mod gateway;
 mod media;
 mod messages;

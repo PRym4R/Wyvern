@@ -335,6 +335,11 @@ pub(crate) struct App {
     pub(crate) lightbox_evict_at: Option<std::time::Instant>,
     /// Files selected for the next send (drag-drop / paste).
     pub(crate) pending_attachments: Vec<String>,
+    /// Native file dialog result, polled on the UI thread.
+    pub(crate) pending_file_pick: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// Original-resolution image on its way to the clipboard.
+    pub(crate) pending_copy_image:
+        Option<std::sync::mpsc::Receiver<Option<(String, egui::ColorImage)>>>,
     /// Quick-switch dialog open (Ctrl+K).
     pub(crate) quick_switch_open: bool,
     pub(crate) quick_switch_query: String,
@@ -479,6 +484,8 @@ impl App {
             lightbox_pending: None,
             lightbox_evict_at: None,
             pending_attachments: Vec::new(),
+            pending_file_pick: None,
+            pending_copy_image: None,
             quick_switch_open: false,
             quick_switch_query: String::new(),
             gateway_generation: Arc::new(Generation::default()),
@@ -622,6 +629,10 @@ impl App {
             }
             Err(e) => self.push_debug(format!("ss: не удалось разобрать ссылку: {e}")),
         }
+    }
+    /// Whether UI transitions are enabled (default on).
+    pub(crate) fn animations_enabled(&self) -> bool {
+        self.settings.animations.unwrap_or(true)
     }
     /// Write settings to disk if a path is configured; a failure is logged, not fatal.
     pub(crate) fn write_settings(&mut self) {
@@ -1787,6 +1798,9 @@ impl App {
 
         // Apply the UI scale from settings (1.0 = default).
         ctx.set_zoom_factor(self.settings.ui_scale.unwrap_or(1.0));
+        // Honor the Animations setting for egui's own widget transitions too.
+        let animation_time = if self.animations_enabled() { 1.0 / 12.0 } else { 0.0 };
+        ctx.all_styles_mut(|style| style.animation_time = animation_time);
 
         self.theme = crate::models::theme_by_index(self.theme_index);
 
@@ -1795,6 +1809,9 @@ impl App {
         // Typing indicators have no stop event; drop the ones that have lapsed.
         self.prune_typing();
         self.prune_toasts();
+        // Finish background file-picker/copy work on the UI thread.
+        self.poll_picked_files(ctx);
+        self.poll_copy_image(ctx);
         // New image-cache frame: last frame's visible items age by one frame.
         self.image_cache.begin_frame();
         if self.shows_login() {

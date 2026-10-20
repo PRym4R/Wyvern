@@ -12,6 +12,12 @@ mod sidebar;
 /// Color for failures: failed sends and Discord errors.
 pub(crate) const ERROR_RED: Color32 = Color32::from_rgb(250, 77, 77);
 
+/// Cubic ease-out for short UI transitions: fast start, soft landing.
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
 /// Paints a top-to-bottom linear gradient covering `rect`.
 pub(crate) fn paint_vertical_gradient(
     painter: &egui::Painter,
@@ -58,5 +64,27 @@ impl crate::app::App {
                     }
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ease_out_cubic;
+
+    #[test]
+    fn ease_out_cubic_hits_the_endpoints() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ease_out_cubic_is_monotonic_and_starts_fast() {
+        let mut prev = 0.0;
+        for i in 0..=20 {
+            let v = ease_out_cubic(i as f32 / 20.0);
+            assert!(v >= prev, "кривая должна только расти");
+            prev = v;
+        }
+        assert!(ease_out_cubic(0.25) > 0.5, "кривая должна быстро стартовать");
     }
 }

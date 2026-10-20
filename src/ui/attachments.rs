@@ -132,11 +132,42 @@ impl App {
                 if disp.x <= 0.0 || disp.y <= 0.0 {
                     return;
                 }
-                let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp)).sense(egui::Sense::all()));
+                let fade = if self.animations_enabled() {
+                    // egui starts a fresh bool animation at its target, so seed
+                    // the id at 0 on the first frame or the image would pop in.
+                    let fade_id = egui::Id::new(("img_fade", url));
+                    if ui.ctx().data(|d| d.get_temp::<bool>(fade_id).is_none()) {
+                        ui.ctx().data_mut(|d| d.insert_temp(fade_id, true));
+                        ui.ctx().animate_bool_with_time(fade_id, false, 0.0);
+                    }
+                    ui.ctx().animate_bool_with_time_and_easing(
+                        fade_id,
+                        true,
+                        0.22,
+                        crate::ui::ease_out_cubic,
+                    )
+                } else {
+                    1.0
+                };
+                let resp = ui
+                    .scope(|ui| {
+                        ui.set_opacity(fade);
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::new(tex.id(), disp))
+                                .sense(egui::Sense::all()),
+                        )
+                    })
+                    .inner;
                 let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
+                resp.context_menu(|ui| {
+                    if ui.button("Copy image").clicked() {
+                        self.copy_original_image(ui.ctx(), url);
+                        ui.close_menu();
+                    }
+                });
                 let rect_click = ui.ctx().pointer_latest_pos()
                     .map(|p| resp.rect.contains(p) && ui.ctx().input(|i| i.pointer.primary_clicked()))
                     .unwrap_or(false);
