@@ -795,12 +795,15 @@ impl App {
             eprintln!("{}", line);
             use std::io::Write;
             // Rotate the log file at 2 MB so it can't grow forever.
-            let path = "/tmp/wyvern_layout.log";
-            let too_big = std::fs::metadata(path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false);
-            if too_big {
-                let _ = std::fs::rename(path, format!("{}.1", path));
+            let path = crate::paths::layout_log_path();
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
             }
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let too_big = std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false);
+            if too_big {
+                let _ = std::fs::rename(&path, path.with_extension("log.1"));
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 let _ = writeln!(f, "{}", line);
             }
         }
@@ -1291,7 +1294,11 @@ impl App {
                         if m.attachments.is_empty() { String::new() } else { format!(" <{} attachments>", m.attachments.len()) }))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let _ = std::fs::write("/tmp/wyvern_messages_dump.txt", dump);
+                let path = crate::paths::log_dir().join("messages_dump.txt");
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&path, dump);
             }
         }
         let for_current = self.current_channel_id() == Some(channel_id);

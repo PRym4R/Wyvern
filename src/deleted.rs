@@ -20,17 +20,7 @@ pub(crate) struct DeletedStore {
 impl DeletedStore {
     /// Path to `deleted.json`; `WYVERN_DELETED_PATH` overrides it (tests).
     pub(crate) fn path() -> PathBuf {
-        if let Ok(custom) = std::env::var("WYVERN_DELETED_PATH") {
-            if !custom.is_empty() {
-                return PathBuf::from(custom);
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            PathBuf::from(".wyvern_deleted.json")
-        } else {
-            Path::new(&home).join(".wyvern_deleted.json")
-        }
+        crate::paths::state_file("WYVERN_DELETED_PATH", "deleted.json")
     }
 
     /// Read the store. A missing, unreadable, or malformed file is empty, never
@@ -50,6 +40,11 @@ impl DeletedStore {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp = path.with_extension("json.tmp");
         let result = (|| {
+            if let Some(dir) = path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(text.as_bytes())?;
             f.sync_all()?;

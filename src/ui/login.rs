@@ -398,11 +398,12 @@ impl App {
         ui.add_space(16.0);
 
         ui.label(RichText::new("Vault password").size(12.0).color(self.theme.text_secondary));
+        let vault_hint = format!("Password for {}...", self.vault_path().display());
         ui.add(
             egui::TextEdit::singleline(&mut self.login_password)
                 .password(true)
                 .desired_width(f32::INFINITY)
-                .hint_text("Password for ~/.wyvern_accounts.json...")
+                .hint_text(vault_hint)
                 .font(egui::FontId::proportional(15.0))
                 .margin(egui::Margin::symmetric(10, 8)),
         );

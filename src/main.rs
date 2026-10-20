@@ -1,3 +1,6 @@
+// Hide the console window on Windows release builds; harmless elsewhere.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[cfg(not(test))]
 use mimalloc::MiMalloc;
 
@@ -16,6 +19,7 @@ mod media;
 mod messages;
 mod models;
 mod net;
+mod paths;
 mod settings;
 mod ss;
 mod proxybridge;
@@ -30,31 +34,25 @@ use crate::app::App;
 use crate::deleted::DeletedStore;
 use crate::settings::Settings;
 
-/// Numbered panic log path: `/tmp/wyvern_panic_N.log`. Numbering keeps a
-/// series of panics instead of overwriting the previous one.
-fn panic_log_path(n: usize) -> String {
-    format!("/tmp/wyvern_panic_{}.log", n)
-}
-
-/// First free panic log number (up to 99).
-fn next_panic_log_path() -> String {
-    (1..=99)
-        .map(panic_log_path)
-        .find(|p| !std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic_log_path(99))
-}
-
+/// Panic logs live in the platform cache dir (`paths::log_dir`), numbered so a
+/// series of panics is kept instead of overwriting the previous one.
 fn main() -> eframe::Result<()> {
-    // Panics go to /tmp/wyvern_panic_N.log (first free N) so a series is not
-    // reduced to the last one. Keep the default hook for the usual hint and
-    // write the backtrace ourselves, independent of RUST_BACKTRACE.
+    // Move pre-0.9.2 `~/.wyvern_*` files into the platform data dir before any
+    // state is read (settings, vault, deleted history).
+    crate::paths::migrate_from_home();
+    // Panics go to panic_N.log (first free N) so a series is not reduced to the
+    // last one. Keep the default hook for the usual hint and write the backtrace
+    // ourselves, independent of RUST_BACKTRACE.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
-        let path = next_panic_log_path();
+        let path = crate::paths::next_panic_log_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let _ = std::fs::write(&path, format!("{:?}\n{}", info, backtrace));
-        eprintln!("[PANIC] записано в {}", path);
+        eprintln!("[PANIC] записано в {}", path.display());
     }));
 
     // Version in the title: the repo-root binary is not always rebuilt.
@@ -90,20 +88,21 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_panic_log_path, panic_log_path};
+    use crate::paths::{next_panic_log_path, panic_log_path};
 
-    /// Panic log name must be project-specific and numbered.
+    /// Panic logs are numbered and live under the app's cache directory.
     #[test]
     fn panic_log_is_named_and_numbered() {
         let first = panic_log_path(1);
-        assert!(
-            first.ends_with("wyvern_panic_1.log"),
-            "лог паники должен называться по проекту и номеру: {first}"
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            "panic_1.log",
+            "лог паники должен называться по номеру"
         );
-        assert!(!first.contains("discord"), "имя осталось от прежнего проекта: {first}");
+        assert!(!first.to_string_lossy().contains("discord"), "имя осталось от прежнего проекта");
         assert_ne!(panic_log_path(1), panic_log_path(2), "номер не влияет на путь");
 
         let next = next_panic_log_path();
-        assert!(next.ends_with(".log"), "нужен путь к файлу, а не что-то ещё: {next}");
+        assert_eq!(next.extension().unwrap().to_str().unwrap(), "log", "нужен путь к файлу, а не что-то ещё");
     }
 }

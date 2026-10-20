@@ -13,6 +13,11 @@ fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
     use std::io::Write;
     let tmp = path.with_extension("tmp");
     let result = (|| {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
         #[cfg(unix)]
@@ -33,17 +38,7 @@ fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
         // Override for tests so the real file isn't touched.
-        if let Ok(custom) = std::env::var("WYVERN_ACCOUNTS_PATH") {
-            if !custom.is_empty() {
-                return std::path::PathBuf::from(custom);
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            std::path::PathBuf::from(".wyvern_accounts.json")
-        } else {
-            std::path::Path::new(&home).join(".wyvern_accounts.json")
-        }
+        crate::paths::state_file("WYVERN_ACCOUNTS_PATH", "accounts.json")
     }
     pub(crate) fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
         let mut key = [0u8; 32];
@@ -117,7 +112,7 @@ impl App {
     pub(crate) fn vault_path(&self) -> std::path::PathBuf {
         self.vault_path_override.clone().unwrap_or_else(Self::accounts_path)
     }
-    /// Path to the lock file next to the vault: `~/.wyvern_accounts.lock`.
+    /// Path to the lock file next to the vault (`accounts.lock`).
     pub(crate) fn vault_lock_path(&self) -> std::path::PathBuf {
         self.vault_path().with_extension("lock")
     }
@@ -128,6 +123,15 @@ impl App {
             return Ok(());
         }
         let path = self.vault_lock_path();
+        // The data dir may not exist on a fresh install; `create(true)` does not
+        // create parents and fails with ERROR_PATH_NOT_FOUND on Windows/Wine.
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    format!("Failed to create the vault directory ({}): {}", dir.display(), e)
+                })?;
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)

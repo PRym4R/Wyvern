@@ -32,17 +32,7 @@ pub(crate) struct Settings {
 impl Settings {
     /// Path to `settings.json`; `WYVERN_SETTINGS_PATH` overrides it (tests).
     pub(crate) fn path() -> PathBuf {
-        if let Ok(custom) = std::env::var("WYVERN_SETTINGS_PATH") {
-            if !custom.is_empty() {
-                return PathBuf::from(custom);
-            }
-        }
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            PathBuf::from(".wyvern_settings.json")
-        } else {
-            Path::new(&home).join(".wyvern_settings.json")
-        }
+        crate::paths::state_file("WYVERN_SETTINGS_PATH", "settings.json")
     }
 
     /// Read settings from `path`. A missing, unreadable, or malformed file is an
@@ -62,6 +52,11 @@ impl Settings {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let tmp = path.with_extension("json.tmp");
         let result = (|| {
+            if let Some(dir) = path.parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(text.as_bytes())?;
             f.sync_all()?;

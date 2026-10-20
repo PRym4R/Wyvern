@@ -29,9 +29,11 @@ tar czf /home/hackerman/backups/wyvern-src-<YYYYMMDD>-<shortsha>.tar.gz \
 
 ## Map
 - `src/app.rs` app state; `src/gateway.rs` + `src/gateway/rest.rs` Discord;
-  `src/models.rs` structs; `src/ui/*` screens; `src/memcheck.rs` memory test
-  (`--ignored`).
-- State files (all overridable): `~/.wyvern_settings.json`,
-  `~/.wyvern_deleted.json`, `~/.wyvern_accounts.json` (vault).
+  `src/models.rs` structs; `src/ui/*` screens; `src/paths.rs` data/cache paths;
+  `src/memcheck.rs` memory test (`--ignored`).
+- State files (all overridable) live in the platform data dir
+  (`dirs::data_dir()/wyvern`, e.g. `~/.local/share/wyvern`): `settings.json`,
+  `deleted.json`, `accounts.json` (vault), `accounts.lock`; logs go to
+  `dirs::cache_dir()/wyvern`. Legacy `~/.wyvern_*` files migrate on startup.
 - Any change to message height must update `estimate_msg_height` and the geometry
   tests (`src/ui/chat.rs`, `mod geometry_tests`).

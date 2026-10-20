@@ -1822,8 +1822,10 @@ fn live_message_from_another_channel_does_not_scroll_the_chat() {
 /// Debug log goes to file/stderr only with WYVERN_DEBUG.
 #[test]
 fn debug_log_writes_only_when_enabled() {
-    let path = std::path::Path::new("/tmp/wyvern_layout.log");
-    let _ = std::fs::remove_file(path);
+    let dir = std::env::temp_dir().join(format!("wyvern-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("WYVERN_LOG_DIR", &dir);
+    let path = crate::paths::layout_log_path();
     let (_tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(rx);
 
@@ -1835,7 +1837,8 @@ fn debug_log_writes_only_when_enabled() {
     app.push_debug("громкая строка".into());
     assert!(path.exists(), "с включённым флагом строка должна попасть в файл");
 
-    let _ = std::fs::remove_file(path);
+    std::env::remove_var("WYVERN_LOG_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Old log lines are evicted from the front, not by shifting the whole vector.

@@ -362,6 +362,22 @@ mod vault_write_tests {
         app.saved_accounts = vec![StoredAccount { token: "секрет".into(), username: "вася".into() }];
     }
 
+    /// The vault directory must exist before the lock file is opened: on
+    /// Windows/Wine `create(true)` fails with ERROR_PATH_NOT_FOUND otherwise.
+    #[test]
+    fn vault_lock_creates_missing_parent_dir() {
+        let (mut app, tmp) = vaulted();
+        let tag = TAG.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("wyvern-lock-dir-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.vault_path_override = Some(dir.join("accounts.json"));
+        app.acquire_vault_lock().expect("замок должен создаться вместе с каталогом");
+        assert!(dir.join("accounts.lock").exists(), "lock-файл должен появиться");
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     /// The vault file must be owner-only since it holds tokens.
     #[cfg(unix)]
     #[test]
@@ -387,11 +403,13 @@ mod vault_write_tests {
     #[test]
     fn vault_write_error_is_reported_in_status() {
         let (mut app, tmp) = vaulted();
-        let missing = std::env::temp_dir()
-            .join(format!("wyvern-no-such-dir-{}", std::process::id()))
-            .join("accounts.json");
-        let _ = std::fs::remove_dir_all(missing.parent().unwrap());
-        app.vault_path_override = Some(missing);
+        // A regular file where the parent directory should be: creating the
+        // directory fails, so the write must be reported instead of swallowed.
+        let blocked = std::env::temp_dir().join(format!("wyvern-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_file(&blocked);
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        app.vault_path_override = Some(blocked.join("accounts.json"));
         one_account(&mut app);
         app.save_accounts("правильный");
         assert!(
@@ -399,6 +417,7 @@ mod vault_write_tests {
             "ошибка записи должна попасть в статус, а там: {:?}",
             app.status
         );
+        let _ = std::fs::remove_file(&blocked);
         let _ = std::fs::remove_file(&tmp);
     }
 

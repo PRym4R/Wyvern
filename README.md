@@ -2,8 +2,8 @@
 
 A lightweight Discord client in Rust + egui. Token and a local password, servers
 and channels, history that pages in as you scroll up, images and GIFs, and a
-debug log in `/tmp`. Everything runs on your own machine; there is no server of
-its own.
+debug log in the platform cache directory. Everything runs on your own machine;
+there is no server of its own.
 
 Licensed under AGPL-3.0 (see `LICENSE`).
 
@@ -16,16 +16,20 @@ cp -f target/release/wyvern ./wyvern   # a ready binary is committed in the repo
 ```
 
 The token goes into the login field. If "Remember this account" is ticked, the
-token is encrypted with a password in `~/.wyvern_accounts.json` (AES-256-GCM,
-key derived via PBKDF2). The path can be overridden with `WYVERN_ACCOUNTS_PATH`
-— test and sandbox runs then leave the real vault alone.
+token is encrypted with a password in `accounts.json` (AES-256-GCM, key derived
+via PBKDF2). It lives in the platform data directory — `~/.local/share/wyvern`
+on Linux, `%APPDATA%\wyvern` on Windows, `~/Library/Application Support/wyvern`
+on macOS — and the path can be overridden with `WYVERN_ACCOUNTS_PATH`, so test
+and sandbox runs leave the real vault alone.
 
 ## Debug log
 
-Each frame writes panel geometry to `/tmp/wyvern_layout.log`; on overflow the
-file is rotated to `.1`. Gateway events and image downloads go there too, so the
-log shows what the client sees. A message dump into `/tmp` happens only with
-`WYVERN_DUMP=1`.
+Each frame writes panel geometry to `layout.log` in the platform cache directory
+(`~/.cache/wyvern` on Linux, `%LOCALAPPDATA%\wyvern` on Windows,
+`~/Library/Caches/wyvern` on macOS); on overflow the file is rotated to `.1`.
+Gateway events and image downloads go there too, so the log shows what the
+client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
+(`messages_dump.txt`) happens only with `WYVERN_DUMP=1`.
 
 ## Layout
 
@@ -36,6 +40,7 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 | `src/gateway.rs` | WebSocket gateway and history/message parsing |
 | `src/media.rs` | downloading, decoding and caching images and GIFs |
 | `src/models.rs` | data structures, byte-budget cache |
+| `src/paths.rs` | cross-platform data/cache paths and legacy migration |
 | `src/ui/*` | screens: login, sidebar, chat, attachments, input, overlays, settings |
 | `src/crypto.rs` | account vault encryption |
 | `src/ss.rs` | native Shadowsocks (SIP002 parsing, AEAD ciphers, stream) |
@@ -46,7 +51,7 @@ log shows what the client sees. A message dump into `/tmp` happens only with
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 265 tests (262 + 3 ignored)
+cargo test --release                                        # 272 tests (269 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke
@@ -55,6 +60,22 @@ WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_prox
 ---
 
 # Changes
+
+## 0.9.2 — 2026-10-20
+
+- **Cross-platform paths**: settings, the vault and deleted history now live in
+  the OS data directory, and logs in the cache directory, resolved through the
+  `dirs` crate instead of hidden `~/.wyvern_*` files. The old files are moved
+  once on startup. On Linux the paths are `~/.local/share/wyvern` and
+  `~/.cache/wyvern`; Windows release builds no longer open a console window.
+- **Live messages in large guilds**: opening a channel now sends a gateway
+  guild subscription (`op 14`) for that channel. Without it Discord withholds
+  `MESSAGE_CREATE` in big servers and new messages only appeared after
+  reopening the channel (REST history still worked).
+- **Themes**: expanded from 3 to 13 — added Midnight, Nord, Dracula, Tokyo
+  Night, AMOLED, Catppuccin, Gruvbox, plus gradient palettes Aurora, Sunset and
+  Ocean. Dark/Cyberpunk/Light were reworked for contrast, and Settings shows a
+  live preview for each theme.
 
 ## 0.9.0 — 2026-10-19
 
@@ -81,7 +102,10 @@ WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_prox
 - **Settings and state**: a settings window (theme, UI and font scale, hide
   media, notifications, keep deleted, reset scale, clear drafts, reset window
   size). Theme, window size, last channel and per-channel drafts persist in
-  `~/.wyvern_settings.json`; kept-deleted messages in `~/.wyvern_deleted.json`.
+  `settings.json`; kept-deleted messages in `deleted.json`. Both live in the
+  platform data directory (`~/.local/share/wyvern` on Linux, `%APPDATA%\wyvern`
+  on Windows, `~/Library/Application Support/wyvern` on macOS); pre-0.9.2
+  `~/.wyvern_*` files are migrated once on startup.
 - **Typing indicator**: "Alice is typing…" / "Several people are typing…";
   it lapses after eight seconds (Discord sends no stop event); DM names are
   resolved from loaded messages; our own typing is ignored.
