@@ -6,11 +6,13 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
 - **Linux (primary)**: `/home/hackerman/wyvern` — the git repo, the real
   build/test host, and where the user runs the client.
 - **Windows (this copy)**: `C:\Users\hackerman\Documents\Wyvern-main` — no
-  `.git`, no `git` on PATH, and no MSVC linker. Treat it as a mirror: inspect
-  and test here (see the gnu command below), but the real build happens on
-  Linux.
-- Both roots carry a committed **Linux ELF** `./wyvern` (~29 MB). Never read
-  the binary and never copy a Windows build over it.
+  `.git`; the git clone that is pushed from lives next to it in
+  `...\wyvern-git`. There is no MSVC linker, so `cargo` alone fails: use the
+  gnu toolchain below. Treat `Wyvern-main` as a mirror: inspect and test here,
+  but the Linux release build happens on Linux.
+- Both roots carry a committed **Linux ELF** `./wyvern` (~29 MB) and a
+  committed **Windows build** `./wyvern.exe` (~30 MB). Never read either
+  binary, and never copy a Windows build over `./wyvern`.
 
 ## Commands
 - Build (Linux, the release target):

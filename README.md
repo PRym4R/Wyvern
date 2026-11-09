@@ -15,6 +15,9 @@ cp -f target/release/wyvern ./wyvern   # a ready binary is committed in the repo
 ./wyvern
 ```
 
+Ready builds are committed at the repo root: `./wyvern` for Linux and
+`./wyvern.exe` for Windows.
+
 The token goes into the login field. If "Remember this account" is ticked, the
 token is encrypted with a password in `accounts.json` (AES-256-GCM, key derived
 via PBKDF2). It lives in the platform data directory — `~/.local/share/wyvern`
