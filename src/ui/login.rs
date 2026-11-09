@@ -138,11 +138,22 @@ impl App {
                     .corner_radius(12.0),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("ACCOUNTS")
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("ACCOUNTS")
+                            .size(10.0)
+                            .color(theme.text_secondary),
+                    );
+                    ui.label(
+                        RichText::new(if self.accounts_unlocked {
+                            "click to sign in"
+                        } else {
+                            "click to choose, then enter the password"
+                        })
                         .size(10.0)
-                        .color(theme.text_secondary),
-                );
+                        .color(theme.text_secondary.gamma_multiply(0.7)),
+                    );
+                });
                 ui.add_space(6.0);
                 for row in &rows {
                     ui.horizontal(|ui| {

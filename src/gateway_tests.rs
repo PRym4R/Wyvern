@@ -615,6 +615,45 @@ mod parse_tests {
         assert_eq!(live.reply.map(|r| r.preview), Some("первая строка".to_string()));
     }
 
+    /// Reactions arrive in history and in live payloads the same way: a plain
+    /// unicode emoji, a custom one with an id, counts and our own flag.
+    #[test]
+    fn reactions_parse_from_both_paths() {
+        let body = r#"[{"id":"1","content":"x","author":{"id":"u","username":"n"},
+            "reactions":[{"count":3,"me":true,"emoji":{"id":null,"name":"👍"}},
+                         {"count":"2","me":false,"emoji":{"id":"42","name":"cat","animated":true}}]}]"#;
+        let m = parse_one(body);
+        assert_eq!(m.reactions.len(), 2, "обе реакции должны разобраться");
+        assert_eq!(m.reactions[0].label(), "👍", "юникод-эмодзи показывается как есть");
+        assert_eq!(m.reactions[0].count, 3);
+        assert!(m.reactions[0].me, "наша реакция должна быть отмечена");
+        assert_eq!(m.reactions[0].api_key(), "👍", "юникод-ключ — сам символ");
+        assert_eq!(m.reactions[1].label(), ":cat:", "кастомный эмодзи показывается именем");
+        assert_eq!(m.reactions[1].count, 2, "счёт строкой должен читаться");
+        assert_eq!(m.reactions[1].api_key(), "cat:42", "кастомный ключ — name:id");
+        assert!(m.reactions[1].animated);
+
+        let live = parse_message_value(
+            &serde_json::from_str::<serde_json::Value>(body).unwrap()[0],
+            "9",
+        )
+        .expect("живое сообщение");
+        assert_eq!(
+            m.reactions, live.reactions,
+            "живой разбор реакций должен совпадать с историей"
+        );
+    }
+
+    /// An emoji with neither a name nor an id is dropped instead of drawn empty.
+    #[test]
+    fn empty_reaction_is_skipped() {
+        let body = r#"[{"id":"1","content":"x","author":{"id":"u","username":"n"},
+            "reactions":[{"count":1,"emoji":{"id":null,"name":""}},{"count":1,"emoji":{"id":"7","name":"ok"}}]}]"#;
+        let m = parse_one(body);
+        assert_eq!(m.reactions.len(), 1, "пустая реакция должна отбрасываться");
+        assert_eq!(m.reactions[0].label(), ":ok:");
+    }
+
     /// History and live messages must parse identically, except the channel:
     /// a page takes the requested channel, a live message its own `channel_id`.
     #[test]
@@ -779,5 +818,95 @@ mod heartbeat_tests {
         assert_eq!(reconnect_delay_with_jitter(3, 1.0), base + Duration::from_secs(2));
         assert_eq!(reconnect_delay_with_jitter(3, -5.0), base);
         assert_eq!(reconnect_delay_with_jitter(3, 5.0), base + Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod send_retry_tests {
+    use super::{send_retry_delay, send_retryable};
+    use std::time::Duration;
+
+    /// Only a throttled or temporarily broken Discord is worth another try;
+    /// a refused message must surface immediately.
+    #[test]
+    fn only_temporary_statuses_are_retried() {
+        for status in [429u16, 500, 502, 503, 504] {
+            assert!(
+                send_retryable(status),
+                "временный статус {} должен повторяться",
+                status
+            );
+        }
+        for status in [200u16, 400, 401, 403, 404, 413] {
+            assert!(
+                !send_retryable(status),
+                "статус {} повторять бессмысленно",
+                status
+            );
+        }
+    }
+
+    /// The backoff doubles from half a second and stops growing.
+    #[test]
+    fn retry_backoff_doubles_and_is_capped() {
+        assert_eq!(
+            send_retry_delay(0),
+            Duration::from_millis(500),
+            "нулевая попытка не должна ждать ноль"
+        );
+        assert_eq!(send_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(send_retry_delay(2), Duration::from_millis(1000));
+        assert_eq!(send_retry_delay(3), Duration::from_millis(2000));
+        assert_eq!(
+            send_retry_delay(9),
+            Duration::from_millis(4000),
+            "рост должен упираться в потолок"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::{encode_path_segment, reaction_url};
+
+    /// A unicode emoji is multi-byte UTF-8 and must reach the URL as percent
+    /// escapes; the colon of `name:id` must survive or a custom emoji breaks.
+    #[test]
+    fn emoji_path_segment_is_encoded_but_keeps_the_colon() {
+        assert_eq!(
+            encode_path_segment("👍"),
+            "%F0%9F%91%8D",
+            "юникод-эмодзи должен кодироваться побайтово"
+        );
+        assert_eq!(
+            encode_path_segment("cat:42"),
+            "cat:42",
+            "двоеточие кастомного эмодзи не кодируется"
+        );
+        assert_eq!(
+            encode_path_segment("a b"),
+            "a%20b",
+            "пробел в пути должен кодироваться"
+        );
+        assert_eq!(
+            encode_path_segment("ok-._~"),
+            "ok-._~",
+            "безопасные символы остаются как есть"
+        );
+    }
+
+    /// The reaction URL ends with our own `@me` and carries the encoded emoji.
+    #[test]
+    fn reaction_url_points_at_our_own_reaction() {
+        assert_eq!(
+            reaction_url("c1", "m2", "👍"),
+            "https://discord.com/api/v10/channels/c1/messages/m2/reactions/%F0%9F%91%8D/@me",
+            "URL реакции собран неверно"
+        );
+        assert_eq!(
+            reaction_url("c1", "m2", "cat:42"),
+            "https://discord.com/api/v10/channels/c1/messages/m2/reactions/cat:42/@me",
+            "кастомный эмодзи должен идти как name:id"
+        );
     }
 }

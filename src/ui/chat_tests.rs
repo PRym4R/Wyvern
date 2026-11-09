@@ -97,6 +97,7 @@ mod geometry_tests {
             timestamp: "2026-01-01T00:00:00.000Z".into(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
             reply: None,
             is_own: i % 11 == 0,
         }
@@ -343,6 +344,85 @@ mod geometry_tests {
         }
     }
 
+    /// Two frames at `pos`: press, then release. egui reports the click on the
+    /// release frame, which is when the pill hit-test fires.
+    fn click_at(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut press = screen();
+        press.events.push(egui::Event::PointerMoved(pos));
+        press.events.push(button(true));
+        let _ = ctx.run(press, |ctx| app.draw_chat(ctx));
+
+        let mut release = screen();
+        release.events.push(egui::Event::PointerMoved(pos));
+        release.events.push(button(false));
+        let _ = ctx.run(release, |ctx| app.draw_chat(ctx));
+    }
+
+    /// Clicking a reaction pill toggles it even though the message frame and
+    /// the scroll area also sense clicks and are registered later; that is the
+    /// case the manual pointer hit-test exists for.
+    #[test]
+    fn clicking_a_pill_toggles_the_reaction() {
+        let mut h = app_with_messages(1);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        let mut msg = (*h.app.messages["c0"][0]).clone();
+        msg.reactions.push(crate::models::Reaction {
+            name: "👍".into(),
+            id: None,
+            count: 2,
+            me: false,
+            animated: false,
+        });
+        h.app.messages.get_mut("c0").unwrap()[0] = Arc::new(msg);
+        frames(&mut h.app, &ctx, 2);
+
+        let (rect, key) = h
+            .app
+            .probe_reaction_rects
+            .first()
+            .cloned()
+            .expect("пилюля должна быть нарисована");
+        assert_eq!(key, "👍");
+
+        click_at(&mut h.app, &ctx, rect.center());
+
+        let msg = &h.app.messages["c0"][0];
+        assert_eq!(msg.reactions.len(), 1, "вторая пилюля появиться не должна");
+        assert!(msg.reactions[0].me, "клик по пилюле должен добавить нашу реакцию");
+        assert_eq!(msg.reactions[0].count, 3, "счётчик должен вырасти на нас");
+
+        let mut sent = false;
+        while let Ok(cmd) = h.cmds.try_recv() {
+            if let ToGateway::React { emoji, add, .. } = cmd {
+                assert_eq!(emoji, "👍");
+                assert!(add, "клик добавляет реакцию");
+                sent = true;
+            }
+        }
+        assert!(sent, "команда реакции должна уйти в гейтвей");
+    }
+
+    /// A click on a pill can add a reaction to a message that had none: this is
+    /// the only way to react without a full emoji picker.
+    #[test]
+    fn quick_reaction_menus_cover_the_basic_emoji() {
+        // The list is what the context menu offers; it must stay non-empty and
+        // free of duplicates (a duplicate would toggle itself twice).
+        let mut seen = std::collections::HashSet::new();
+        for emoji in super::QUICK_REACTIONS {
+            assert!(!emoji.is_empty(), "пустой эмодзи в меню");
+            assert!(seen.insert(emoji), "эмодзи {emoji} повторяется в меню");
+        }
+    }
+
     /// Estimation must stay close to the real height: a bias made the list
     /// drift and the bottom unreachable. Measured on live egui.
     #[test]
@@ -380,6 +460,25 @@ mod geometry_tests {
                 size: Some([100, 200]),
             });
             cases.push((format!("{who} с картинкой"), m));
+            let mut m = message(97);
+            m.is_own = own;
+            m.author_id = "u0".into();
+            m.content = "с реакциями".into();
+            m.reactions.push(crate::models::Reaction {
+                name: "👍".into(),
+                id: None,
+                count: 2,
+                me: true,
+                animated: false,
+            });
+            m.reactions.push(crate::models::Reaction {
+                name: "❤".into(),
+                id: None,
+                count: 12,
+                me: false,
+                animated: false,
+            });
+            cases.push((format!("{who} с реакциями"), m));
         }
 
         let mut sum_est = 0.0;
@@ -1084,6 +1183,7 @@ mod menu_tests {
             timestamp: String::new(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
             reply: None,
             is_own: own,
         }
@@ -1140,7 +1240,10 @@ mod menu_tests {
     fn menu_reflects_which_actions_apply() {
         let app = app();
         let own = app.message_menu(&message("m1", "текст", true));
-        assert!(own.reply && own.edit && own.delete && own.copy, "own: {own:?}");
+        assert!(
+            own.reply && own.react && own.edit && own.delete && own.copy,
+            "own: {own:?}"
+        );
 
         // Edit needs text: an image-only own message has nothing to change.
         let image_only = app.message_menu(&message("m2", "", true));
@@ -1148,21 +1251,24 @@ mod menu_tests {
         assert!(image_only.delete, "удалить картинку можно: {image_only:?}");
 
         let other = app.message_menu(&message("m1", "текст", false));
-        assert!(other.reply && other.copy, "other reply/copy: {other:?}");
+        assert!(
+            other.reply && other.react && other.copy,
+            "other reply/react/copy: {other:?}"
+        );
         assert!(!other.edit && !other.delete, "other edit/delete: {other:?}");
 
         // A pending local echo carries a `local:` id, not a real Discord id:
         // id-based actions must stay off even though the id is non-empty.
         let pending = app.message_menu(&message("local:0", "текст", true));
         assert!(
-            !pending.reply && !pending.edit && !pending.delete,
+            !pending.reply && !pending.react && !pending.edit && !pending.delete,
             "pending: {pending:?}"
         );
         assert!(pending.copy, "pending copy: {pending:?}");
 
         // No id at all is the same: nothing to reference.
         let no_id = app.message_menu(&message("", "текст", true));
-        assert!(!no_id.reply && !no_id.edit && !no_id.delete);
+        assert!(!no_id.reply && !no_id.react && !no_id.edit && !no_id.delete);
 
         let empty = app.message_menu(&message("m1", "", false));
         assert!(!empty.copy, "empty copy: {empty:?}");

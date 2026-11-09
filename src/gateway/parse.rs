@@ -3,7 +3,9 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::models::{image_size_of, message_preview, size_from, Attachment, ChatMessage, Embed, ReplyRef};
+use crate::models::{
+    image_size_of, message_preview, size_from, Attachment, ChatMessage, Embed, Reaction, ReplyRef,
+};
 
 /// Deserialize a field that may not be a string (e.g. `content` can be a
 /// number) by stringifying it, instead of dropping the whole page.
@@ -117,6 +119,68 @@ impl RawEmbed {
     }
 }
 
+/// One reaction: the emoji plus how many people used it and whether we did.
+#[derive(serde::Deserialize)]
+struct RawReaction {
+    #[serde(default)]
+    emoji: Option<RawEmoji>,
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    count: Option<u32>,
+    #[serde(default)]
+    me: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RawEmoji {
+    #[serde(default, deserialize_with = "de_opt_text")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_text")]
+    name: Option<String>,
+    #[serde(default)]
+    animated: bool,
+}
+
+impl RawReaction {
+    fn into_reaction(self) -> Option<Reaction> {
+        let emoji = self.emoji?;
+        let name = emoji.name.unwrap_or_default();
+        // No text and no custom id: nothing to draw and nothing to send back.
+        if name.is_empty() && emoji.id.is_none() {
+            return None;
+        }
+        Some(Reaction {
+            name,
+            id: emoji.id,
+            count: self.count.unwrap_or(1),
+            me: self.me,
+            animated: emoji.animated,
+        })
+    }
+}
+
+/// The same reaction from an already-built `Value` tree (live events). Kept
+/// next to [`RawReaction`] so both paths must agree; a test compares them.
+fn reaction_from_value(v: &Value) -> Option<Reaction> {
+    let emoji = v.get("emoji")?;
+    let name = emoji["name"].as_str().unwrap_or_default().to_string();
+    let id = emoji["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    if name.is_empty() && id.is_none() {
+        return None;
+    }
+    let count = match v.get("count") {
+        Some(Value::Number(n)) => n.as_u64().map(|x| x.min(u64::from(u32::MAX)) as u32),
+        Some(Value::String(s)) => s.trim().parse::<u32>().ok(),
+        _ => None,
+    };
+    Some(Reaction {
+        name,
+        id,
+        count: count.unwrap_or(1),
+        me: v.get("me").map(|m| m.as_bool().unwrap_or(false)).unwrap_or(false),
+        animated: emoji["animated"].as_bool().unwrap_or(false),
+    })
+}
+
 /// Message as stored by the client.
 #[derive(serde::Deserialize)]
 struct RawMessage {
@@ -132,6 +196,8 @@ struct RawMessage {
     attachments: Vec<RawAttachment>,
     #[serde(default)]
     embeds: Vec<RawEmbed>,
+    #[serde(default)]
+    reactions: Vec<RawReaction>,
     /// The message this one replies to, if any (Discord includes it inline).
     #[serde(default)]
     referenced_message: Option<RawRefMessage>,
@@ -201,6 +267,7 @@ impl RawMessage {
             // Store embeds trimmed: the full JSON costs far more than the two
             // fields used.
             embeds: self.embeds.into_iter().filter_map(RawEmbed::into_embed).collect(),
+            reactions: self.reactions.into_iter().filter_map(RawReaction::into_reaction).collect(),
             reply: self.referenced_message.map(RawRefMessage::into_reply),
             is_own: false,
         })
@@ -269,6 +336,10 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
         embeds: m["embeds"]
             .as_array()
             .map(|arr| arr.iter().filter_map(Embed::from_json).collect())
+            .unwrap_or_default(),
+        reactions: m["reactions"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(reaction_from_value).collect())
             .unwrap_or_default(),
         reply: m.get("referenced_message").map(|r| {
             let content = r["content"].as_str().unwrap_or("");

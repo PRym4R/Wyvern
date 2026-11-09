@@ -394,6 +394,7 @@ impl App {
                 timestamp: String::new(),
                 attachments: Vec::new(),
                 embeds: Vec::new(),
+                reactions: Vec::new(),
                 reply: reply_ref,
                 is_own: true,
             }));

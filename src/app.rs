@@ -9,7 +9,7 @@ use crate::gateway::{run_gateway, EventTx, Generation};
 use crate::media::AvatarFetch;
 use crate::messages::{ToApp, ToGateway};
 use crate::models::{
-    BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, MsgHeight,
+    BoundedCache, ChatChannel, ChatMessage, Guild, ImagePayload, LoadedImage, MsgHeight, Reaction,
     StoredAccount, Theme, UserProfile,
 };
 use crate::deleted::DeletedStore;
@@ -415,6 +415,13 @@ pub(crate) struct App {
     pub(crate) chat_anchor: Option<(String, f32)>,
     /// Request older messages; set during rendering.
     pub(crate) want_older: bool,
+    /// Reaction clicked while the list was taken out of `messages` for
+    /// drawing: `(channel, message, emoji key)`, applied right after restore.
+    pub(crate) reaction_click: Option<(String, String, String)>,
+    /// Test probe: reaction pill rects drawn last frame and their emoji, so a
+    /// test can click one at its real position.
+    #[cfg(test)]
+    pub(crate) probe_reaction_rects: Vec<(egui::Rect, String)>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -532,6 +539,9 @@ impl App {
             chat_offset_y: 0.0,
             chat_anchor: None,
             want_older: false,
+            reaction_click: None,
+            #[cfg(test)]
+            probe_reaction_rects: Vec::new(),
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),
@@ -683,8 +693,8 @@ impl App {
             self.settings.drafts.insert(cid, text);
         }
     }
-    /// Desktop notification via `notify-send`; only when the window isn't focused.
-    #[cfg(target_os = "linux")]
+    /// Desktop notification; only when the window isn't focused. The platform
+    /// tool itself lives in `crate::notify` (`notify-send`, PowerShell, osascript).
     fn notify_desktop(&self, msg: &ChatMessage) {
         let focused = self.egui_ctx.as_ref().map(|c| c.input(|i| i.focused)).unwrap_or(false);
         if focused {
@@ -694,16 +704,8 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        use std::process::{Command, Stdio};
-        let _ = Command::new("notify-send")
-            .arg(&msg.author_name)
-            .arg(text)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        crate::notify::desktop(&msg.author_name, text);
     }
-    #[cfg(not(target_os = "linux"))]
-    fn notify_desktop(&self, _msg: &ChatMessage) {}
     /// Queues a corner notice, dropping the oldest if the stack is full.
     pub(crate) fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
         let text = text.into();
@@ -1042,6 +1044,23 @@ impl App {
                     if self.current_channel_id() == Some(channel_id.as_str()) {
                         self.send_error = Some(reason);
                     }
+                }
+                ToApp::ReactionFailed {
+                    channel_id,
+                    message_id,
+                    emoji,
+                    add,
+                } => {
+                    // Undo the optimistic pill: the same toggle in reverse.
+                    self.toggle_reaction_local(&channel_id, &message_id, &emoji);
+                    self.toast(
+                        ToastKind::Error,
+                        if add {
+                            "Couldn't add reaction".to_string()
+                        } else {
+                            "Couldn't remove reaction".to_string()
+                        },
+                    );
                 }
                 ToApp::AuthFailed { reason } => {
                     // Token rejected: return to the login screen, keeping the token in the field so it can be fixed.
@@ -1453,6 +1472,68 @@ impl App {
         if changed {
             self.msg_heights.remove(&id);
         }
+    }
+    /// Toggle our own reaction on a message. The pill flips at once; the REST
+    /// call confirms it and `ReactionFailed` flips it back. `emoji` is the API
+    /// key: `name` for a unicode emoji, `name:id` for a custom one.
+    pub(crate) fn toggle_reaction(&mut self, channel_id: &str, message_id: &str, emoji: &str) {
+        let Some(add) = self.toggle_reaction_local(channel_id, message_id, emoji) else {
+            return;
+        };
+        self.send_cmd(ToGateway::React {
+            channel_id: channel_id.to_string(),
+            message_id: message_id.to_string(),
+            emoji: emoji.to_string(),
+            add,
+        });
+    }
+    /// The local half of [`Self::toggle_reaction`]: flip the pill and drop the
+    /// cached row height so it remeasures. `Some(add)` on success, `None` when
+    /// the message is no longer there; the caller uses `add` to undo on error.
+    pub(crate) fn toggle_reaction_local(
+        &mut self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Option<bool> {
+        let entry = self.messages.get_mut(channel_id)?;
+        let slot = entry.iter_mut().find(|m| m.id == message_id)?;
+        let msg = Arc::make_mut(slot);
+        let position = msg.reactions.iter().position(|r| r.api_key() == emoji);
+        let add = match position {
+            Some(i) if msg.reactions[i].me => {
+                let r = &mut msg.reactions[i];
+                r.me = false;
+                r.count = r.count.saturating_sub(1);
+                if r.count == 0 {
+                    msg.reactions.remove(i);
+                }
+                false
+            }
+            Some(i) => {
+                let r = &mut msg.reactions[i];
+                r.me = true;
+                r.count = r.count.saturating_add(1);
+                true
+            }
+            None => {
+                // First reaction on this message: build the pill from the key.
+                let (name, id) = match emoji.split_once(':') {
+                    Some((name, id)) if !id.is_empty() => (name.to_string(), Some(id.to_string())),
+                    _ => (emoji.to_string(), None),
+                };
+                msg.reactions.push(Reaction {
+                    name,
+                    id,
+                    count: 1,
+                    me: true,
+                    animated: false,
+                });
+                true
+            }
+        };
+        self.msg_heights.remove(message_id);
+        Some(add)
     }
     /// Remove one message and its cached height so it doesn't linger until rejoin.
     /// With `keep_deleted` on, the row stays and is drawn red instead.

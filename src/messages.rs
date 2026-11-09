@@ -55,6 +55,14 @@ pub(crate) enum ToApp {
     EditFailed { channel_id: String, message_id: String, content: String, reason: String },
     /// Delete refused; the row stays and `reason` is shown in chat.
     DeleteFailed { channel_id: String, reason: String },
+    /// Reaction refused (no permission, deleted message, network). `add` says
+    /// which way the optimistic toggle went so the app can undo exactly that.
+    ReactionFailed {
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    },
     Debug(String),
 }
 
@@ -72,6 +80,14 @@ pub(crate) enum ToGateway {
     /// Delete one of our messages. Discord answers with MESSAGE_DELETE, which
     /// removes the row; a rejection comes back as `DeleteFailed`.
     DeleteMessage { channel_id: String, message_id: String },
+    /// Add (`add`) or remove our own reaction. `emoji` is the API key:
+    /// `name:id` for a custom emoji, the bare character otherwise.
+    React {
+        channel_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    },
     /// History page. `before` is the oldest shown id: `None` for the first
     /// page, otherwise paging upward.
     FetchHistory { channel_id: String, before: Option<String> },

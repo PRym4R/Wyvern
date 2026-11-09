@@ -38,6 +38,7 @@ fn make_app() -> App {
             timestamp: "2026-01-01T00:00:00.000Z".into(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
             reply: None,
             is_own: false,
         })],
@@ -161,6 +162,7 @@ fn chat_scroll_to_bottom_on_history() {
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reactions: vec![],
         reply: None,
         is_own: false,
     }).map(Arc::new).collect::<Vec<_>>();
@@ -420,19 +422,18 @@ fn full_cycle_save_restart_unlock_and_login() {
     assert_eq!(app2.saved_accounts[0].token, token);
     assert!(app2.accounts_unlocked);
 
-    // 4. Click an account in the bottom strip.
+    // 4. Click an account in the bottom strip: the vault is already open, so
+    // the click is the login itself — no second "Log in" press.
     app2.select_account(token.clone());
-    assert_eq!(app2.login_selected.as_deref(), Some(token.as_str()));
-    assert_eq!(app2.login_password, pw, "раз уже открыто — пароль подставляется");
-
-    // 5. Press login: token goes to the gateway, selection clears.
-    app2.login_with_password(&token);
+    assert!(
+        app2.login_selected.is_none(),
+        "при открытом хранилище клик по аккаунту сразу входит"
+    );
+    assert!(app2.login_password.is_empty(), "пароль из поля должен очищаться");
     assert_eq!(app2.token_input, token, "вход должен выбрать аккаунт");
     assert!(app2.gw_started, "гейтвей должен стартовать");
-    assert!(app2.login_selected.is_none(), "после входа выбор сброшен");
-    assert!(app2.login_password.is_empty(), "пароль из поля должен очищаться");
 
-    // 6. The vault on disk survived the login.
+    // 5. The vault on disk survived the login.
     drop(app2);
     let mut app3 = App::new(mpsc::unbounded_channel().1);
     app3.vault_path_override = Some(tmp.clone());
@@ -473,6 +474,7 @@ fn history_is_capped_and_old_channels_dropped() {
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reactions: vec![],
         reply: None,
         is_own: false,
     };
@@ -528,6 +530,7 @@ fn test_msg(id: &str, channel_id: &str, content: &str) -> ChatMessage {        C
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         attachments: vec![],
         embeds: vec![],
+        reactions: vec![],
         reply: None,
         is_own: false,
     }
@@ -2470,4 +2473,144 @@ fn proxy_form_loads_vless_link_verbatim() {
     assert_eq!(app.proxy_host, "uk5.example.org");
     assert_eq!(app.proxy_port, "8443");
     assert_eq!(app.proxy_link, link, "ссылка сохраняется целиком для round-trip");
+}
+
+/// Toggling a reaction flips our pill at once and tells the gateway; a second
+/// click takes the pill away entirely.
+#[test]
+fn toggle_reaction_adds_then_removes() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let (to_gw, mut cmds) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.to_gw = Some(to_gw);
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "привет"))]);
+    // A stale measured height must not survive the pill appearing.
+    app.msg_heights.insert(
+        "m1".into(),
+        MsgHeight { height: 40.0, width: 800, grouped: false },
+    );
+
+    app.toggle_reaction("c1", "m1", "👍");
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "реакция должна появиться сразу");
+    assert_eq!(msg.reactions[0].label(), "👍");
+    assert_eq!(msg.reactions[0].count, 1);
+    assert!(msg.reactions[0].me, "своя реакция должна быть отмечена");
+    assert!(!app.msg_heights.contains_key("m1"), "высоту строки нужно пересчитать");
+    match cmds.try_recv().expect("команда должна уйти в гейтвей") {
+        ToGateway::React { channel_id, message_id, emoji, add } => {
+            assert_eq!(channel_id, "c1");
+            assert_eq!(message_id, "m1");
+            assert_eq!(emoji, "👍");
+            assert!(add, "первый клик добавляет реакцию");
+        }
+        other => panic!("ожидалась реакция, пришло {:?}", other),
+    }
+
+    app.toggle_reaction("c1", "m1", "👍");
+
+    let msg = &app.messages["c1"][0];
+    assert!(msg.reactions.is_empty(), "повторный клик убирает свою реакцию");
+    match cmds.try_recv().expect("вторая команда") {
+        ToGateway::React { add, .. } => assert!(!add, "второй клик снимает реакцию"),
+        other => panic!("ожидалась реакция, пришло {:?}", other),
+    }
+}
+
+/// Someone else's reaction (count 3, not ours) is joined, not duplicated.
+#[test]
+fn toggle_reaction_joins_an_existing_pill() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    let mut msg = test_msg("m1", "c1", "текст");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        id: None,
+        count: 3,
+        me: false,
+        animated: false,
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    app.toggle_reaction("c1", "m1", "👍");
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "новая колонка не должна появляться");
+    assert!(msg.reactions[0].me);
+    assert_eq!(msg.reactions[0].count, 4, "счётчик должен вырасти на нас");
+}
+
+/// Taking our own reaction back leaves the other three people on the pill.
+#[test]
+fn toggle_reaction_leaves_others_on_the_pill() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    let mut msg = test_msg("m1", "c1", "текст");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        id: None,
+        count: 4,
+        me: true,
+        animated: false,
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    app.toggle_reaction("c1", "m1", "👍");
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "чужие реакции должны остаться");
+    assert!(!msg.reactions[0].me);
+    assert_eq!(msg.reactions[0].count, 3);
+}
+
+/// A custom emoji is keyed `name:id`; the pill shows `:name:` and the same key
+/// comes back when toggling it off.
+#[test]
+fn toggle_reaction_handles_custom_emoji() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "текст"))]);
+
+    app.toggle_reaction("c1", "m1", "cat:42");
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions[0].label(), ":cat:");
+    assert_eq!(msg.reactions[0].id.as_deref(), Some("42"));
+    assert_eq!(msg.reactions[0].api_key(), "cat:42");
+
+    app.toggle_reaction("c1", "m1", "cat:42");
+    assert!(
+        app.messages["c1"][0].reactions.is_empty(),
+        "снятие по тому же ключу должно находить кастомный эмодзи"
+    );
+}
+
+/// The failure path undoes exactly the direction the optimistic toggle took.
+#[test]
+fn reaction_failure_undoes_the_toggle() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "текст"))]);
+
+    assert_eq!(app.toggle_reaction_local("c1", "m1", "👍"), Some(true));
+    assert_eq!(app.messages["c1"][0].reactions.len(), 1);
+    // Discord refused the PUT: the same toggle in reverse removes the pill.
+    assert_eq!(app.toggle_reaction_local("c1", "m1", "👍"), Some(false));
+    assert!(app.messages["c1"][0].reactions.is_empty(), "отказ должен откатить пилюлю");
+}
+
+/// A reaction click for a message that is gone changes nothing and sends nothing.
+#[test]
+fn toggle_reaction_ignores_a_missing_message() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let (to_gw, mut cmds) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.to_gw = Some(to_gw);
+
+    app.toggle_reaction("c1", "нет-такого", "👍");
+
+    assert!(cmds.try_recv().is_err(), "без сообщения отправлять нечего");
 }

@@ -72,12 +72,12 @@ impl<V: CacheCost> BoundedCache<V> {
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
-    // Test/debug helpers, not used by the client itself.
-    #[allow(dead_code)]
+    // Test-only helper: the client itself never asks whether a key is cached.
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &str) -> bool {
         self.map.contains_key(key)
     }
-    #[allow(dead_code)]
+    /// How many entries the cache holds; used by the media debug log.
     pub(crate) fn len(&self) -> usize {
         self.map.len()
     }
@@ -182,9 +182,45 @@ pub(crate) struct ChatMessage {
     pub(crate) timestamp: String,
     pub(crate) attachments: Vec<Attachment>,
     pub(crate) embeds: Vec<Embed>,
+    /// Emoji reactions, in the order Discord sent them.
+    pub(crate) reactions: Vec<Reaction>,
     /// The message this one replies to, reduced to what the client shows.
     pub(crate) reply: Option<ReplyRef>,
     pub(crate) is_own: bool,
+}
+
+/// One emoji reaction: a unicode emoji (`id` is `None`) or a custom one.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct Reaction {
+    /// The emoji itself for unicode, or the name of a custom emoji.
+    pub(crate) name: String,
+    /// Custom emoji id; `None` for a plain unicode emoji.
+    pub(crate) id: Option<String>,
+    pub(crate) count: u32,
+    /// Whether we are among those who reacted.
+    pub(crate) me: bool,
+    pub(crate) animated: bool,
+}
+
+impl Reaction {
+    /// What the pill shows: the unicode emoji, or `:name:` for a custom one,
+    /// which has no image in the client yet.
+    pub(crate) fn label(&self) -> String {
+        if self.id.is_some() {
+            format!(":{}:", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+    /// The path segment Discord wants in `PUT .../reactions/{emoji}/@me`:
+    /// `name:id` for custom emoji, the bare character for unicode ones.
+    pub(crate) fn api_key(&self) -> String {
+        match &self.id {
+            Some(id) => format!("{}:{}", self.name, id),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// A referenced (replied-to) message: the bits needed for the quote line above

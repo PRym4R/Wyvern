@@ -10,11 +10,25 @@ use crate::models::{ChatChannel, ChatMessage, UserProfile};
 use crate::util::super_props;
 
 use super::parse::parse_history_page_lenient;
+use super::ratelimit;
 use super::{EventTx, API_BASE};
 
 /// Messages per history page. Discord allows up to 100, but loading three
 /// pages at once shows an empty channel; 50, then more on scroll.
 pub(crate) const HISTORY_PAGE: usize = 50;
+
+/// Browser fingerprint Discord expects on every REST call. A user token
+/// without it gets flagged, so the headers live in one place: a new endpoint
+/// cannot forget one.
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+fn browser_headers(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    req.header("Authorization", token)
+        .header("User-Agent", USER_AGENT)
+        .header("X-Super-Properties", super_props())
+        .header("X-Discord-Locale", "en-US")
+        .header("X-Discord-Timezone", "Europe/Moscow")
+}
 
 /// Send a message to a channel.
 ///
@@ -64,6 +78,25 @@ pub(crate) fn client_with_timeout(timeout: Duration) -> Result<reqwest::Client, 
         .map_err(|e| format!("failed to build HTTP client: {}", e))
 }
 
+/// Attempts per send before the composer gets the text back. Three covers a
+/// rate limit or a blip; more would leave the echo hanging for too long.
+const SEND_ATTEMPTS: u32 = 3;
+
+/// Whether a status is worth another attempt: Discord throttling us or a
+/// temporary outage. A 400/403/404 means the message itself was refused, and
+/// retrying the same text would only annoy the user.
+pub(crate) fn send_retryable(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Backoff between attempts, doubling from half a second and capped at four.
+/// The rate limiter already waits when Discord says how long; this covers a
+/// blind `5xx`.
+pub(crate) fn send_retry_delay(attempt: u32) -> Duration {
+    let shifted = attempt.saturating_sub(1).min(3);
+    Duration::from_millis(500u64 << shifted)
+}
+
 /// Send a message to a ready URL. The URL is a parameter so tests can point
 /// at a local socket.
 pub(crate) async fn send_message_to(
@@ -89,20 +122,32 @@ pub(crate) async fn send_message_to(
             "channel_id": channel_id.as_str(),
         });
     }
-    let req = httpc
-        .post(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow")
-        .json(&body);
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
+    let route = format!("messages:{}", channel_id);
+    // The text stays in the echo until an attempt finally fails: a `429` or a
+    // dropped connection is retried instead of handing the draft back.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        ratelimit::wait(&route).await;
+        let req = browser_headers(httpc.post(&url), &tkn).json(&body);
+        match req.send().await {
+            Ok(resp) => {
+                let limit = ratelimit::note(&route, resp.headers());
+                let status = resp.status();
+                if status.is_success() {
+                    let _ = event_tx.send(ToApp::Debug("Message sent".into()));
+                    return;
+                }
                 let body = resp.text().await.unwrap_or_default();
                 let _ = event_tx.send(ToApp::Debug(format!("Send failed {}: {}", status, body)));
+                if send_retryable(status.as_u16()) && attempt < SEND_ATTEMPTS {
+                    // A rate limit is already remembered by the limiter; only a
+                    // blind `5xx` needs a backoff of our own.
+                    if limit.is_none() {
+                        tokio::time::sleep(send_retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
                 // Show the failure and drop the echo: otherwise it looks sent
                 // forever.
                 let _ = event_tx.send(ToApp::SendFailed {
@@ -110,17 +155,21 @@ pub(crate) async fn send_message_to(
                     local_id,
                     reason: send_failure_reason(status.as_u16()).to_string(),
                 });
-            } else {
-                let _ = event_tx.send(ToApp::Debug("Message sent".into()));
+                return;
             }
-        }
-        Err(e) => {
-            let _ = event_tx.send(ToApp::Debug(format!("Send error: {}", e)));
-            let _ = event_tx.send(ToApp::SendFailed {
-                channel_id,
-                local_id,
-                reason: "couldn't send: no connection to Discord".to_string(),
-            });
+            Err(e) => {
+                let _ = event_tx.send(ToApp::Debug(format!("Send error: {}", e)));
+                if attempt < SEND_ATTEMPTS {
+                    tokio::time::sleep(send_retry_delay(attempt)).await;
+                    continue;
+                }
+                let _ = event_tx.send(ToApp::SendFailed {
+                    channel_id,
+                    local_id,
+                    reason: "couldn't send: no connection to Discord".to_string(),
+                });
+                return;
+            }
         }
     }
 }
@@ -169,16 +218,12 @@ pub(crate) async fn edit_message_to(
     message_id: String,
     content: String,
 ) {
-    let req = httpc
-        .patch(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow")
-        .json(&json!({ "content": content }));
+    let route = format!("edit:{}", channel_id);
+    ratelimit::wait(&route).await;
+    let req = browser_headers(httpc.patch(&url), &tkn).json(&json!({ "content": content }));
     match req.send().await {
         Ok(resp) => {
+            let _ = ratelimit::note(&route, resp.headers());
             let status = resp.status();
             if status.is_success() {
                 let _ = event_tx.send(ToApp::Debug("Message edited".into()));
@@ -205,6 +250,76 @@ pub(crate) async fn edit_message_to(
     }
 }
 
+/// URL for one reaction on one message. `emoji` is already the API key
+/// (`name` or `name:id`), percent-encoded for the path.
+pub(crate) fn reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
+    format!(
+        "{}/channels/{}/messages/{}/reactions/{}/@me",
+        API_BASE,
+        channel_id,
+        message_id,
+        encode_path_segment(emoji)
+    )
+}
+
+/// Percent-encode one path segment. A unicode emoji is multi-byte UTF-8 and
+/// would otherwise produce an invalid URL; `:` must survive so a custom emoji
+/// stays `name:id`.
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+/// Add (`add`) or remove our own reaction. The UI has already toggled the pill
+/// optimistically; a rejection comes back as `ReactionFailed` so it can undo.
+pub(super) async fn set_reaction(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    message_id: String,
+    emoji: String,
+    add: bool,
+) {
+    let url = reaction_url(&channel_id, &message_id, &emoji);
+    let route = format!("reactions:{}", channel_id);
+    ratelimit::wait(&route).await;
+    let req = browser_headers(httpc.request(if add { reqwest::Method::PUT } else { reqwest::Method::DELETE }, &url), &tkn);
+    let result = req.send().await;
+    match result {
+        Ok(resp) => {
+            let _ = ratelimit::note(&route, resp.headers());
+            let status = resp.status();
+            if !status.is_success() {
+                let _ = event_tx.send(ToApp::Debug(format!("Reaction failed {}", status)));
+                let _ = event_tx.send(ToApp::ReactionFailed {
+                    channel_id,
+                    message_id,
+                    emoji,
+                    add,
+                });
+            }
+        }
+        Err(e) => {
+            let _ = event_tx.send(ToApp::Debug(format!("Reaction error: {}", e)));
+            let _ = event_tx.send(ToApp::ReactionFailed {
+                channel_id,
+                message_id,
+                emoji,
+                add,
+            });
+        }
+    }
+}
+
 /// Delete a message. The row disappears on MESSAGE_DELETE, not here.
 pub(super) async fn delete_message(
     httpc: reqwest::Client,
@@ -226,15 +341,12 @@ pub(crate) async fn delete_message_to(
     url: String,
     channel_id: String,
 ) {
-    let req = httpc
-        .delete(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow");
+    let route = format!("delete:{}", channel_id);
+    ratelimit::wait(&route).await;
+    let req = browser_headers(httpc.delete(&url), &tkn);
     match req.send().await {
         Ok(resp) => {
+            let _ = ratelimit::note(&route, resp.headers());
             let status = resp.status();
             if status.is_success() {
                 let _ = event_tx.send(ToApp::Debug("Message deleted".into()));
@@ -270,21 +382,18 @@ pub(super) async fn ack_message(
         "{}/channels/{}/messages/{}/ack",
         API_BASE, channel_id, message_id
     );
-    let req = httpc
-        .post(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow")
-        .json(&json!({ "token": null }));
+    let route = format!("ack:{}", channel_id);
+    ratelimit::wait(&route).await;
+    let req = browser_headers(httpc.post(&url), &tkn).json(&json!({ "token": null }));
     match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let _ = event_tx.send(ToApp::Debug("Channel acked".into()));
-        }
         Ok(resp) => {
-            let status = resp.status();
-            let _ = event_tx.send(ToApp::Debug(format!("Ack failed {}", status)));
+            let _ = ratelimit::note(&route, resp.headers());
+            if resp.status().is_success() {
+                let _ = event_tx.send(ToApp::Debug("Channel acked".into()));
+            } else {
+                let status = resp.status();
+                let _ = event_tx.send(ToApp::Debug(format!("Ack failed {}", status)));
+            }
         }
         Err(e) => {
             let _ = event_tx.send(ToApp::Debug(format!("Ack error: {}", e)));
@@ -301,16 +410,12 @@ pub(super) async fn open_dm(
     user_id: String,
 ) {
     let url = format!("{}/users/@me/channels", API_BASE);
-    let req = httpc
-        .post(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow")
-        .json(&json!({ "recipient_id": user_id }));
+    let route = "dm";
+    ratelimit::wait(route).await;
+    let req = browser_headers(httpc.post(&url), &tkn).json(&json!({ "recipient_id": user_id }));
     match req.send().await {
         Ok(resp) => {
+            let _ = ratelimit::note(route, resp.headers());
             let status = resp.status();
             if !status.is_success() {
                 let _ = event_tx.send(ToApp::Debug(format!("Open DM failed {}", status)));
@@ -347,25 +452,21 @@ pub(super) async fn fetch_relationships(
     tkn: String,
     url: String,
 ) -> Result<Vec<UserProfile>, String> {
+    let route = "relationships";
     for _attempt in 0..3 {
-        let req = httpc
-            .get(&url)
-            .header("Authorization", &*tkn)
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-            .header("X-Super-Properties", &super_props())
-            .header("X-Discord-Locale", "en-US")
-            .header("X-Discord-Timezone", "Europe/Moscow");
+        ratelimit::wait(route).await;
+        let req = browser_headers(httpc.get(&url), &tkn);
         match req.send().await {
             Ok(resp) => {
+                let limit = ratelimit::note(route, resp.headers());
                 let status = resp.status();
                 if status == 429 {
-                    let retry = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(2);
-                    tokio::time::sleep(Duration::from_secs(retry)).await;
+                    // `retry-after` is what Discord asks for; the fixed two
+                    // seconds only covers a response that names no delay.
+                    let wait = limit
+                        .map(|l| l.wait)
+                        .unwrap_or(Duration::from_secs(2));
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
                 if !status.is_success() {
@@ -414,30 +515,27 @@ pub(super) async fn fetch_history_page(
     let mut got_page = false;
     let mut failed = false;
     let mut reason = String::new();
+    let route = format!("history:{}", channel_id);
     let mut attempt = 0u32;
     while !got_page && attempt < 3 && !failed {
         attempt += 1;
-        let req = httpc
-            .get(&url)
-            .header("Authorization", &*tkn)
-            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-            .header("X-Super-Properties", &super_props())
-            .header("X-Discord-Locale", "en-US")
-            .header("X-Discord-Timezone", "Europe/Moscow");
+        ratelimit::wait(&route).await;
+        let req = browser_headers(httpc.get(&url), &tkn);
         match req.send().await {
             Ok(resp) => {
+                let limit = ratelimit::note(&route, resp.headers());
                 let status = resp.status();
                 let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
                 if status == 429 {
-                    let retry = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(2);
-                    let _ = event_tx.send(ToApp::Debug(format!("History 429, retrying in {}s", retry)));
+                    let wait = limit
+                        .map(|l| l.wait)
+                        .unwrap_or(Duration::from_secs(2));
+                    let _ = event_tx.send(ToApp::Debug(format!(
+                        "History 429, retrying in {:?}",
+                        wait
+                    )));
                     reason = "Discord asks you to wait (rate limit)".to_string();
-                    time::sleep(Duration::from_secs(retry)).await;
+                    time::sleep(wait).await;
                     continue;
                 }
                 if !status.is_success() {
@@ -545,18 +643,17 @@ pub(super) async fn send_files(
         });
     }
 
-    let mut form = reqwest::multipart::Form::new()
-        .text("payload_json", payload.to_string());
-
-    for (i, path) in paths.iter().enumerate() {
+    // Read once: a retry must not re-read a file that may have changed (or
+    // vanished) between attempts.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(paths.len());
+    for path in &paths {
         match tokio::fs::read(path).await {
             Ok(bytes) => {
                 let name = std::path::Path::new(path)
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
-                let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
-                form = form.part(format!("files[{}]", i), part);
+                files.push((name, bytes));
             }
             Err(e) => {
                 let _ = event_tx.send(ToApp::Debug(format!("Read file error: {}", e)));
@@ -565,27 +662,45 @@ pub(super) async fn send_files(
         }
     }
 
-    let req = httpc
-        .post(&url)
-        .header("Authorization", &*tkn)
-        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .header("X-Super-Properties", &super_props())
-        .header("X-Discord-Locale", "en-US")
-        .header("X-Discord-Timezone", "Europe/Moscow")
-        .multipart(form);
+    let route = format!("messages:{}", channel_id);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut form = reqwest::multipart::Form::new()
+            .text("payload_json", payload.to_string());
+        for (i, (name, bytes)) in files.iter().enumerate() {
+            let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name(name.clone());
+            form = form.part(format!("files[{}]", i), part);
+        }
 
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if !status.is_success() {
+        ratelimit::wait(&route).await;
+        let req = browser_headers(httpc.post(&url), &tkn).multipart(form);
+        match req.send().await {
+            Ok(resp) => {
+                let limit = ratelimit::note(&route, resp.headers());
+                let status = resp.status();
+                if status.is_success() {
+                    let _ = event_tx.send(ToApp::Debug("Files sent".into()));
+                    return;
+                }
                 let body = resp.text().await.unwrap_or_default();
                 let _ = event_tx.send(ToApp::Debug(format!("Send files failed {}: {}", status, body)));
-            } else {
-                let _ = event_tx.send(ToApp::Debug("Files sent".into()));
+                if send_retryable(status.as_u16()) && attempt < SEND_ATTEMPTS {
+                    if limit.is_none() {
+                        tokio::time::sleep(send_retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+                return;
             }
-        }
-        Err(e) => {
-            let _ = event_tx.send(ToApp::Debug(format!("Send files error: {}", e)));
+            Err(e) => {
+                let _ = event_tx.send(ToApp::Debug(format!("Send files error: {}", e)));
+                if attempt < SEND_ATTEMPTS {
+                    tokio::time::sleep(send_retry_delay(attempt)).await;
+                    continue;
+                }
+                return;
+            }
         }
     }
 }

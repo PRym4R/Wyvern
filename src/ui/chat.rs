@@ -26,6 +26,12 @@ const BUBBLE_BASE_H: f32 = 30.0;
 const OTHER_MIN_H: f32 = 72.0;
 /// Height of the reply quote line above a reply's own content.
 const REPLY_ROW_H: f32 = 16.0;
+/// One row of reaction pills, including the gap above it. Pills wrap, so a
+/// message with many reactions is estimated short and corrected after drawing.
+const REACTION_ROW_H: f32 = 24.0;
+/// Emoji offered by the quick "Add reaction" menu. A searchable picker is a
+/// separate piece of work; these cover everyday use.
+const QUICK_REACTIONS: [&str; 8] = ["👍", "❤️", "😂", "🎉", "😮", "😢", "🔥", "👀"];
 /// Gap after an image inside a message.
 const IMAGE_GAP: f32 = 6.0;
 /// Avatar side; a grouped row is indented by this plus the item spacing to
@@ -50,6 +56,8 @@ const CHAR_W: f32 = 7.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct MessageMenu {
     pub(crate) reply: bool,
+    /// A confirmed id is required to react; a local echo has none yet.
+    pub(crate) react: bool,
     pub(crate) edit: bool,
     pub(crate) delete: bool,
     pub(crate) copy: bool,
@@ -185,6 +193,7 @@ impl App {
         let own = self.is_own_msg(msg);
         MessageMenu {
             reply: confirmed,
+            react: confirmed,
             edit: own && confirmed && !msg.content.trim().is_empty(),
             delete: own && confirmed,
             copy: !self.display_content(msg).trim().is_empty(),
@@ -266,6 +275,25 @@ impl App {
     fn message_context_menu(&mut self, response: &egui::Response, msg: &ChatMessage) {
         let menu = self.message_menu(msg);
         response.context_menu(|ui| {
+            ui.menu_button("Add reaction", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for emoji in QUICK_REACTIONS {
+                        if ui
+                            .add_enabled(menu.react, egui::Button::new(RichText::new(emoji).size(16.0)))
+                            .clicked()
+                        {
+                            // Applied after the frame: the list is taken out of
+                            // `messages` while it is being drawn.
+                            self.reaction_click = Some((
+                                msg.channel_id.clone(),
+                                msg.id.clone(),
+                                emoji.to_string(),
+                            ));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
             if ui
                 .add_enabled(menu.reply, egui::Button::new("Reply"))
                 .clicked()
@@ -338,7 +366,8 @@ impl App {
             images += h + IMAGE_GAP;
         });
         let mut total = BUBBLE_BASE_H + lines * LINE_H + images
-            + if msg.reply.is_some() { REPLY_ROW_H } else { 0.0 };
+            + if msg.reply.is_some() { REPLY_ROW_H } else { 0.0 }
+            + if msg.reactions.is_empty() { 0.0 } else { REACTION_ROW_H };
         if grouped {
             // No name row, and a tighter gap than a full block.
             total += GROUPED_GAP - MESSAGE_GAP;
@@ -696,6 +725,11 @@ impl App {
                 // id from it, while the frame drew from its own Vec.
                 self.restore_channel_messages(taken_channel, msgs);
                 self.msg_offsets = offsets;
+                // Reaction clicks are deferred: the list lives outside
+                // `self.messages` while the frame draws it.
+                if let Some((channel_id, message_id, emoji)) = self.reaction_click.take() {
+                    self.toggle_reaction(&channel_id, &message_id, &emoji);
+                }
                 if self.want_older {
                     self.want_older = false;
                     self.request_older_history();
@@ -783,6 +817,7 @@ impl App {
                         self.draw_reply_quote(ui, msg);
                         render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
+                        self.draw_reactions(ui, msg);
                     });
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
@@ -848,11 +883,81 @@ impl App {
                         self.draw_reply_quote(ui, msg);
                         render_message_text(ui, content, 14.0, text_color);
                         self.draw_attachments(ui, msg);
+                        self.draw_reactions(ui, msg);
                     });
                 });
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
                 ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
+        }
+    }
+    /// Reaction pills under the message. A click toggles ours: the pill flips
+    /// at once and the REST call follows. Recorded for after the frame, since
+    /// the message list is taken out of `App::messages` while drawing.
+    fn draw_reactions(&mut self, ui: &mut egui::Ui, msg: &ChatMessage) {
+        #[cfg(test)]
+        self.probe_reaction_rects.clear();
+        if msg.reactions.is_empty() {
+            return;
+        }
+        let mut clicked_emoji: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for reaction in &msg.reactions {
+                let fill = if reaction.me {
+                    self.theme.accent.gamma_multiply(0.18)
+                } else {
+                    self.theme.message_hover
+                };
+                let stroke = egui::Stroke::new(
+                    1.0_f32,
+                    if reaction.me { self.theme.accent } else { self.theme.divider },
+                );
+                let text = RichText::new(format!("{} {}", reaction.label(), reaction.count))
+                    .size(12.0)
+                    .color(if reaction.me {
+                        self.theme.accent
+                    } else {
+                        self.theme.text_secondary
+                    });
+                let response = egui::Frame::new()
+                    .fill(fill)
+                    .stroke(stroke)
+                    .corner_radius(9.0)
+                    .inner_margin(egui::Margin::symmetric(7, 2))
+                    .show(ui, |ui| {
+                        ui.label(text);
+                    })
+                    .response;
+                let rect = response.rect;
+                #[cfg(test)]
+                self.probe_reaction_rects.push((rect, reaction.api_key()));
+                let response = response.interact(egui::Sense::click());
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                // `clicked()` alone misses: the surrounding message frame and the
+                // scroll area both sense clicks and are registered later, so they
+                // take the press. Fall back to a direct pointer hit-test, the
+                // same way the image tiles do.
+                let clicked = response.clicked()
+                    || ui
+                        .ctx()
+                        .pointer_latest_pos()
+                        .map(|p| rect.contains(p) && ui.ctx().input(|i| i.pointer.primary_clicked()))
+                        .unwrap_or(false);
+                if clicked {
+                    clicked_emoji = Some(reaction.api_key());
+                }
+                response.on_hover_text(if reaction.me {
+                    "Remove your reaction"
+                } else {
+                    "Add reaction"
+                });
+            }
+        });
+        if let Some(emoji) = clicked_emoji {
+            self.reaction_click = Some((msg.channel_id.clone(), msg.id.clone(), emoji));
         }
     }
     pub(crate) fn draw_lightbox(&mut self, ctx: &egui::Context) {

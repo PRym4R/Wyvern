@@ -19,12 +19,13 @@ use crate::models::{ChatChannel, Guild};
 use crate::util::{client_properties, super_props};
 
 mod parse;
+mod ratelimit;
 mod rest;
 
 use self::parse::parse_message_value;
 use self::rest::{
     ack_message, api_client, delete_message, edit_message, fetch_history_page, fetch_relationships,
-    open_dm, send_files, send_message,
+    open_dm, send_files, send_message, set_reaction,
 };
 
 // Re-exported so the `crate::gateway::...` paths used by the test modules keep
@@ -33,8 +34,9 @@ use self::rest::{
 pub(crate) use self::parse::{parse_history_page, parse_history_page_lenient};
 #[cfg(test)]
 pub(crate) use self::rest::{
-    client_with_timeout, delete_message_to, edit_message_to, history_url, message_action_reason,
-    message_url, more_history_available, next_before_id, send_failure_reason, send_message_to,
+    client_with_timeout, delete_message_to, edit_message_to, encode_path_segment, history_url,
+    message_action_reason, message_url, more_history_available, next_before_id,
+    reaction_url, send_failure_reason, send_message_to, send_retry_delay, send_retryable,
     API_TIMEOUT, HISTORY_PAGE,
 };
 
@@ -489,6 +491,22 @@ async fn socks5_connect(
     Ok(stream)
 }
 
+/// One queued send: a text message or a message with files.
+enum SendJob {
+    Message {
+        channel_id: String,
+        content: String,
+        local_id: String,
+        reply_to: Option<String>,
+    },
+    Files {
+        channel_id: String,
+        content: String,
+        paths: Vec<String>,
+        reply_to: Option<String>,
+    },
+}
+
 async fn gw_inner(
     cmd_rx: &mut mpsc::UnboundedReceiver<ToGateway>,
     event_tx: EventTx,
@@ -571,6 +589,28 @@ async fn gw_inner(
     // forever (see `api_client`).
     let http = api_client()?;
     let tkn = token.to_string();
+
+    // Sends go through one worker so they keep their order: a retried message
+    // must not land after a newer one. The gateway loop stays free to read
+    // events while the POST runs.
+    let (send_tx, mut send_rx) = mpsc::unbounded_channel::<SendJob>();
+    {
+        let httpc = http.clone();
+        let tkc = tkn.clone();
+        let ev = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(job) = send_rx.recv().await {
+                match job {
+                    SendJob::Message { channel_id, content, local_id, reply_to } => {
+                        send_message(httpc.clone(), tkc.clone(), ev.clone(), channel_id, content, local_id, reply_to).await;
+                    }
+                    SendJob::Files { channel_id, content, paths, reply_to } => {
+                        send_files(httpc.clone(), tkc.clone(), ev.clone(), channel_id, content, paths, reply_to).await;
+                    }
+                }
+            }
+        });
+    }
     let mut heartbeat = time::interval(Duration::from_millis(interval));
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
@@ -1003,21 +1043,20 @@ async fn gw_inner(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ToGateway::Send { channel_id, content, local_id, reply_to } => {
-                        // Send in a separate task so the gateway keeps reading
-                        // events and commands during the POST.
-                        let httpc = http.clone();
-                        let tkc = tkn.clone();
-                        let ev = event_tx.clone();
-                        tokio::spawn(async move {
-                            send_message(httpc, tkc, ev, channel_id, content, local_id, reply_to).await;
+                        // Queued, not spawned: the worker sends in order.
+                        let _ = send_tx.send(SendJob::Message {
+                            channel_id,
+                            content,
+                            local_id,
+                            reply_to,
                         });
                     }
                     ToGateway::SendFiles { channel_id, content, paths, reply_to } => {
-                        let httpc = http.clone();
-                        let tkc = tkn.clone();
-                        let ev = event_tx.clone();
-                        tokio::spawn(async move {
-                            send_files(httpc, tkc, ev, channel_id, content, paths, reply_to).await;
+                        let _ = send_tx.send(SendJob::Files {
+                            channel_id,
+                            content,
+                            paths,
+                            reply_to,
                         });
                     }
                     ToGateway::EditMessage { channel_id, message_id, content } => {
@@ -1035,6 +1074,16 @@ async fn gw_inner(
                         let ev = event_tx.clone();
                         tokio::spawn(async move {
                             delete_message(httpc, tkc, ev, channel_id, message_id).await;
+                        });
+                    }
+                    ToGateway::React { channel_id, message_id, emoji, add } => {
+                        // Not queued with sends: a reaction must not wait for a
+                        // slow upload to finish.
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            set_reaction(httpc, tkc, ev, channel_id, message_id, emoji, add).await;
                         });
                     }
                     ToGateway::FetchHistory { channel_id, before } => {

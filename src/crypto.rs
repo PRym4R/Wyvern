@@ -328,15 +328,28 @@ impl App {
         let pw = self.master_password.clone();
         self.save_accounts(&pw);
     }
-    /// Left-click an account in the bottom bar: select it and ask for the password.
+    /// Left-click an account in the bottom bar. When the vault is already open
+    /// (the password was typed a moment ago), the click signs in directly:
+    /// making the user pick the account and then press "Log in" again is
+    /// busywork for the same password. A locked vault still selects the account
+    /// and asks for the password.
     pub(crate) fn select_account(&mut self, token: String) {
+        if self.accounts_unlocked {
+            if !self.saved_accounts.iter().any(|a| a.token == token) {
+                self.status = "Account not found in the vault".to_string();
+                return;
+            }
+            // The vault stays open, so no second PBKDF2 pass is needed.
+            self.login_selected = None;
+            self.login_password.clear();
+            self.status.clear();
+            self.login_notice.clear();
+            self.switch_account(token);
+            return;
+        }
         self.login_selected = Some(token);
         self.status.clear();
-        self.login_password = if self.accounts_unlocked {
-            self.master_password.clone()
-        } else {
-            String::new()
-        };
+        self.login_password.clear();
     }
     pub(crate) fn clear_login_selection(&mut self) {
         self.login_selected = None;

@@ -20,6 +20,7 @@ mod media;
 mod messages;
 mod models;
 mod net;
+mod notify;
 mod paths;
 mod settings;
 mod ss;

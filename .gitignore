@@ -1,5 +1,8 @@
 target/
 
+# Windows build (the tracked ./wyvern binary is the Linux one)
+wyvern.exe
+
 # Local planning notes, not published
 TODO.md
 ROADMAP.md

@@ -482,3 +482,67 @@ mod vault_write_tests {
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
     }
 }
+
+#[cfg(test)]
+mod select_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// An app with one saved account and a temp vault path, so nothing touches
+    /// the real accounts file.
+    fn app_with_account(tag: &str) -> (App, std::path::PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!("wyvern-test-select-{}-{}.json", std::process::id(), tag));
+        let _ = std::fs::remove_file(&p);
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(rx);
+        app.vault_path_override = Some(p.clone());
+        app.no_gateway = true;
+        app.saved_accounts = vec![StoredAccount {
+            token: "tok-a".into(),
+            username: "Алиса".into(),
+        }];
+        (app, p)
+    }
+
+    /// A locked vault cannot sign in on its own: the click only selects the
+    /// account, and the form then asks for the password.
+    #[test]
+    fn locked_vault_only_selects() {
+        let (mut app, tmp) = app_with_account("locked");
+        app.select_account("tok-a".into());
+        assert_eq!(app.login_selected.as_deref(), Some("tok-a"));
+        assert!(app.login_password.is_empty(), "пароль ещё не введён");
+        assert!(!app.gw_started, "без пароля входа быть не должно");
+        assert!(app.token_input.is_empty(), "токен не должен подставляться");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Once the vault is open the click is the login: no second "Log in" press.
+    #[test]
+    fn open_vault_signs_in_on_click() {
+        let (mut app, tmp) = app_with_account("open");
+        app.accounts_unlocked = true;
+        app.select_account("tok-a".into());
+        assert!(app.login_selected.is_none(), "при открытом хранилище форма не нужна");
+        assert_eq!(app.token_input, "tok-a", "клик должен сразу выбрать аккаунт");
+        assert!(app.gw_started, "клик должен сразу запускать вход");
+        assert!(app.login_password.is_empty(), "пароль из поля должен очищаться");
+        assert_eq!(app.saved_accounts.len(), 1, "аккаунт не должен потеряться");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("lock"));
+    }
+
+    /// A token that is not in the vault must be refused instead of starting a
+    /// session with something unknown.
+    #[test]
+    fn unknown_account_is_refused() {
+        let (mut app, tmp) = app_with_account("unknown");
+        app.accounts_unlocked = true;
+        app.select_account("чужой".into());
+        assert_eq!(app.status, "Account not found in the vault");
+        assert!(!app.gw_started, "неизвестный аккаунт не должен входить");
+        assert!(app.login_selected.is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
