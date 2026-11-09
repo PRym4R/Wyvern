@@ -1,5 +1,8 @@
 target/
 
+# Windows build output: the release binary is attached to GitHub Releases
+wyvern.exe
+
 # Local planning notes, not published
 TODO.md
 ROADMAP.md

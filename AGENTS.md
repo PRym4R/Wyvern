@@ -10,9 +10,10 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   `...\wyvern-git`. There is no MSVC linker, so `cargo` alone fails: use the
   gnu toolchain below. Treat `Wyvern-main` as a mirror: inspect and test here,
   but the Linux release build happens on Linux.
-- Both roots carry a committed **Linux ELF** `./wyvern` (~29 MB) and a
-  committed **Windows build** `./wyvern.exe` (~30 MB). Never read either
-  binary, and never copy a Windows build over `./wyvern`.
+- Both roots carry a committed **Linux ELF** `./wyvern` (~29 MB). Never read
+  it and never copy a Windows build over it. The **Windows** build is not
+  committed: it is attached to the GitHub release for its tag
+  (`wyvern.exe`), and `wyvern.exe` stays gitignored.
 
 ## Commands
 - Build (Linux, the release target):

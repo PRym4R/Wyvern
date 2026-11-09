@@ -15,8 +15,8 @@ cp -f target/release/wyvern ./wyvern   # a ready binary is committed in the repo
 ./wyvern
 ```
 
-Ready builds are committed at the repo root: `./wyvern` for Linux and
-`./wyvern.exe` for Windows.
+Ready Linux builds are committed at the repo root (`./wyvern`); the Windows
+build (`wyvern.exe`) is attached to each GitHub release.
 
 The token goes into the login field. If "Remember this account" is ticked, the
 token is encrypted with a password in `accounts.json` (AES-256-GCM, key derived
