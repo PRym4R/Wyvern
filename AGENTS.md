@@ -32,10 +32,18 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   cargo +stable-x86_64-pc-windows-gnu test
   ```
 
-## Git (Linux only; `git` is not installed on Windows)
-- Identity is unset: `git -c user.name='hackerman' -c user.email='hackerman@local' commit ...`.
-- Only `main`; no side branches. Never push — the user pushes manually.
+## Git and releases
+- `git` 2.56 is installed on Windows and pushes go out from
+  `C:\Users\hackerman\Documents\wyvern-git` (identity `prym4r`, credentials via
+  Git Credential Manager). The Linux checkout commits as
+  `git -c user.name='hackerman' -c user.email='hackerman@local' commit ...`.
+- Only `main`; no side branches. Never push without being asked.
 - Style: `feat(scope): ...`, `fix(scope): ...`, `docs(...)`.
+- Releases: `gh` (GitHub CLI) is installed at
+  `C:\Program Files\GitHub CLI\gh.exe`. The stored credential is a PAT without
+  `read:org`, so `gh auth login` refuses it — export it instead:
+  `$env:GH_TOKEN = (... | git credential fill ... | password line)` and run
+  `gh release create <tag> ./wyvern.exe --title <ver> --notes-file <file>`.
 
 ## Conventions
 - Code comments: English, brief ("why" first). User-facing strings: English.
