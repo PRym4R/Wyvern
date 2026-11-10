@@ -33,6 +33,14 @@ pub(crate) enum ToApp {
         reaction: Reaction,
         user_id: String,
     },
+    /// Everyone lost one emoji (moderator action): the whole pill goes.
+    ReactionEmojiCleared {
+        channel_id: String,
+        message_id: String,
+        reaction: Reaction,
+    },
+    /// Every reaction on the message was removed.
+    ReactionsCleared { channel_id: String, message_id: String },
     /// Someone started typing in a channel. `user_name` may be empty when the
     /// event carries only a user id (DMs); the app then resolves the name from
     /// messages it has already seen.

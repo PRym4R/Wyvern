@@ -966,6 +966,24 @@ async fn gw_inner(
                                     }
                                 }
                             }
+                            "MESSAGE_REACTION_REMOVE_EMOJI" => {
+                                let d = &v["d"];
+                                // A moderator sweep: one emoji loses everybody.
+                                if let Some(reaction) = reaction_event_emoji(d) {
+                                    let _ = event_tx.send(ToApp::ReactionEmojiCleared {
+                                        channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+                                        message_id: d["message_id"].as_str().unwrap_or("").to_string(),
+                                        reaction,
+                                    });
+                                }
+                            }
+                            "MESSAGE_REACTION_REMOVE_ALL" => {
+                                let d = &v["d"];
+                                let _ = event_tx.send(ToApp::ReactionsCleared {
+                                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
+                                    message_id: d["message_id"].as_str().unwrap_or("").to_string(),
+                                });
+                            }
                             "CHANNEL_UPDATE" => {
                                 let d = &v["d"];
                                 let _ = event_tx.send(ToApp::ChannelUpdated {

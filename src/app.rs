@@ -925,6 +925,12 @@ impl App {
                 ToApp::ReactionRemoved { channel_id, message_id, reaction, user_id } => {
                     self.apply_reaction_event(&channel_id, &message_id, reaction, &user_id, false)
                 }
+                ToApp::ReactionEmojiCleared { channel_id, message_id, reaction } => {
+                    self.clear_reaction_emoji(&channel_id, &message_id, &reaction)
+                }
+                ToApp::ReactionsCleared { channel_id, message_id } => {
+                    self.clear_reactions(&channel_id, &message_id)
+                }
                 ToApp::ChannelUpdated { channel_id, name, topic } => {
                     self.update_channel(&channel_id, name, topic)
                 }
@@ -1624,6 +1630,50 @@ impl App {
         }
         if changed {
             // Pills change the row height: the measurement must be redone.
+            self.msg_heights.remove(message_id);
+        }
+    }
+
+    /// A moderator cleared one emoji from a message: the whole pill goes, ours
+    /// included, and the row must be re-measured.
+    pub(crate) fn clear_reaction_emoji(
+        &mut self,
+        channel_id: &str,
+        message_id: &str,
+        reaction: &Reaction,
+    ) {
+        let key = reaction.api_key();
+        let changed = {
+            let Some(entry) = self.messages.get_mut(channel_id) else {
+                return;
+            };
+            let Some(slot) = entry.iter_mut().find(|m| m.id == message_id) else {
+                return;
+            };
+            let msg = Arc::make_mut(slot);
+            let before = msg.reactions.len();
+            msg.reactions.retain(|r| r.api_key() != key);
+            msg.reactions.len() != before
+        };
+        if changed {
+            self.msg_heights.remove(message_id);
+        }
+    }
+    /// Every reaction on the message was swept: all pills go at once.
+    pub(crate) fn clear_reactions(&mut self, channel_id: &str, message_id: &str) {
+        let changed = {
+            let Some(entry) = self.messages.get_mut(channel_id) else {
+                return;
+            };
+            let Some(slot) = entry.iter_mut().find(|m| m.id == message_id) else {
+                return;
+            };
+            let msg = Arc::make_mut(slot);
+            let had = !msg.reactions.is_empty();
+            msg.reactions.clear();
+            had
+        };
+        if changed {
             self.msg_heights.remove(message_id);
         }
     }

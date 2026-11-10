@@ -3,6 +3,13 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.3 - 2026-11-10
+
+- **Moderator reaction sweeps**: `MESSAGE_REACTION_REMOVE_EMOJI` drops the whole
+  pill for one emoji and `MESSAGE_REACTION_REMOVE_ALL` clears every pill on the
+  message. Before, a cleared reaction kept its old counter until the channel was
+  reloaded, and clicking the stale pill then disagreed with the server.
+
 ## 0.10.2 - 2026-11-10
 
 - **Quick reactions on hover**: pointing at a message brings up a small strip of

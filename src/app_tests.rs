@@ -2768,3 +2768,59 @@ fn reaction_event_for_unloaded_channel_is_ignored() {
 
     assert!(app.messages["c1"][0].reactions.is_empty());
 }
+
+/// A moderator clearing one emoji takes that whole pill away, ours included.
+#[test]
+fn reaction_emoji_clear_drops_only_that_pill() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    let mut msg = test_msg("m1", "c1", "привет");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        count: 3,
+        me: true,
+        ..Default::default()
+    });
+    msg.reactions.push(Reaction {
+        name: "🔥".into(),
+        count: 1,
+        me: false,
+        ..Default::default()
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+    app.msg_heights.insert(
+        "m1".into(),
+        MsgHeight { height: 40.0, width: 800, grouped: false },
+    );
+
+    app.clear_reaction_emoji("c1", "m1", &event_reaction("👍"));
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "должна остаться только чужая пилюля");
+    assert_eq!(msg.reactions[0].name, "🔥");
+    assert!(!app.msg_heights.contains_key("m1"), "высоту строки нужно пересчитать");
+}
+
+/// A full sweep removes every pill at once.
+#[test]
+fn reaction_clear_empties_the_row() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    let mut msg = test_msg("m1", "c1", "привет");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        count: 2,
+        me: true,
+        ..Default::default()
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    app.clear_reactions("c1", "m1");
+
+    assert!(
+        app.messages["c1"][0].reactions.is_empty(),
+        "после полной очистки пилюль быть не должно"
+    );
+}
