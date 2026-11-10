@@ -410,6 +410,85 @@ mod geometry_tests {
         assert!(sent, "команда реакции должна уйти в гейтвей");
     }
 
+    /// Hovering a message shows the quick-reaction strip. It floats above the
+    /// row, so the click lands outside the message itself — the strip must still
+    /// be there and the click must still count.
+    #[test]
+    fn hovering_a_message_offers_quick_reactions() {
+        let mut h = app_with_messages(2);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        let (row, id) = h
+            .app
+            .probe_msg_rows
+            .first()
+            .cloned()
+            .expect("строка сообщения должна быть отрисована");
+        assert_eq!(id, "m0000", "первой рисуется верхняя строка");
+
+        // Наводим курсор на строку: полоска должна появиться.
+        let mut input = screen();
+        input.events.push(egui::Event::PointerMoved(row.center()));
+        let _ = ctx.run(input, |ctx| h.app.draw_chat(ctx));
+
+        let cells = h.app.probe_quick_rects.clone();
+        assert_eq!(
+            cells.len(),
+            crate::ui::chat::QUICK_REACTIONS.len(),
+            "на каждый быстрый эмодзи должна быть своя ячейка"
+        );
+        assert_eq!(cells[0].1, "👍", "первым идёт «палец вверх»");
+
+        // Полоска висит над строкой: точка ячейки заведомо вне сообщения.
+        let (cell, _) = cells[0].clone();
+        assert!(
+            !row.contains(cell.center()),
+            "полоска должна висеть над строкой, а не внутри неё"
+        );
+
+        click_at(&mut h.app, &ctx, cell.center());
+
+        let msg = &h.app.messages["c0"][0];
+        assert_eq!(msg.reactions.len(), 1, "клик по полоске ставит реакцию");
+        assert!(msg.reactions[0].me, "наша реакция должна быть подсвечена");
+        assert_eq!(msg.reactions[0].label(), "👍");
+
+        let mut sent = false;
+        while let Ok(cmd) = h.cmds.try_recv() {
+            if let ToGateway::React { emoji, add, .. } = cmd {
+                assert_eq!(emoji, "👍");
+                assert!(add, "полоска только добавляет реакцию");
+                sent = true;
+            }
+        }
+        assert!(sent, "команда реакции должна уйти в гейтвей");
+    }
+
+    /// Without the pointer over a row there is no strip: it must not clutter
+    /// every message in the channel.
+    #[test]
+    fn quick_reactions_hide_when_not_hovered() {
+        let mut h = app_with_messages(3);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        assert!(
+            h.app.probe_quick_rects.is_empty(),
+            "без наведения полоска не рисуется"
+        );
+
+        // Курсор уводим в сторону от списка сообщений.
+        let mut input = screen();
+        input.events.push(egui::Event::PointerMoved(egui::Pos2::new(2.0, 2.0)));
+        let _ = ctx.run(input, |ctx| h.app.draw_chat(ctx));
+
+        assert!(
+            h.app.probe_quick_rects.is_empty(),
+            "полоска не должна появляться без наведения"
+        );
+    }
+
     /// A click on a pill can add a reaction to a message that had none: this is
     /// the only way to react without a full emoji picker.
     #[test]

@@ -32,6 +32,9 @@ const REACTION_ROW_H: f32 = 24.0;
 /// Emoji offered by the quick "Add reaction" menu. A searchable picker is a
 /// separate piece of work; these cover everyday use.
 const QUICK_REACTIONS: [&str; 8] = ["👍", "❤️", "😂", "🎉", "😮", "😢", "🔥", "👀"];
+/// One cell of the hover quick-reaction strip, and the padding around it.
+const QUICK_CELL: f32 = 22.0;
+const QUICK_PAD: f32 = 3.0;
 /// Gap after an image inside a message.
 const IMAGE_GAP: f32 = 6.0;
 /// Avatar side; a grouped row is indented by this plus the item spacing to
@@ -139,6 +142,9 @@ impl App {
         style.spacing.item_spacing = egui::vec2(8.0, 2.0);
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
         ctx.set_style(style);
+
+        #[cfg(test)]
+        self.probe_quick_rects.clear();
 
         self.draw_legacy_vault_banner(ctx);
         self.draw_server_list(ctx);
@@ -821,6 +827,7 @@ impl App {
                     });
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
+                self.hover_strip(ui, &frame.response, msg);
             });
             ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
         } else {
@@ -888,6 +895,7 @@ impl App {
                 });
                 });
                 self.message_interactions(ui.ctx(), &frame.response, msg);
+                self.hover_strip(ui, &frame.response, msg);
                 ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
         }
     }
@@ -957,6 +965,86 @@ impl App {
             }
         });
         if let Some(emoji) = clicked_emoji {
+            self.reaction_click = Some((msg.channel_id.clone(), msg.id.clone(), emoji));
+        }
+    }
+    /// Floating strip of quick reactions over a hovered message. It is painted
+    /// as an overlay, never allocated, so the measured row height and the
+    /// virtualization stay untouched — and clicks are hit-tested by hand for the
+    /// same reason the pills are: the scroll area takes widget clicks first.
+    fn hover_strip(&mut self, ui: &mut egui::Ui, response: &egui::Response, msg: &ChatMessage) {
+        #[cfg(test)]
+        self.probe_msg_rows.push((response.rect, msg.id.clone()));
+        // An unconfirmed echo has no id; reacting to it would 404.
+        if msg.id.is_empty() || !self.message_menu(msg).react {
+            return;
+        }
+        let pointer = ui.ctx().pointer_latest_pos();
+        // The strip sits above the row, so reaching it means leaving the row.
+        // Without the remembered rect it would disappear under the cursor.
+        let over_strip = match (&self.hover_reaction, pointer) {
+            (Some((id, rect)), Some(p)) => id == &msg.id && rect.contains(p),
+            _ => false,
+        };
+        if !response.hovered() && !over_strip {
+            if self.hover_reaction.as_ref().is_some_and(|(id, _)| id == &msg.id) {
+                self.hover_reaction = None;
+            }
+            return;
+        }
+
+        let strip = egui::vec2(
+            QUICK_REACTIONS.len() as f32 * QUICK_CELL + 2.0 * QUICK_PAD,
+            QUICK_CELL + 2.0 * QUICK_PAD,
+        );
+        let row = response.rect;
+        // Top-right corner, just above the row; clamped so the first visible
+        // message does not push it off the top of the viewport.
+        let mut origin = egui::pos2(row.right() - strip.x - 4.0, row.top() - strip.y - 2.0);
+        origin.y = origin.y.max(ui.clip_rect().top() + 2.0);
+        let rect = egui::Rect::from_min_size(origin, strip);
+        // Stored slightly inflated: the 2 px gap between the row and the strip
+        // must not make it flicker while the cursor crosses it.
+        self.hover_reaction = Some((msg.id.clone(), rect.expand(4.0)));
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, 8.0, self.theme.self_bg);
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0_f32, self.theme.divider),
+            egui::StrokeKind::Inside,
+        );
+
+        let mut clicked: Option<String> = None;
+        for (i, emoji) in QUICK_REACTIONS.iter().enumerate() {
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + QUICK_PAD + i as f32 * QUICK_CELL,
+                    rect.top() + QUICK_PAD,
+                ),
+                egui::Vec2::splat(QUICK_CELL),
+            );
+            #[cfg(test)]
+            self.probe_quick_rects.push((cell, emoji.to_string()));
+            let over = pointer.is_some_and(|p| cell.contains(p));
+            if over {
+                painter.rect_filled(cell, 5.0, self.theme.message_hover);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                emoji,
+                egui::FontId::proportional(15.0),
+                self.theme.text,
+            );
+            if over && ui.ctx().input(|i| i.pointer.primary_clicked()) {
+                clicked = Some(emoji.to_string());
+            }
+        }
+        if let Some(emoji) = clicked {
+            // Applied after the frame: the list is out of `messages` while drawn.
             self.reaction_click = Some((msg.channel_id.clone(), msg.id.clone(), emoji));
         }
     }

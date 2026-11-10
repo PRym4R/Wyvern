@@ -3,6 +3,15 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.2 - 2026-11-10
+
+- **Quick reactions on hover**: pointing at a message brings up a small strip of
+  eight emoji above its top-right corner; one click adds (or removes) that
+  reaction, so reacting no longer needs the context menu. The strip is painted
+  as an overlay, not part of the layout, so message heights and the virtualized
+  list stay exactly as they were. It floats just outside the row, and the
+  remembered rect keeps it from flickering while the cursor crosses the gap.
+
 ## 0.10.1 - 2026-11-10
 
 - **Live reactions**: `MESSAGE_REACTION_ADD` / `MESSAGE_REACTION_REMOVE` are

@@ -418,10 +418,20 @@ pub(crate) struct App {
     /// Reaction clicked while the list was taken out of `messages` for
     /// drawing: `(channel, message, emoji key)`, applied right after restore.
     pub(crate) reaction_click: Option<(String, String, String)>,
+    /// The quick-reaction strip currently shown: `(message id, its rect)`. The
+    /// strip floats above the row, so the cursor leaves the row to reach it; the
+    /// remembered rect keeps it from flickering away under the pointer.
+    pub(crate) hover_reaction: Option<(String, egui::Rect)>,
     /// Test probe: reaction pill rects drawn last frame and their emoji, so a
     /// test can click one at its real position.
     #[cfg(test)]
     pub(crate) probe_reaction_rects: Vec<(egui::Rect, String)>,
+    /// Test probe: message row rects, so a test can hover a real message.
+    #[cfg(test)]
+    pub(crate) probe_msg_rows: Vec<(egui::Rect, String)>,
+    /// Test probe: quick-reaction cells drawn last frame.
+    #[cfg(test)]
+    pub(crate) probe_quick_rects: Vec<(egui::Rect, String)>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -540,8 +550,13 @@ impl App {
             chat_anchor: None,
             want_older: false,
             reaction_click: None,
+            hover_reaction: None,
             #[cfg(test)]
             probe_reaction_rects: Vec::new(),
+            #[cfg(test)]
+            probe_msg_rows: Vec::new(),
+            #[cfg(test)]
+            probe_quick_rects: Vec::new(),
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),
