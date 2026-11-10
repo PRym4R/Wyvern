@@ -29,6 +29,10 @@ const MAX_GIF_FRAMES: usize = 2000;
 const MAX_SOURCE_PIXELS: u64 = 40_000_000;
 /// Cap on response bytes; pixel size is only checked after the body is read.
 const MAX_DOWNLOAD_BYTES: u64 = MAX_SOURCE_PIXELS * 8;
+/// Avatars are a few hundred KB at most; anything larger is a mistake or a bomb.
+const MAX_AVATAR_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest avatar side worth decoding: 1024 CSS px on a 2x screen, with slack.
+const MAX_AVATAR_DIM: u32 = 2048;
 
 /// Read the response body, at most `max` bytes; `None` if it exceeds that.
 fn read_limited(resp: reqwest::blocking::Response, max: u64) -> Option<Vec<u8>> {
@@ -49,20 +53,60 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
 }
 
 /// One shared client; per-image clients would create a new pool and TLS session.
-fn http() -> &'static reqwest::blocking::Client {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        crate::net::with_proxy_blocking(reqwest::blocking::Client::builder())
-            .timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(8)
-            .build()
-            .expect("не собрать HTTP-клиент")
-    })
+/// `None` when the client cannot be built (no TLS backend): that must cost
+/// images, not the whole UI thread.
+fn http() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::net::with_proxy_blocking(reqwest::blocking::Client::builder())
+                .timeout(Duration::from_secs(20))
+                .pool_max_idle_per_host(8)
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Whether remote media may be fetched from `url`.
+///
+/// These URLs come from Discord's JSON, not from us: a crafted attachment could
+/// point at `http://127.0.0.1:…` and turn the client into a local-network
+/// prober. Only `https` on a real hostname passes; literal addresses (loopback,
+/// RFC1918, link-local, v6) fail the address check below.
+fn is_fetchable_media_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+
+    // Tests run a plain-HTTP server on loopback; production never sees one.
+    #[cfg(test)]
+    if parsed.scheme() == "http" && (host == "127.0.0.1" || host == "localhost") {
+        return true;
+    }
+
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let bare = host.trim_end_matches('.');
+    if bare.is_empty() || bare == "localhost" || bare.ends_with(".localhost") || bare.ends_with(".local") {
+        return false;
+    }
+    // IPv6 literals arrive bracketed; anything that parses as an address is out.
+    let bare = bare.trim_start_matches('[').trim_end_matches(']');
+    bare.parse::<std::net::IpAddr>().is_err()
 }
 
 /// Download an image and decode it at its original resolution for the clipboard.
 fn fetch_original_image(url: &str) -> Option<egui::ColorImage> {
-    let resp = http().get(url).send().ok()?;
+    if !is_fetchable_media_url(url) {
+        return None;
+    }
+    let resp = http()?.get(url).send().ok()?;
     let bytes = read_limited(resp, MAX_DOWNLOAD_BYTES)?;
     decode_original(&bytes)
 }
@@ -79,6 +123,21 @@ pub(crate) fn decode_original(bytes: &[u8]) -> Option<egui::ColorImage> {
         [w as usize, h as usize],
         &pixels,
     ))
+}
+
+/// Decode an avatar with its own limits. The static-image budget is sized for
+/// full attachments, so it would happily decode a 40-megapixel "avatar".
+fn decode_avatar(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageReader;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_AVATAR_DIM);
+    limits.max_image_height = Some(MAX_AVATAR_DIM);
+    limits.max_alloc = Some(u64::from(MAX_AVATAR_DIM) * u64::from(MAX_AVATAR_DIM) * 4);
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    reader.decode().ok()
 }
 
 /// Shrink the image if it exceeds the target dimension.
@@ -246,9 +305,11 @@ impl App {
                     let _ = result_tx.send(AvatarFetch::Busy);
                     return;
                 }
-                let outcome = match http().get(&url_moved).send().ok()
-                    .and_then(|resp| read_limited(resp, MAX_DOWNLOAD_BYTES))
-                    .and_then(|bytes| image::load_from_memory(&bytes).ok())
+                let outcome = match http()
+                    .filter(|_| is_fetchable_media_url(&url_moved))
+                    .and_then(|client| client.get(&url_moved).send().ok())
+                    .and_then(|resp| read_limited(resp, MAX_AVATAR_BYTES))
+                    .and_then(|bytes| decode_avatar(&bytes))
                 {
                     Some(img) => {
                         let rgba = img.to_rgba8();
@@ -416,11 +477,15 @@ pub(crate) fn download_image(&mut self, ctx: &egui::Context, url: &str) -> Optio
         std::thread::spawn(move || {
             // The slot is released on any exit, including a panic.
             let _slot = ImageSlot;
-            if let Ok(resp) = http().get(&url_moved).send() {
-                if let Some(bytes) = read_limited(resp, MAX_DOWNLOAD_BYTES) {
-                    if let Some(payload) = Self::decode_image_payload(&bytes) {
-                        let _ = result_tx.send(Some(payload));
-                        return;
+            if is_fetchable_media_url(&url_moved) {
+                if let Some(client) = http() {
+                    if let Ok(resp) = client.get(&url_moved).send() {
+                        if let Some(bytes) = read_limited(resp, MAX_DOWNLOAD_BYTES) {
+                            if let Some(payload) = Self::decode_image_payload(&bytes) {
+                                let _ = result_tx.send(Some(payload));
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -592,9 +657,8 @@ fn decode_lightbox_payload(bytes: &[u8]) -> Option<ImagePayload> {
         let url_moved = url.clone();
         std::thread::spawn(move || {
             let payload = http()
-                .get(&url_moved)
-                .send()
-                .ok()
+                .filter(|_| is_fetchable_media_url(&url_moved))
+                .and_then(|client| client.get(&url_moved).send().ok())
                 .and_then(|resp| read_limited(resp, MAX_DOWNLOAD_BYTES))
                 .and_then(|bytes| App::decode_lightbox_payload(&bytes));
             let _ = result_tx.send(payload);

@@ -985,7 +985,9 @@ impl App {
                     }
                 }
                 ToApp::DMChannel(ch) => {
-                    self.push_debug(format!("Opening DM '{}' id={}", ch.name, &ch.id[..ch.id.len().min(14)]));
+                    // Slice by chars: a byte boundary inside an id would panic.
+                    let short: String = ch.id.chars().take(14).collect();
+                    self.push_debug(format!("Opening DM '{}' id={}", ch.name, short));
                     let idx = if let Some(idx) = self.channels.iter().position(|c| c.id == ch.id) {
                         idx
                     } else {

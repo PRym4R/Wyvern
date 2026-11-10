@@ -1,6 +1,6 @@
 [package]
 name = "wyvern"
-version = "0.10.4"
+version = "0.10.5"
 edition = "2021"
 
 [dependencies]
@@ -15,7 +15,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 eframe = "0.31"
 mimalloc = "0.1"
 base64 = "0.22"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 arboard = "3"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"

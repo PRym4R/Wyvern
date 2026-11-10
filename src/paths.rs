@@ -105,6 +105,14 @@ pub(crate) fn migrate(home: &Path, data: &Path) -> Vec<&'static str> {
 pub(crate) fn migrate_from_home() {
     let data = data_dir();
     let _ = std::fs::create_dir_all(&data);
+    // The directory holds drafts, the proxy password and the vault. Files are
+    // written 0600, but a 0755 directory still exposes their names; an older
+    // install may already have it open, so close it here too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700));
+    }
     if let Some(home) = dirs::home_dir() {
         migrate(&home, &data);
     }

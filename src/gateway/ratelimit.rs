@@ -59,7 +59,8 @@ impl Limit {
 
 /// Per-bucket state. Discord groups several routes into one bucket and names it
 /// with `X-RateLimit-Bucket`; until that header is seen, a route is tracked by
-/// its own name (`r:`), afterwards by the shared bucket (`b:`).
+/// its own name (`r:`), afterwards by the shared bucket plus its major
+/// parameter (`b:<hash>:<channel|guild|webhook>`).
 #[derive(Default)]
 struct Limits {
     /// "not before" per key; expired entries are dropped on lookup.
@@ -84,8 +85,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn bucket_key(bucket: &str) -> String {
-    format!("b:{bucket}")
+/// The major parameter of a route: Discord counts limits per `channel_id`,
+/// `guild_id` and `webhook_id`. Routes are named `kind:{id}`, so the suffix is
+/// the major parameter; routes without one (`dm`) share a single limit.
+fn major_param(route: &str) -> &str {
+    route.rsplit_once(':').map_or("", |(_, major)| major)
+}
+
+/// The wait key for a bucket, qualified by the major parameter. The
+/// `X-RateLimit-Bucket` hash is explicitly non-inclusive of major parameters,
+/// so keying by the hash alone would make a 429 in one channel stall another.
+fn bucket_key(bucket: &str, route: &str) -> String {
+    format!("b:{bucket}:{}", major_param(route))
 }
 
 fn route_key(route: &str) -> String {
@@ -102,7 +113,7 @@ pub(crate) fn delay(route: &str) -> Duration {
     }
     let mut st = lock(state());
     let key = match st.buckets.get(route).cloned() {
-        Some(bucket) => bucket_key(&bucket),
+        Some(bucket) => bucket_key(&bucket, route),
         None => route_key(route),
     };
     match st.waits.get(&key).copied() {
@@ -127,9 +138,9 @@ fn remember(route: &str, bucket: Option<&str>, limit: Limit) {
     }
     let mut st = lock(state());
     let key = match bucket {
-        Some(bucket) => bucket_key(bucket),
+        Some(bucket) => bucket_key(bucket, route),
         None => match st.buckets.get(route).cloned() {
-            Some(bucket) => bucket_key(&bucket),
+            Some(bucket) => bucket_key(&bucket, route),
             None => route_key(route),
         },
     };
@@ -165,7 +176,7 @@ pub(crate) fn note(route: &str, headers: &HeaderMap) -> Option<Limit> {
             // A wait remembered under the route name before the bucket was
             // known belongs to the bucket now; move it so both routes see it.
             if let Some(until) = st.waits.remove(&route_key(route)) {
-                let entry = st.waits.entry(bucket_key(bucket)).or_insert(until);
+                let entry = st.waits.entry(bucket_key(bucket, route)).or_insert(until);
                 if *entry < until {
                     *entry = until;
                 }
@@ -177,7 +188,6 @@ pub(crate) fn note(route: &str, headers: &HeaderMap) -> Option<Limit> {
     remember(route, bucket.as_deref(), limit);
     Some(limit)
 }
-
 
 /// Sleep until `route` is allowed again; cheap when the bucket is free.
 pub(crate) async fn wait(route: &str) {
@@ -326,13 +336,13 @@ mod tests {
     }
 
     /// Two routes Discord put in one bucket share the wait, even though only
-    /// one of them hit the limit.
+    /// one of them hit the limit. Same major parameter: same budget.
     #[test]
     fn routes_in_one_bucket_share_the_wait() {
         let _guard = exclusive();
         // Both learn the bucket while it still has room: that alone is enough
         // for a later 429 on either of them to apply to both.
-        for route in ["test-bucket-send", "test-bucket-edit"] {
+        for route in ["messages:42", "edit:42"] {
             note(
                 route,
                 &headers(&[
@@ -342,7 +352,7 @@ mod tests {
             );
         }
         note(
-            "test-bucket-send",
+            "messages:42",
             &headers(&[
                 ("x-ratelimit-bucket", "shared-abc"),
                 ("x-ratelimit-remaining", "0"),
@@ -350,12 +360,42 @@ mod tests {
             ]),
         );
         assert!(
-            delay("test-bucket-edit") > Duration::ZERO,
+            delay("edit:42") > Duration::ZERO,
             "маршрут из того же бакета должен ждать"
         );
         assert!(
-            delay("test-bucket-edit") <= Duration::from_millis(400),
+            delay("edit:42") <= Duration::from_millis(400),
             "ждать дольше сброса нельзя"
+        );
+    }
+
+    /// The bucket hash excludes the major parameter, so two channels share the
+    /// hash but not the budget: a 429 in one must not stall the other.
+    #[test]
+    fn same_bucket_hash_in_other_channel_is_independent() {
+        let _guard = exclusive();
+        for route in ["messages:1", "messages:2"] {
+            note(
+                route,
+                &headers(&[
+                    ("x-ratelimit-bucket", "shared-abc"),
+                    ("x-ratelimit-remaining", "5"),
+                ]),
+            );
+        }
+        note(
+            "messages:1",
+            &headers(&[
+                ("x-ratelimit-bucket", "shared-abc"),
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset-after", "0.4"),
+            ]),
+        );
+        assert!(delay("messages:1") > Duration::ZERO, "свой канал должен ждать");
+        assert_eq!(
+            delay("messages:2"),
+            Duration::ZERO,
+            "другой канал с тем же хешем ждать не должен"
         );
     }
 

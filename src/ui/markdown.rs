@@ -55,6 +55,16 @@ pub(crate) fn render_message_text(ui: &mut Ui, text: &str, size: f32, color: Col
     }
 }
 
+/// Only http(s) may be opened: `[x](smb://server/share)` on Windows would make
+/// the OS send credentials, and unknown schemes reach arbitrary handlers.
+fn is_safe_link(url: &str) -> bool {
+    let url = url.trim();
+    let scheme = |p: &str| {
+        url.len() >= p.len() && url.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+    };
+    scheme("https://") || scheme("http://")
+}
+
 fn render_inline(ui: &mut Ui, text: &str, size: f32, color: Color32) {
     let mut pos = 0usize;
     let mut plain = String::new();
@@ -155,7 +165,13 @@ fn render_inline(ui: &mut Ui, text: &str, size: f32, color: Color32) {
                 if let Some(paren) = tail.find(')') {
                     let url = &tail[..paren];
                     flush_plain(ui, &mut plain, size, color);
-                    ui.hyperlink_to(label, url);
+                    if is_safe_link(url) {
+                        ui.hyperlink_to(label, url);
+                    } else {
+                        // `[x](smb://server/share)` must not reach the system
+                        // handler; the label is still worth showing.
+                        ui.label(RichText::new(label).size(size).color(color));
+                    }
                     pos += bracket + 2 + paren + 1;
                     continue;
                 }
@@ -179,4 +195,22 @@ fn render_inline(ui: &mut Ui, text: &str, size: f32, color: Color32) {
     }
 
     flush_plain(ui, &mut plain, size, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_link;
+
+    /// Only web schemes become clickable; everything else would reach the OS
+    /// handler (`smb://` leaks NTLM on Windows, `file://` opens local files).
+    #[test]
+    fn only_web_links_are_clickable() {
+        assert!(is_safe_link("https://example.com/a?b=1"), "https должен открываться");
+        assert!(is_safe_link("HTTP://example.com"), "схема без учёта регистра");
+        assert!(!is_safe_link("smb://server/share"), "smb-ссылка не должна открываться");
+        assert!(!is_safe_link("file:///etc/passwd"), "file-ссылка не должна открываться");
+        assert!(!is_safe_link("javascript:alert(1)"), "javascript не должен открываться");
+        assert!(!is_safe_link("https:/example.com"), "одного слэша мало");
+        assert!(!is_safe_link(""), "пустая ссылка не должна открываться");
+    }
 }

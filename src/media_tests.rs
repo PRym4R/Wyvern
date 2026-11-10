@@ -509,12 +509,13 @@ mod tests {
     #[test]
     fn oversized_response_body_is_refused() {
         let addr = body_server(200);
-        let resp = http().get(format!("http://{}/small.png", addr)).send().unwrap();
+        let client = http().expect("клиент для теста");
+        let resp = client.get(format!("http://{}/small.png", addr)).send().unwrap();
         let small = read_limited(resp, 1024).expect("маленькое тело должно прочитаться");
         assert_eq!(small.len(), 200);
 
         let addr = body_server(8 * 1024 * 1024);
-        let resp = http().get(format!("http://{}/huge.png", addr)).send().unwrap();
+        let resp = client.get(format!("http://{}/huge.png", addr)).send().unwrap();
         assert!(
             read_limited(resp, 4096).is_none(),
             "тело сверх потолка должно отсекаться, а не читаться целиком"
@@ -569,4 +570,44 @@ impl App {
             None => false,
         }
     }
+}
+
+/// Remote media may only come over https from a real hostname: a message can
+/// otherwise point the client at the local network.
+#[test]
+fn only_real_https_media_urls_are_fetched() {
+    assert!(is_fetchable_media_url("https://cdn.discordapp.com/avatars/1/a.png"));
+    assert!(is_fetchable_media_url("https://media.tenor.com/x.gif"));
+    // Plain http is not worth the downgrade.
+    assert!(!is_fetchable_media_url("http://cdn.discordapp.com/a.png"));
+    // Literal addresses reach the local network, whatever the port.
+    assert!(!is_fetchable_media_url("https://127.0.0.1:8080/a.png"));
+    assert!(!is_fetchable_media_url("https://10.0.0.5/a.png"));
+    assert!(!is_fetchable_media_url("https://[::1]/a.png"));
+    assert!(!is_fetchable_media_url("https://localhost/a.png"));
+    assert!(!is_fetchable_media_url("https://printer.local/a.png"));
+    assert!(!is_fetchable_media_url("file:///etc/passwd"));
+    assert!(!is_fetchable_media_url("not a url"));
+    assert!(!is_fetchable_media_url(""));
+}
+
+/// A huge "avatar" is refused before the pixels are allocated.
+#[test]
+fn oversized_avatar_is_not_decoded() {
+    use image::{ImageEncoder, Rgba, RgbaImage};
+
+    let mut buf = Vec::new();
+    let img = RgbaImage::from_pixel(MAX_AVATAR_DIM + 1, 8, Rgba([1, 2, 3, 255]));
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
+        .expect("encode png");
+    assert!(decode_avatar(&buf).is_none(), "аватар шире лимита не должен декодироваться");
+
+    // A normal-size avatar in the same format still decodes.
+    let mut small = Vec::new();
+    let img = RgbaImage::from_pixel(64, 64, Rgba([1, 2, 3, 255]));
+    image::codecs::png::PngEncoder::new(&mut small)
+        .write_image(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgba8)
+        .expect("encode png");
+    assert!(decode_avatar(&small).is_some(), "обычный аватар должен декодироваться");
 }

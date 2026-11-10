@@ -3,6 +3,33 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.5 - 2026-11-11
+
+- **Private state files**: `settings.json` (drafts, proxy password) and
+  `deleted.json` (other people's messages) are now written `0600`, and the
+  state directory is `0700`, instead of trusting the process umask. The vault
+  already did this; all three now share one atomic-write helper, which also
+  removes three copies of the temp-file dance.
+- **A corrupted vault is refused, not fatal**: a hand-edited `accounts.json`
+  with a nonce that wasn't 12 bytes used to panic at unlock, because the nonce
+  length comes from the file. It now counts as a wrong password. An unknown
+  vault `version` is refused too, so a newer file is never half-read and then
+  rewritten in the old layout.
+- **Media is not a network probe**: avatar and attachment URLs arrive in
+  Discord's JSON, so a crafted message could point them at `http://127.0.0.1:…`
+  and use the client to poke the local network. Only `https` on a real hostname
+  is fetched now. Avatars also get their own decode limits (8 MB, 2048 px)
+  instead of the full attachment budget, which allowed a 40-megapixel "avatar".
+- **Links are http(s) only**: `[text](smb://server/share)` on Windows sent the
+  system handler an NTLM-authenticating URL; unknown schemes now render as
+  plain text.
+- **Rate-limit buckets per major parameter**: the `X-RateLimit-Bucket` hash
+  excludes `channel_id`/`guild_id`, so keying a wait by the hash alone made a
+  429 in one channel stall another. The bucket key now includes the route's
+  major parameter, which is what every client library does.
+- **Smaller builds**: `image` is compiled with only the codecs the client can
+  display (png, jpeg, gif, webp) instead of the whole default set.
+
 ## 0.10.4 - 2026-11-10
 
 - **Rate-limit buckets**: `X-RateLimit-Bucket` is now read and remembered, so

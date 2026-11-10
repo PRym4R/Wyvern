@@ -587,7 +587,7 @@ pub(super) async fn fetch_history_page(
         "History page: {} messages, more={} (before={})",
         got,
         more,
-        before.as_deref().map(|b| &b[..b.len().min(14)]).unwrap_or("-")
+        before.as_deref().map(|b| b.chars().take(14).collect::<String>()).unwrap_or_else(|| "-".to_string())
     )));
     let event = if before.is_some() {
         ToApp::HistoryMore { channel_id, messages: page, more }

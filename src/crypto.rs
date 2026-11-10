@@ -8,33 +8,6 @@ use crate::app::App;
 use crate::models::StoredAccount;
 use crate::util::{base64_decode, base64_string};
 
-/// Write the vault atomically via a 0600 temp file, fsync, and rename.
-fn write_vault_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    let result = (|| {
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
-        }
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        // Don't leave a stray temp file next to the vault.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
         // Override for tests so the real file isn't touched.
@@ -72,9 +45,21 @@ impl App {
             return None;
         }
         let v: Value = serde_json::from_str(content).ok()?;
+        // An unknown format is a refusal, not a guess: a newer vault must not be
+        // half-read and then overwritten in the old layout.
+        if let Some(version) = v["version"].as_u64() {
+            if version != 1 {
+                return None;
+            }
+        }
         let salt = base64_decode(&v["salt"].as_str()?.to_string())?;
         let nonce_bytes = base64_decode(&v["nonce"].as_str()?.to_string())?;
         let ct = base64_decode(&v["data"].as_str()?.to_string())?;
+        // A malformed file is a wrong password, never a panic: `Nonce::from_slice`
+        // asserts the length, and both lengths come from the file.
+        if salt.is_empty() || nonce_bytes.len() != 12 {
+            return None;
+        }
 
         let key = Self::derive_key(password, &salt);
         let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
@@ -103,7 +88,7 @@ impl App {
             return;
         };
         // Don't swallow write errors: the UI would claim success while the disk is stale.
-        if let Err(e) = write_vault_file(&self.vault_path(), encrypted.as_bytes()) {
+        if let Err(e) = crate::fsutil::write_atomic(&self.vault_path(), encrypted.as_bytes()) {
             self.status = format!("Failed to save vault: {}", e);
         }
     }

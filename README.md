@@ -66,7 +66,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 326 tests (323 + 3 ignored)
+cargo test --release                                        # 334 tests (331 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

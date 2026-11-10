@@ -33,28 +33,11 @@ impl DeletedStore {
     }
 
     /// Write through a temp file + rename, so a crash mid-write can't leave a
-    /// truncated file.
+    /// truncated file. Other people's messages are private, so `0600`.
     pub(crate) fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        use std::io::Write;
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let tmp = path.with_extension("json.tmp");
-        let result = (|| {
-            if let Some(dir) = path.parent() {
-                if !dir.as_os_str().is_empty() {
-                    std::fs::create_dir_all(dir)?;
-                }
-            }
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        if result.is_err() {
-            // Don't leave a stray temp file behind on failure.
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        crate::fsutil::write_atomic(path, text.as_bytes())
     }
 
     /// Remember a channel's deleted messages: deduped by id, oldest first,

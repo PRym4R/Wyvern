@@ -15,6 +15,7 @@ mod app;
 mod crypto;
 mod deleted;
 mod file_picker;
+mod fsutil;
 mod gateway;
 mod media;
 mod messages;

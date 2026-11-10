@@ -345,6 +345,42 @@ mod vault_write_tests {
 
     static TAG: AtomicU64 = AtomicU64::new(0);
 
+    /// A hand-edited or corrupted vault is refused, never fatal: the nonce
+    /// length comes from the file, and `Nonce::from_slice` asserts it.
+    #[test]
+    fn malformed_vault_is_refused_not_fatal() {
+        let good = App::encrypt_accounts(&[], "pw").expect("encrypt");
+        assert!(
+            App::decrypt_accounts(&good, "pw").is_some(),
+            "целый файл должен читаться"
+        );
+
+        // A nonce shorter or longer than 12 bytes used to panic here.
+        for nonce in ["AAAA", "AAAAAAAAAAAAAAAA"] {
+            let mut v: serde_json::Value = serde_json::from_str(&good).expect("json");
+            v["nonce"] = serde_json::json!(nonce);
+            assert!(
+                App::decrypt_accounts(&v.to_string(), "pw").is_none(),
+                "nonce неверной длины не должен паниковать"
+            );
+        }
+
+        // A future format must not be half-read and then overwritten.
+        let mut v: serde_json::Value = serde_json::from_str(&good).expect("json");
+        v["version"] = serde_json::json!(99);
+        assert!(
+            App::decrypt_accounts(&v.to_string(), "pw").is_none(),
+            "неизвестная версия должна отвергаться"
+        );
+
+        let mut v: serde_json::Value = serde_json::from_str(&good).expect("json");
+        v["salt"] = serde_json::json!("");
+        assert!(
+            App::decrypt_accounts(&v.to_string(), "pw").is_none(),
+            "пустая соль должна отвергаться"
+        );
+    }
+
     /// Own file per test since tests run in parallel.
     fn vaulted() -> (App, std::path::PathBuf) {
         let tag = TAG.fetch_add(1, Ordering::SeqCst);
@@ -435,7 +471,11 @@ mod vault_write_tests {
             app.status
         );
         assert!(
-            !dir.with_extension("tmp").exists(),
+            {
+                let mut tmp = dir.as_os_str().to_owned();
+                tmp.push(".tmp");
+                !std::path::PathBuf::from(tmp).exists()
+            },
             "временный файл должен быть убран"
         );
         let _ = std::fs::remove_dir_all(&dir);

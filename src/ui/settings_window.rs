@@ -9,6 +9,12 @@ const SECTIONS: [&str; 6] = ["Theme", "Interface", "Media", "History", "Network"
 /// Proxy kinds for the Network tab dropdown.
 const PROXY_KINDS: [&str; 5] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadowsocks", "VLESS"];
 
+/// Checkbox that reports a change. Every flag is persisted at once, so the
+/// caller only runs its side effects instead of repeating the write dance.
+fn flag(ui: &mut egui::Ui, label: &str, value: &mut bool) -> bool {
+    ui.checkbox(value, label).changed()
+}
+
 impl crate::app::App {
     /// Settings window: a full-client overlay with tabs down the left.
     pub(crate) fn draw_settings(&mut self, ctx: &egui::Context) {
@@ -169,10 +175,7 @@ impl crate::app::App {
                 }
                 ui.add_space(8.0);
                 let mut animations = self.settings.animations.unwrap_or(true);
-                if ui
-                    .checkbox(&mut animations, "Animate selections, toasts and settings")
-                    .changed()
-                {
+                if flag(ui, "Animate selections, toasts and settings", &mut animations) {
                     self.settings.animations = Some(animations);
                     self.write_settings();
                 }
@@ -180,36 +183,24 @@ impl crate::app::App {
             2 => {
                 ui.heading("Media and notifications");
                 let mut blur = self.settings.blur_media;
-                if ui
-                    .checkbox(&mut blur, "Hide images and GIFs until clicked")
-                    .changed()
-                {
+                if flag(ui, "Hide images and GIFs until clicked", &mut blur) {
                     self.settings.blur_media = blur;
                     // Revealing state belongs to the old mode; start fresh.
                     self.revealed_images.clear();
                     self.write_settings();
                 }
                 let mut notes = self.settings.notifications;
-                if ui
-                    .checkbox(&mut notes, "Notify about new messages")
-                    .changed()
-                {
+                if flag(ui, "Notify about new messages", &mut notes) {
                     self.settings.notifications = notes;
                     self.write_settings();
                 }
                 let mut sound = self.settings.notify_sound;
-                if ui
-                    .checkbox(&mut sound, "Play a sound with the notification")
-                    .changed()
-                {
+                if flag(ui, "Play a sound with the notification", &mut sound) {
                     self.settings.notify_sound = sound;
                     self.write_settings();
                 }
                 let mut dnd = self.settings.dnd;
-                if ui
-                    .checkbox(&mut dnd, "Do not disturb (mute notifications and sound)")
-                    .changed()
-                {
+                if flag(ui, "Do not disturb (mute notifications and sound)", &mut dnd) {
                     self.settings.dnd = dnd;
                     self.write_settings();
                 }
@@ -217,10 +208,7 @@ impl crate::app::App {
             3 => {
                 ui.heading("History");
                 let mut keep = self.settings.keep_deleted;
-                if ui
-                    .checkbox(&mut keep, "Keep deleted messages (shown red)")
-                    .changed()
-                {
+                if flag(ui, "Keep deleted messages (shown red)", &mut keep) {
                     self.settings.keep_deleted = keep;
                     if !keep {
                         // Turning the view off also discards the stored archive.
