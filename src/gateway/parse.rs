@@ -181,6 +181,13 @@ fn reaction_from_value(v: &Value) -> Option<Reaction> {
     })
 }
 
+/// Emoji from a reaction gateway event (`d.emoji`): one user reacted once, so
+/// the count starts at 1. Whether it was us is decided by the app, which is the
+/// only side that knows our own user id.
+pub(crate) fn reaction_event_emoji(d: &Value) -> Option<Reaction> {
+    reaction_from_value(d).map(|r| Reaction { count: 1, ..r })
+}
+
 /// Message as stored by the client.
 #[derive(serde::Deserialize)]
 struct RawMessage {

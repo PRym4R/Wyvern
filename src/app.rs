@@ -904,6 +904,12 @@ impl App {
                 ToApp::MessageDeletedBulk { channel_id, message_ids } => {
                     self.delete_messages(&channel_id, &message_ids)
                 }
+                ToApp::ReactionAdded { channel_id, message_id, reaction, user_id } => {
+                    self.apply_reaction_event(&channel_id, &message_id, reaction, &user_id, true)
+                }
+                ToApp::ReactionRemoved { channel_id, message_id, reaction, user_id } => {
+                    self.apply_reaction_event(&channel_id, &message_id, reaction, &user_id, false)
+                }
                 ToApp::ChannelUpdated { channel_id, name, topic } => {
                     self.update_channel(&channel_id, name, topic)
                 }
@@ -1535,6 +1541,78 @@ impl App {
         self.msg_heights.remove(message_id);
         Some(add)
     }
+    /// Apply one live `MESSAGE_REACTION_ADD`/`REMOVE`. A single event is one
+    /// user reacting once, so the counter moves by exactly one and a pill with
+    /// nobody left disappears. Our own events must not count twice: the pill was
+    /// already flipped optimistically, so an add that finds `me` set, or a
+    /// remove that finds `me` clear, is stale news and changes nothing.
+    pub(crate) fn apply_reaction_event(
+        &mut self,
+        channel_id: &str,
+        message_id: &str,
+        reaction: Reaction,
+        user_id: &str,
+        add: bool,
+    ) {
+        // Without READY no user id is known, so nothing can be "ours".
+        let mine = !self.user_id.is_empty() && user_id == self.user_id;
+        let Some(entry) = self.messages.get_mut(channel_id) else {
+            return;
+        };
+        let Some(slot) = entry.iter_mut().find(|m| m.id == message_id) else {
+            return;
+        };
+        let msg = Arc::make_mut(slot);
+        let key = reaction.api_key();
+        let position = msg.reactions.iter().position(|r| r.api_key() == key);
+        let mut changed = false;
+        let mut drop_index = None;
+        if add {
+            match position {
+                None => {
+                    msg.reactions.push(Reaction { count: 1, me: mine, ..reaction });
+                    changed = true;
+                }
+                Some(i) => {
+                    let pill = &mut msg.reactions[i];
+                    if !(mine && pill.me) {
+                        pill.me |= mine;
+                        pill.count = pill.count.saturating_add(1);
+                        changed = true;
+                    }
+                }
+            }
+        } else if let Some(i) = position {
+            let pill = &mut msg.reactions[i];
+            if !(mine && !pill.me) {
+                if mine {
+                    // We are leaving: the count drops with us, and our single
+                    // reaction must take the whole pill away.
+                    pill.me = false;
+                    pill.count = pill.count.saturating_sub(1);
+                    if pill.count == 0 {
+                        drop_index = Some(i);
+                    }
+                } else {
+                    // Somebody else left; our own pill keeps the count at 1.
+                    let floor = u32::from(pill.me);
+                    pill.count = pill.count.saturating_sub(1).max(floor);
+                    if pill.count == 0 {
+                        drop_index = Some(i);
+                    }
+                }
+                changed = true;
+            }
+        }
+        if let Some(i) = drop_index {
+            msg.reactions.remove(i);
+        }
+        if changed {
+            // Pills change the row height: the measurement must be redone.
+            self.msg_heights.remove(message_id);
+        }
+    }
+
     /// Remove one message and its cached height so it doesn't linger until rejoin.
     /// With `keep_deleted` on, the row stays and is drawn red instead.
     pub(crate) fn delete_message(&mut self, channel_id: &str, message_id: &str) {

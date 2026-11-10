@@ -1,4 +1,4 @@
-use crate::models::{ChatChannel, ChatMessage, Guild, UserProfile};
+use crate::models::{ChatChannel, ChatMessage, Guild, Reaction, UserProfile};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadState {
@@ -18,6 +18,21 @@ pub(crate) enum ToApp {
     MessageDeleted { channel_id: String, message_id: String },
     /// Bulk delete: one event for many ids.
     MessageDeletedBulk { channel_id: String, message_ids: Vec<String> },
+    /// One user added a reaction. `reaction` holds the emoji only (count 1);
+    /// `user_id` lets the app keep our own optimistic pill from counting twice.
+    ReactionAdded {
+        channel_id: String,
+        message_id: String,
+        reaction: Reaction,
+        user_id: String,
+    },
+    /// One user took a reaction back; the counter drops and an empty pill goes.
+    ReactionRemoved {
+        channel_id: String,
+        message_id: String,
+        reaction: Reaction,
+        user_id: String,
+    },
     /// Someone started typing in a channel. `user_name` may be empty when the
     /// event carries only a user id (DMs); the app then resolves the name from
     /// messages it has already seen.

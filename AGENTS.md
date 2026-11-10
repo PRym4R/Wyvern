@@ -20,12 +20,12 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   `cargo build --release && cp -f target/release/wyvern ./wyvern`.
   The root `wyvern` binary is tracked; a stale copy means the user runs old code.
   Never run that `cp` on Windows — it would replace the Linux ELF with an `.exe`.
-- Tests: `cargo test` — 310 tests (307 + 3 ignored); keep that count in sync
+- Tests: `cargo test` — 317 tests (314 + 3 ignored); keep that count in sync
   with README.
 - 0 warnings required.
 - Windows has no MSVC linker (`link.exe`), so `cargo` alone fails. Use the gnu
   toolchain that is installed there (one `#[cfg(unix)]` test is skipped, so
-  Windows reports 309 in total):
+  Windows reports 316 in total):
 
   ```
   $env:Path = 'C:\Users\hackerman\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;' + $env:Path

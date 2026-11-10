@@ -909,4 +909,33 @@ mod reaction_tests {
             "кастомный эмодзи должен идти как name:id"
         );
     }
+
+    /// A live reaction event carries the emoji only: one event is one person,
+    /// and "ours" is decided by the app, which knows our user id.
+    #[test]
+    fn reaction_event_parses_only_the_emoji() {
+        let d = serde_json::json!({
+            "user_id": "u1",
+            "channel_id": "c1",
+            "message_id": "m1",
+            "emoji": { "name": "👍" },
+        });
+        let r = super::parse::reaction_event_emoji(&d).expect("реакция должна разобраться");
+        assert_eq!(r.count, 1, "одно событие — это один человек");
+        assert!(!r.me, "признак «моя» ставит приложение, а не парсер");
+        assert_eq!(r.api_key(), "👍");
+
+        let custom = serde_json::json!({
+            "emoji": { "name": "cat", "id": "42", "animated": true },
+        });
+        let r = super::parse::reaction_event_emoji(&custom).expect("кастомный эмодзи тоже");
+        assert_eq!(r.api_key(), "cat:42");
+        assert!(r.animated, "анимация кастомного эмодзи должна сохраниться");
+
+        let empty = serde_json::json!({ "emoji": { "name": "" } });
+        assert!(
+            super::parse::reaction_event_emoji(&empty).is_none(),
+            "пустой эмодзи не должен превращаться в пилюлю"
+        );
+    }
 }

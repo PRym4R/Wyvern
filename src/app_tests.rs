@@ -2614,3 +2614,157 @@ fn toggle_reaction_ignores_a_missing_message() {
 
     assert!(cmds.try_recv().is_err(), "без сообщения отправлять нечего");
 }
+
+/// What the gateway hands over for one live reaction event: the emoji only.
+fn event_reaction(key: &str) -> Reaction {
+    match key.split_once(':') {
+        Some((name, id)) => Reaction {
+            name: name.to_string(),
+            id: Some(id.to_string()),
+            count: 1,
+            ..Default::default()
+        },
+        None => Reaction { name: key.to_string(), count: 1, ..Default::default() },
+    }
+}
+
+/// A live reaction from somebody else creates the pill and marks it as not ours.
+#[test]
+fn reaction_event_adds_someone_elses_pill() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "привет"))]);
+    // A cached height from before the pill existed must not survive.
+    app.msg_heights.insert(
+        "m1".into(),
+        MsgHeight { height: 40.0, width: 800, grouped: false },
+    );
+
+    app.apply_reaction_event("c1", "m1", event_reaction("👍"), "other", true);
+    app.apply_reaction_event("c1", "m1", event_reaction("👍"), "third", true);
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "вторая реакция должна попасть в ту же пилюлю");
+    assert_eq!(msg.reactions[0].count, 2, "каждое событие добавляет одного человека");
+    assert!(!msg.reactions[0].me, "чужая реакция не подсвечивается как своя");
+    assert!(!app.msg_heights.contains_key("m1"), "высоту строки нужно пересчитать");
+}
+
+/// Our own live event repeats what the optimistic pill already shows.
+#[test]
+fn reaction_event_does_not_double_count_ours() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    let mut msg = test_msg("m1", "c1", "привет");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        count: 3,
+        me: false,
+        ..Default::default()
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    // The click already moved the pill to 4 with us on it.
+    app.toggle_reaction("c1", "m1", "👍");
+    assert_eq!(app.messages["c1"][0].reactions[0].count, 4);
+
+    app.apply_reaction_event("c1", "m1", event_reaction("👍"), "me", true);
+    assert_eq!(
+        app.messages["c1"][0].reactions[0].count,
+        4,
+        "своё событие не должно считаться вторым человеком"
+    );
+    assert!(app.messages["c1"][0].reactions[0].me);
+}
+
+/// Taking our reaction back optimistically and then receiving the event must not
+/// eat somebody else's reaction: only the first one moves the counter.
+#[test]
+fn reaction_event_ignores_our_repeated_removal() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    let mut msg = test_msg("m1", "c1", "привет");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        count: 2,
+        me: true,
+        ..Default::default()
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    app.toggle_reaction("c1", "m1", "👍");
+    app.apply_reaction_event("c1", "m1", event_reaction("👍"), "me", false);
+
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "чужая реакция должна остаться");
+    assert_eq!(msg.reactions[0].count, 1, "счётчик не должен упасть дважды");
+    assert!(!msg.reactions[0].me);
+}
+
+/// The last person to leave takes the pill away, but our own pill keeps count 1.
+#[test]
+fn reaction_event_drops_empty_pill_only() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    let mut msg = test_msg("m1", "c1", "привет");
+    msg.reactions.push(Reaction {
+        name: "👍".into(),
+        count: 2,
+        me: true,
+        ..Default::default()
+    });
+    app.messages.insert("c1".into(), vec![Arc::new(msg)]);
+
+    // Somebody else leaves: count 2 -> 1, the pill stays because we are on it.
+    app.apply_reaction_event("c1", "m1", event_reaction("👍"), "other", false);
+    assert_eq!(app.messages["c1"][0].reactions[0].count, 1);
+    assert!(app.messages["c1"][0].reactions[0].me);
+
+    // A pill that holds only somebody else disappears with its last count.
+    app.apply_reaction_event("c1", "m1", event_reaction("🔥"), "other", true);
+    app.apply_reaction_event("c1", "m1", event_reaction("🔥"), "other", false);
+    let msg = &app.messages["c1"][0];
+    assert_eq!(msg.reactions.len(), 1, "пустая пилюля должна исчезнуть");
+    assert_eq!(msg.reactions[0].name, "👍");
+}
+
+/// A custom emoji event is keyed `name:id`, exactly like the pill it belongs to.
+#[test]
+fn reaction_event_matches_custom_emoji_by_key() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "привет"))]);
+
+    app.apply_reaction_event("c1", "m1", event_reaction("cat:42"), "other", true);
+    let pill = &app.messages["c1"][0].reactions[0];
+    assert_eq!(pill.label(), ":cat:");
+    assert_eq!(pill.api_key(), "cat:42");
+
+    app.apply_reaction_event("c1", "m1", event_reaction("cat:42"), "other", false);
+    assert!(
+        app.messages["c1"][0].reactions.is_empty(),
+        "снятие кастомного эмодзи должно находить ту же пилюлю"
+    );
+}
+
+/// Events for a channel or message that is not loaded are ignored, not panicked.
+#[test]
+fn reaction_event_for_unloaded_channel_is_ignored() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.user_id = "me".into();
+
+    app.apply_reaction_event("нет-канала", "m1", event_reaction("👍"), "other", true);
+    app.messages
+        .insert("c1".into(), vec![Arc::new(test_msg("m1", "c1", "привет"))]);
+    app.apply_reaction_event("c1", "нет-сообщения", event_reaction("👍"), "other", true);
+
+    assert!(app.messages["c1"][0].reactions.is_empty());
+}

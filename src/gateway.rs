@@ -23,6 +23,7 @@ mod ratelimit;
 mod rest;
 
 use self::parse::parse_message_value;
+use self::parse::reaction_event_emoji;
 use self::rest::{
     ack_message, api_client, delete_message, edit_message, fetch_history_page, fetch_relationships,
     open_dm, send_files, send_message, set_reaction,
@@ -935,6 +936,35 @@ async fn gw_inner(
                                     channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
                                     message_ids: ids,
                                 });
+                            }
+                            "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
+                                let d = &v["d"];
+                                // One event is one user and one emoji; the app
+                                // keeps the counter, since only it can tell
+                                // whether that user is us.
+                                if let Some(reaction) = reaction_event_emoji(d) {
+                                    let channel_id = d["channel_id"].as_str().unwrap_or("").to_string();
+                                    let message_id = d["message_id"].as_str().unwrap_or("").to_string();
+                                    let user_id = d["user_id"].as_str().unwrap_or("").to_string();
+                                    if !channel_id.is_empty() && !message_id.is_empty() {
+                                        let event = if t == "MESSAGE_REACTION_ADD" {
+                                            ToApp::ReactionAdded {
+                                                channel_id,
+                                                message_id,
+                                                reaction,
+                                                user_id,
+                                            }
+                                        } else {
+                                            ToApp::ReactionRemoved {
+                                                channel_id,
+                                                message_id,
+                                                reaction,
+                                                user_id,
+                                            }
+                                        };
+                                        let _ = event_tx.send(event);
+                                    }
+                                }
                             }
                             "CHANNEL_UPDATE" => {
                                 let d = &v["d"];

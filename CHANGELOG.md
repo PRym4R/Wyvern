@@ -3,7 +3,16 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
-## 0.10.0 — 2026-11-06
+## 0.10.1 - 2026-11-10
+
+- **Live reactions**: `MESSAGE_REACTION_ADD` / `MESSAGE_REACTION_REMOVE` are
+  applied as they arrive, so somebody else's reaction shows up (and disappears)
+  without reloading the channel. Our own events don't count twice: the pill is
+  already flipped optimistically, and an event that only repeats it is ignored.
+  A pill with nobody left is removed, and a stale cached row height is dropped so
+  the message re-measures.
+
+## 0.10.0 - 2026-11-06
 
 - **Reactions**: messages show their reactions as pills under the text, with a
   count and a highlight on the ones you added. Clicking a pill adds or removes
