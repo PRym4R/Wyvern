@@ -21,7 +21,6 @@ pub(crate) struct Limit {
     /// Discord throttles the whole token, not just this route.
     pub(crate) global: bool,
 }
-
 /// Header value as a number; Discord sends seconds like `"0.75"`, `"1"`.
 fn number(value: &str) -> Option<f64> {
     let n: f64 = value.trim().parse().ok()?;
@@ -58,11 +57,20 @@ impl Limit {
     }
 }
 
-/// One "not before" per route. The client talks to a handful of routes at a
-/// time, so a plain map is enough; expired entries are dropped on lookup.
-fn routes() -> &'static Mutex<HashMap<String, Instant>> {
-    static ROUTES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-    ROUTES.get_or_init(|| Mutex::new(HashMap::new()))
+/// Per-bucket state. Discord groups several routes into one bucket and names it
+/// with `X-RateLimit-Bucket`; until that header is seen, a route is tracked by
+/// its own name (`r:`), afterwards by the shared bucket (`b:`).
+#[derive(Default)]
+struct Limits {
+    /// "not before" per key; expired entries are dropped on lookup.
+    waits: HashMap<String, Instant>,
+    /// Route name → bucket hash learned from the response headers.
+    buckets: HashMap<String, String>,
+}
+
+fn state() -> &'static Mutex<Limits> {
+    static STATE: OnceLock<Mutex<Limits>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(Limits::default()))
 }
 
 /// A global throttle covers every route, so it can't live in the map.
@@ -76,6 +84,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn bucket_key(bucket: &str) -> String {
+    format!("b:{bucket}")
+}
+
+fn route_key(route: &str) -> String {
+    format!("r:{route}")
+}
+
 /// How long `route` still has to wait; zero when it is free.
 pub(crate) fn delay(route: &str) -> Duration {
     let now = Instant::now();
@@ -84,18 +100,22 @@ pub(crate) fn delay(route: &str) -> Duration {
             return until - now;
         }
     }
-    let mut map = lock(routes());
-    match map.get(route) {
-        Some(until) if *until > now => *until - now,
+    let mut st = lock(state());
+    let key = match st.buckets.get(route).cloned() {
+        Some(bucket) => bucket_key(&bucket),
+        None => route_key(route),
+    };
+    match st.waits.get(&key).copied() {
+        Some(until) if until > now => until - now,
         Some(_) => {
-            map.remove(route);
+            st.waits.remove(&key);
             Duration::ZERO
         }
         None => Duration::ZERO,
     }
 }
 
-fn remember(route: &str, limit: Limit) {
+fn remember(route: &str, bucket: Option<&str>, limit: Limit) {
     let until = Instant::now() + limit.wait;
     if limit.global {
         let mut global = lock(global_until());
@@ -105,22 +125,59 @@ fn remember(route: &str, limit: Limit) {
         }
         return;
     }
-    let mut map = lock(routes());
-    let entry = map.entry(route.to_string()).or_insert(until);
+    let mut st = lock(state());
+    let key = match bucket {
+        Some(bucket) => bucket_key(bucket),
+        None => match st.buckets.get(route).cloned() {
+            Some(bucket) => bucket_key(&bucket),
+            None => route_key(route),
+        },
+    };
+    let entry = st.waits.entry(key).or_insert(until);
+    // Never shorten a longer wait that another route in the same bucket set.
     if *entry < until {
         *entry = until;
     }
 }
 
+/// Bucket hash from `X-RateLimit-Bucket`, if the response carried one.
+fn bucket_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-ratelimit-bucket")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Record what a response said and return the parsed limit, if any.
 ///
-/// Returns `None` for an ordinary response with budget left: nothing to wait
-/// for and nothing to remember.
+/// The bucket name is recorded even when there is budget left: a later 429 on
+/// another route in the same bucket must also apply here. Returns `None` for an
+/// ordinary response with budget left — nothing to wait for.
 pub(crate) fn note(route: &str, headers: &HeaderMap) -> Option<Limit> {
+    let bucket = bucket_of(headers);
+    if let Some(bucket) = &bucket {
+        let mut st = lock(state());
+        let known = st.buckets.insert(route.to_string(), bucket.clone()).as_deref()
+            == Some(bucket.as_str());
+        if !known {
+            // A wait remembered under the route name before the bucket was
+            // known belongs to the bucket now; move it so both routes see it.
+            if let Some(until) = st.waits.remove(&route_key(route)) {
+                let entry = st.waits.entry(bucket_key(bucket)).or_insert(until);
+                if *entry < until {
+                    *entry = until;
+                }
+            }
+        }
+        drop(st);
+    }
     let limit = Limit::from_headers(headers)?;
-    remember(route, limit);
+    remember(route, bucket.as_deref(), limit);
     Some(limit)
 }
+
 
 /// Sleep until `route` is allowed again; cheap when the bucket is free.
 pub(crate) async fn wait(route: &str) {
@@ -143,7 +200,10 @@ mod tests {
     fn exclusive() -> MutexGuard<'static, ()> {
         let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         *lock(global_until()) = None;
-        lock(routes()).clear();
+        let mut st = lock(state());
+        st.waits.clear();
+        st.buckets.clear();
+        drop(st);
         guard
     }
 
@@ -263,5 +323,82 @@ mod tests {
         note(route, &headers(&[("retry-after", "5")])).unwrap();
         note(route, &headers(&[("retry-after", "0.1")])).unwrap();
         assert!(delay(route) > Duration::from_secs(1), "короткий лимит срезал длинный");
+    }
+
+    /// Two routes Discord put in one bucket share the wait, even though only
+    /// one of them hit the limit.
+    #[test]
+    fn routes_in_one_bucket_share_the_wait() {
+        let _guard = exclusive();
+        // Both learn the bucket while it still has room: that alone is enough
+        // for a later 429 on either of them to apply to both.
+        for route in ["test-bucket-send", "test-bucket-edit"] {
+            note(
+                route,
+                &headers(&[
+                    ("x-ratelimit-bucket", "shared-abc"),
+                    ("x-ratelimit-remaining", "5"),
+                ]),
+            );
+        }
+        note(
+            "test-bucket-send",
+            &headers(&[
+                ("x-ratelimit-bucket", "shared-abc"),
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset-after", "0.4"),
+            ]),
+        );
+        assert!(
+            delay("test-bucket-edit") > Duration::ZERO,
+            "маршрут из того же бакета должен ждать"
+        );
+        assert!(
+            delay("test-bucket-edit") <= Duration::from_millis(400),
+            "ждать дольше сброса нельзя"
+        );
+    }
+
+    /// A wait recorded before the bucket was known moves into the bucket when
+    /// the next response names it, instead of being lost with the old key.
+    #[test]
+    fn bucket_learned_later_keeps_the_earlier_wait() {
+        let _guard = exclusive();
+        let route = "test-bucket-late";
+        note(route, &headers(&[("retry-after", "2")])).unwrap();
+        note(
+            route,
+            &headers(&[
+                ("x-ratelimit-bucket", "late-b7"),
+                ("x-ratelimit-remaining", "9"),
+            ]),
+        );
+        assert!(
+            delay(route) > Duration::from_secs(1),
+            "ожидание потерялось при смене ключа на бакет"
+        );
+    }
+
+    /// Different buckets stay independent.
+    #[test]
+    fn different_buckets_are_independent() {
+        let _guard = exclusive();
+        note(
+            "test-bucket-a",
+            &headers(&[
+                ("x-ratelimit-bucket", "one"),
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset-after", "0.4"),
+            ]),
+        );
+        note(
+            "test-bucket-b",
+            &headers(&[
+                ("x-ratelimit-bucket", "two"),
+                ("x-ratelimit-remaining", "5"),
+            ]),
+        );
+        assert!(delay("test-bucket-a") > Duration::ZERO, "свой бакет должен ждать");
+        assert_eq!(delay("test-bucket-b"), Duration::ZERO, "чужой бакет ждать не должен");
     }
 }

@@ -197,6 +197,22 @@ impl crate::app::App {
                     self.settings.notifications = notes;
                     self.write_settings();
                 }
+                let mut sound = self.settings.notify_sound;
+                if ui
+                    .checkbox(&mut sound, "Play a sound with the notification")
+                    .changed()
+                {
+                    self.settings.notify_sound = sound;
+                    self.write_settings();
+                }
+                let mut dnd = self.settings.dnd;
+                if ui
+                    .checkbox(&mut dnd, "Do not disturb (mute notifications and sound)")
+                    .changed()
+                {
+                    self.settings.dnd = dnd;
+                    self.write_settings();
+                }
             }
             3 => {
                 ui.heading("History");

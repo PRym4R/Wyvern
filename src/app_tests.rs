@@ -2824,3 +2824,25 @@ fn reaction_clear_empties_the_row() {
         "после полной очистки пилюль быть не должно"
     );
 }
+
+/// Do-not-disturb silences notifications, and our own echo never notifies.
+#[test]
+fn notification_gate_respects_dnd_and_own_messages() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    let mut msg = test_msg("m1", "c1", "привет");
+    app.settings.notifications = true;
+
+    assert!(app.should_notify(&msg), "обычное сообщение должно уведомлять");
+
+    app.settings.dnd = true;
+    assert!(!app.should_notify(&msg), "режим «не беспокоить» должен всё глушить");
+
+    app.settings.dnd = false;
+    app.settings.notifications = false;
+    assert!(!app.should_notify(&msg), "без включённых уведомлений — тишина");
+
+    app.settings.notifications = true;
+    msg.is_own = true;
+    assert!(!app.should_notify(&msg), "своё сообщение не должно уведомлять");
+}

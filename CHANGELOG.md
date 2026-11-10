@@ -3,6 +3,18 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.4 - 2026-11-10
+
+- **Rate-limit buckets**: `X-RateLimit-Bucket` is now read and remembered, so
+  routes Discord groups into one bucket share the wait. A 429 on a send no
+  longer lets an edit walk into the same exhausted bucket, and a wait recorded
+  before the bucket was known is moved into it instead of being forgotten.
+- **Notification sound and do-not-disturb**: two new switches under *Media and
+  notifications*. The sound is the platform's own short cue (PowerShell
+  `SystemSounds` on Windows, `afplay` on macOS, `canberra-gtk-play` on Linux);
+  DND silences notifications and sound while badges and unread counts keep
+  working.
+
 ## 0.10.3 - 2026-11-10
 
 - **Moderator reaction sweeps**: `MESSAGE_REACTION_REMOVE_EMOJI` drops the whole

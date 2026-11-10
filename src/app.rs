@@ -710,6 +710,11 @@ impl App {
     }
     /// Desktop notification; only when the window isn't focused. The platform
     /// tool itself lives in `crate::notify` (`notify-send`, PowerShell, osascript).
+    /// Whether an incoming message should raise a desktop notification at all:
+    /// the setting is on, do-not-disturb is off, and it isn't our own echo.
+    pub(crate) fn should_notify(&self, msg: &ChatMessage) -> bool {
+        self.settings.notifications && !self.settings.dnd && !msg.is_own
+    }
     fn notify_desktop(&self, msg: &ChatMessage) {
         let focused = self.egui_ctx.as_ref().map(|c| c.input(|i| i.focused)).unwrap_or(false);
         if focused {
@@ -720,6 +725,9 @@ impl App {
             return;
         }
         crate::notify::desktop(&msg.author_name, text);
+        if self.settings.notify_sound {
+            crate::notify::sound();
+        }
     }
     /// Queues a corner notice, dropping the oldest if the stack is full.
     pub(crate) fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
@@ -896,7 +904,7 @@ impl App {
                         // The confirmation replaces our local echo; otherwise the same text would appear twice.
                         let replaced = self.replace_local_echo(&cid, &msg);
                         if !replaced {
-                            if self.settings.notifications && !msg.is_own {
+                            if self.should_notify(&msg) {
                                 self.notify_desktop(&msg);
                             }
                             self.note_unread(&msg);

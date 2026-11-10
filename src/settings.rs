@@ -23,6 +23,10 @@ pub(crate) struct Settings {
     pub(crate) blur_media: bool,
     /// Show a desktop notification for incoming messages.
     pub(crate) notifications: bool,
+    /// Play the system notification sound together with the notification.
+    pub(crate) notify_sound: bool,
+    /// Do not disturb: no notifications and no sound, not even mention-free ones.
+    pub(crate) dnd: bool,
     /// Keep deleted messages in the list, drawn in red, instead of removing them.
     pub(crate) keep_deleted: bool,
     /// Outbound proxy URL (http/https/socks5); empty or absent means direct.

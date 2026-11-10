@@ -17,12 +17,49 @@ pub(crate) fn desktop(title: &str, body: &str) {
     if title.trim().is_empty() && body.trim().is_empty() {
         return;
     }
-    let (program, args) = command_for(std::env::consts::OS, title, body);
+    spawn(&command_for(std::env::consts::OS, title, body));
+}
+
+/// Play the system notification sound, if the platform has one to run.
+pub(crate) fn sound() {
+    spawn(&sound_command_for(std::env::consts::OS));
+}
+
+/// Fire and forget: a missing tool must never block a frame or panic.
+fn spawn((program, args): &(String, Vec<String>)) {
     let _ = Command::new(program)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+/// What to run for a short notification sound on `os`. Linux asks the
+/// freedesktop sound theme, which every desktop that ships notifications has.
+pub(crate) fn sound_command_for(os: &str) -> (String, Vec<String>) {
+    match os {
+        "windows" => (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-WindowStyle".to_string(),
+                "Hidden".to_string(),
+                "-Command".to_string(),
+                // The process must outlive the sound, or it is cut off.
+                "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 700"
+                    .to_string(),
+            ],
+        ),
+        "macos" => (
+            "afplay".to_string(),
+            vec!["/System/Library/Sounds/Glass.aiff".to_string()],
+        ),
+        _ => (
+            "canberra-gtk-play".to_string(),
+            vec!["-i".to_string(), "message-new-instant".to_string()],
+        ),
+    }
 }
 
 /// The program and arguments that notify on `os` (`std::env::consts::OS`).

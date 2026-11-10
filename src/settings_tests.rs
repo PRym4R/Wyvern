@@ -25,6 +25,8 @@ fn settings_round_trip_through_a_file() {
     s.ui_scale = Some(1.25);
     s.blur_media = true;
     s.notifications = true;
+    s.notify_sound = true;
+    s.dnd = true;
     s.keep_deleted = true;
     s.animations = Some(false);
 
