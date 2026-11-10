@@ -457,6 +457,37 @@ mod vault_write_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// A lock file that cannot be created must not keep the vault closed: this
+    /// is the state Windows leaves behind when a running client's `accounts.lock`
+    /// is deleted (the name stays "delete pending" until the handle closes).
+    #[test]
+    fn unusable_lock_does_not_block_unlock() {
+        let (mut app, tmp) = vaulted();
+        one_account(&mut app);
+        app.save_accounts("правильный");
+
+        // Something that is not a file sits where the lock should be, so opening
+        // it read+write fails on both platforms.
+        let lock = tmp.with_extension("lock");
+        let _ = std::fs::remove_file(&lock);
+        std::fs::create_dir_all(&lock).expect("каталог на месте замка");
+
+        let mut second = app_at(&tmp);
+        assert!(
+            second.unlock_vault("правильный").is_ok(),
+            "недоступный замок не должен запирать хранилище"
+        );
+        assert!(second.vault_lock.is_none(), "замка нет — так и должно быть");
+        assert!(
+            second.status.contains("lock"),
+            "о недоступном замке нужно сказать: {:?}",
+            second.status
+        );
+
+        let _ = std::fs::remove_dir_all(&lock);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     /// A failed rename (a directory at the vault path) must also be reported.
     #[test]
     fn vault_rename_error_is_reported_and_tmp_is_cleaned() {

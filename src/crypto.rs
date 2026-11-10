@@ -8,6 +8,16 @@ use crate::app::App;
 use crate::models::StoredAccount;
 use crate::util::{base64_decode, base64_string};
 
+/// Open (creating if needed) the vault lock file for read and write; the
+/// session lock is taken on this handle.
+fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
 impl App {
     pub(crate) fn accounts_path() -> std::path::PathBuf {
         // Override for tests so the real file isn't touched.
@@ -103,6 +113,11 @@ impl App {
     }
     /// Take the vault lock for the whole session; a second instance gets an error.
     /// A write-only lock wouldn't separate two clients racing on one account.
+    ///
+    /// The lock guards the vault, it isn't the vault: if the lock file cannot be
+    /// created (left delete-pending by a client that was running when the files
+    /// were deleted, a read-only directory), login must still work, with a
+    /// warning instead of a locked door.
     pub(crate) fn acquire_vault_lock(&mut self) -> Result<(), String> {
         if self.vault_lock.is_some() {
             return Ok(());
@@ -117,12 +132,27 @@ impl App {
                 })?;
             }
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| format!("Failed to open the vault lock ({}): {}", path.display(), e))?;
+        // Windows keeps a file that was deleted while still open in "delete
+        // pending" state, and creating that name again fails with
+        // ERROR_ACCESS_DENIED until the last handle closes. Clearing the name
+        // first is what makes the retry worth attempting.
+        let file = match open_lock_file(&path) {
+            Ok(file) => file,
+            Err(first) => {
+                let _ = std::fs::remove_file(&path);
+                match open_lock_file(&path) {
+                    Ok(file) => file,
+                    Err(_) => {
+                        self.status = format!(
+                            "Vault lock unavailable ({}): {} — logging in without it",
+                            path.display(),
+                            first
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        };
         match file.try_lock() {
             Ok(()) => {
                 self.vault_lock = Some(file);

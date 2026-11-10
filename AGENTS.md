@@ -21,12 +21,12 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   only for running from the repo root; it is not committed).
   Never run that `cp` on Windows — it would put an `.exe` where the Linux
   binary is expected.
-- Tests: `cargo test` — 334 tests (331 + 3 ignored); keep that count in sync
+- Tests: `cargo test` — 335 tests (332 + 3 ignored); keep that count in sync
   with README.
 - 0 warnings required.
 - Windows has no MSVC linker (`link.exe`), so `cargo` alone fails. Use the gnu
   toolchain that is installed there (one `#[cfg(unix)]` test is skipped, so
-  Windows reports 333 in total):
+  Windows reports 334 in total):
 
   ```
   $env:Path = 'C:\Users\hackerman\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;' + $env:Path

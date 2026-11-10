@@ -3,6 +3,15 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.6 - 2026-11-11
+
+- **A stuck vault lock can no longer lock you out**: `accounts.lock` guards
+  against two clients, it isn't the vault itself. When the file cannot be
+  created — most often because a running client's lock was deleted, leaving the
+  name "delete pending" on Windows until that client exits — the old code failed
+  login with "Access is denied" and no way forward. It now clears the stale
+  name, retries once, and otherwise logs in without the lock and says so.
+
 ## 0.10.5 - 2026-11-11
 
 - **Private state files**: `settings.json` (drafts, proxy password) and
