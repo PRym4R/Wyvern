@@ -1,6 +1,7 @@
 target/
 
-# Windows build output: the release binary is attached to GitHub Releases
+# Build output: release binaries are attached to GitHub Releases, not committed
+wyvern
 wyvern.exe
 
 # Local planning notes, not published

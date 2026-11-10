@@ -10,19 +10,17 @@ Licensed under AGPL-3.0 (see `LICENSE`).
 ## Download
 
 Ready builds live in [Releases](https://github.com/PRym4R/Wyvern/releases): the
-Windows `wyvern.exe` is a portable single file, no installer. Linux builds come
-from source below.
+Windows `wyvern.exe` is a portable single file, no installer, and the Linux
+binary comes from source below or from the same release page. Neither binary is
+committed — release assets carry them.
 
 ## Build and run
 
 ```bash
 cargo build --release
-cp -f target/release/wyvern ./wyvern   # a ready binary is committed in the repo
+cp -f target/release/wyvern ./wyvern   # only to run it from the repo root
 ./wyvern
 ```
-
-Linux builds are committed at the repo root (`./wyvern`); the Windows build
-(`wyvern.exe`) is attached to each GitHub release.
 
 The token goes into the login field. If "Remember this account" is ticked, the
 token is encrypted with a password in `accounts.json` (AES-256-GCM, key derived
