@@ -3,6 +3,16 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.7 - 2026-11-11
+
+- **Reproducible release size**: the release profile strips symbols, so a plain
+  `cargo build --release` now produces the same ~16 MB binary the release
+  ships. 0.10.6 was stripped with an ad-hoc `cargo rustc … -C strip=symbols`,
+  which the next build would have silently undone. Nothing changes at runtime.
+- The `0600` promise for state files is a Unix mode; on Windows the profile's
+  own ACL is what keeps other users out. The 0.10.5 note read as if the mode
+  applied everywhere.
+
 ## 0.10.6 - 2026-11-11
 
 - **A stuck vault lock can no longer lock you out**: `accounts.lock` guards

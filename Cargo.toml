@@ -1,6 +1,6 @@
 [package]
 name = "wyvern"
-version = "0.10.6"
+version = "0.10.7"
 edition = "2021"
 
 [dependencies]
@@ -26,3 +26,9 @@ pbkdf2 = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 dirs = "6"
+
+# Release binaries are ~2x smaller without the symbol table, and the release
+# asset is stripped; keep a plain `cargo build --release` matching it instead
+# of relying on an ad-hoc `-C strip=symbols`.
+[profile.release]
+strip = true
