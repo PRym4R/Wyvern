@@ -356,6 +356,20 @@ pub(crate) struct App {
     pub(crate) emoji_picker: Option<(EmojiTarget, String)>,
     /// Whether the picker still has to take keyboard focus (set on open).
     pub(crate) emoji_picker_focus: bool,
+    /// Ctrl+F overlay: whether it is open and what was typed into it.
+    pub(crate) search_open: bool,
+    pub(crate) search_query: String,
+    /// Hits for the current query, newest first.
+    pub(crate) search_hits: Vec<crate::search::Hit>,
+    /// Selected row of the hit list; Enter jumps to it.
+    pub(crate) search_index: usize,
+    /// Whether the field still has to take keyboard focus (set on open).
+    pub(crate) search_focus: bool,
+    /// `(channel, query, message count)` the hits were computed for, so typing
+    /// and new messages refresh them and an idle frame does not.
+    pub(crate) search_key: (String, String, usize),
+    /// Message the view jumped to; its row stays tinted while the search is open.
+    pub(crate) search_highlight: Option<String>,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -448,6 +462,9 @@ pub(crate) struct App {
     /// Test probe: emoji picker cells drawn last frame.
     #[cfg(test)]
     pub(crate) probe_emoji_cells: Vec<(egui::Rect, String)>,
+    /// Test probe: search result rows drawn last frame.
+    #[cfg(test)]
+    pub(crate) probe_search_rows: Vec<(egui::Rect, String)>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -523,6 +540,13 @@ impl App {
             quick_switch_query: String::new(),
             emoji_picker: None,
             emoji_picker_focus: false,
+            search_open: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_index: 0,
+            search_focus: false,
+            search_key: (String::new(), String::new(), 0),
+            search_highlight: None,
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -577,6 +601,8 @@ impl App {
             probe_quick_rects: Vec::new(),
             #[cfg(test)]
             probe_emoji_cells: Vec::new(),
+            #[cfg(test)]
+            probe_search_rows: Vec::new(),
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),

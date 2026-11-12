@@ -3,6 +3,27 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.11.0 - 2026-11-12
+
+- **Ctrl+F search** over the messages already loaded in the open channel. A
+  `🔍` button in the composer opens the same window.
+- Matching ignores case, works on Cyrillic and any other script, and cuts a
+  snippet around the hit so a long message shows its context instead of its
+  beginning. Newest first: a search usually looks for something recent.
+- `↑`/`↓` walk the results, `Enter` jumps, a click does the same, `Esc` or the
+  window's close button drops it. The hit list refreshes as you type and as new
+  messages arrive, but only rescans when the channel, the query or the message
+  count actually changed.
+- A jump reuses the existing viewport anchor (`chat_anchor`) with the bottom
+  lock released, so the message lands at the top of the chat. Its row is tinted
+  with the accent colour while the window is open; the tint is a fill colour
+  only, which keeps the measured row heights and their cache intact.
+- Escape in the composer no longer cancels a reply or an edit while the search
+  window or the emoji picker is open.
+- Search covers loaded history only. Guild-wide search
+  (`GET /guilds/{id}/messages/search`) and jumping into another channel through
+  `?around=` are the next step.
+
 ## 0.10.9 - 2026-11-12
 
 - **Emoji picker**: the composer has an emoji button, the hover strip ends with

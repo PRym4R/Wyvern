@@ -597,6 +597,162 @@ mod geometry_tests {
         );
     }
 
+    /// Sends one key press with the modifiers of the frame. Ctrl doubles as
+    /// Command, which is what the app checks, so the same helper works on macOS.
+    fn key(app: &mut App, ctx: &egui::Context, key: egui::Key, ctrl: bool) {
+        let modifiers = egui::Modifiers {
+            ctrl,
+            command: ctrl,
+            ..Default::default()
+        };
+        let mut input = screen();
+        input.modifiers = modifiers;
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let _ = ctx.run(input, |ctx| app.draw_chat(ctx));
+    }
+
+    /// A channel where one message carries a marker no other message has.
+    fn app_with_marker(count: usize, index: usize, marker: &str) -> Harness {
+        let mut h = app_with_messages(count);
+        let msgs = h.app.messages.get_mut("c0").expect("канал");
+        let mut target = (*msgs[index]).clone();
+        target.content = marker.to_string();
+        msgs[index] = Arc::new(target);
+        h
+    }
+
+    /// Ctrl+F opens the overlay and gives the field focus; nothing is searched
+    /// until something is typed.
+    #[test]
+    fn ctrl_f_opens_the_search_overlay() {
+        let mut h = app_with_messages(3);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 2);
+        assert!(!h.app.search_open, "окно поиска закрыто по умолчанию");
+
+        key(&mut h.app, &ctx, egui::Key::F, true);
+
+        assert!(h.app.search_open, "Ctrl+F должен открыть поиск");
+        assert!(
+            ctx.memory(|m| m.has_focus(egui::Id::new("search_query"))),
+            "поле поиска должно получить фокус"
+        );
+        assert!(h.app.probe_search_rows.is_empty(), "без запроса строк нет");
+    }
+
+    /// A query fills the list, and a click on a row jumps to the message and
+    /// anchors it at the top, dropping the bottom lock.
+    #[test]
+    fn search_shows_a_hit_and_a_click_jumps_to_it() {
+        let mut h = app_with_marker(3, 1, "искомое сообщение");
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        h.app.open_search();
+        h.app.search_query = "искомое".into();
+        frame(&mut h.app, &ctx);
+
+        assert_eq!(h.app.search_hits.len(), 1, "маркер должен найтись один раз");
+        let (row, id) = h
+            .app
+            .probe_search_rows
+            .first()
+            .cloned()
+            .expect("строка результата должна быть отрисована");
+        assert_eq!(id, "m0001", "строка ведёт к помеченному сообщению");
+
+        widget_click_at(&mut h.app, &ctx, row.center());
+
+        assert_eq!(
+            h.app.search_highlight.as_deref(),
+            Some("m0001"),
+            "совпадение подсвечивается"
+        );
+        assert_eq!(
+            h.app.chat_anchor,
+            Some(("m0001".to_string(), 0.0)),
+            "сообщение прижимается к верху списка"
+        );
+        assert!(!h.app.chat_at_bottom, "прыжок отпускает нижний край");
+    }
+
+    /// The jump really moves the view: from the bottom of a long channel a hit
+    /// at the top lands near offset zero.
+    #[test]
+    fn the_jump_scrolls_to_the_message() {
+        let mut h = app_with_marker(80, 0, "уникальный маркер сверху");
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+        assert!(h.app.chat_at_bottom, "список открывается внизу");
+        assert!(
+            h.app.chat_offset_y > 100.0,
+            "канал должен быть длиннее окна, а смещение — {}",
+            h.app.chat_offset_y
+        );
+
+        h.app.open_search();
+        h.app.search_query = "уникальный".into();
+        frame(&mut h.app, &ctx);
+        h.app.jump_to_search_hit(0);
+        frame(&mut h.app, &ctx);
+
+        assert!(
+            h.app.chat_offset_y < 8.0,
+            "вид должен подняться к первому сообщению, а смещение — {}",
+            h.app.chat_offset_y
+        );
+    }
+
+    /// Enter jumps to the selected row without touching the mouse.
+    #[test]
+    fn enter_jumps_to_the_selected_hit() {
+        let mut h = app_with_marker(3, 1, "искомое сообщение");
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        h.app.open_search();
+        h.app.search_query = "искомое".into();
+        frame(&mut h.app, &ctx);
+        assert!(h.app.search_highlight.is_none(), "до Enter прыжка нет");
+
+        key(&mut h.app, &ctx, egui::Key::Enter, false);
+
+        assert_eq!(
+            h.app.search_highlight.as_deref(),
+            Some("m0001"),
+            "Enter должен прыгнуть к выделенной строке"
+        );
+    }
+
+    /// Escape closes the overlay and takes the tint with it, but leaves the
+    /// reply target alone: the composer must not treat the modal's Esc as its own.
+    #[test]
+    fn escape_closes_the_search() {
+        let mut h = app_with_messages(2);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 2);
+        h.app.reply_to = Some(crate::app::ReplyTarget {
+            message_id: "m0000".into(),
+            author_name: "user0".into(),
+            preview: "первое".into(),
+        });
+        h.app.open_search();
+        h.app.search_highlight = Some("m0000".into());
+        frame(&mut h.app, &ctx);
+
+        key(&mut h.app, &ctx, egui::Key::Escape, false);
+
+        assert!(!h.app.search_open, "Escape закрывает поиск");
+        assert!(h.app.search_highlight.is_none(), "подсветка снимается");
+        assert!(h.app.reply_to.is_some(), "ответ не должен отменяться");
+    }
+
     /// Without the pointer over a row there is no strip: it must not clutter
     /// every message in the channel.
     #[test]

@@ -159,6 +159,8 @@ impl App {
         let modal_open = self.lightbox_url.is_some()
             || self.quick_switch_open
             || self.settings_open
+            || self.emoji_picker.is_some()
+            || self.search_open
             || self.confirm.is_some();
         if !modal_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.edit_target.is_some() {
@@ -297,6 +299,16 @@ impl App {
                             .on_hover_text("Emoji");
                         if emoji_btn.clicked() {
                             self.open_emoji_picker(crate::app::EmojiTarget::Insert);
+                        }
+                        ui.add_space(6.0);
+                        let search_btn = ui
+                            .add(
+                                egui::Button::new(RichText::new("🔍").size(16.0))
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Search this channel (Ctrl+F)");
+                        if search_btn.clicked() {
+                            self.open_search();
                         }
                         ui.add_space(6.0);
                         let attach = ui

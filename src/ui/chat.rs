@@ -124,6 +124,12 @@ fn width_key(width: f32) -> u32 {
     width.round().max(0.0) as u32
 }
 
+/// Translucent accent wash for the row a search jumped to. Fill only: a wider
+/// stroke would change the row height and with it every cached estimate.
+fn search_tint(accent: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40)
+}
+
 impl App {
     pub(crate) fn draw_chat(&mut self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
@@ -155,6 +161,7 @@ impl App {
         self.draw_quick_switch(ctx);
         let r3 = ctx.available_rect();
         self.draw_main_chat(ctx);
+        self.draw_search(ctx);
         self.draw_lightbox(ctx);
         self.draw_settings(ctx);
         self.draw_emoji_picker(ctx);
@@ -806,6 +813,19 @@ impl App {
         grouped: bool,
     ) {
         let display = self.display_name(msg);
+        // The row a search jumped to stays tinted until the overlay closes.
+        // Fill and stroke colour only: the stroke keeps its width, or the row
+        // would grow and every cached height would be stale.
+        let highlight_fill = (self.search_highlight.as_deref() == Some(msg.id.as_str()))
+            .then(|| search_tint(self.theme.accent));
+        let row_stroke = egui::Stroke::new(
+            1.0_f32,
+            if highlight_fill.is_some() {
+                self.theme.accent
+            } else {
+                self.theme.divider
+            },
+        );
         // Kept-deleted messages stay in the list but are drawn red.
         let deleted = !msg.id.is_empty() && self.deleted_ids.contains(&msg.id);
         let text_color = if deleted { crate::ui::ERROR_RED } else { self.theme.text };
@@ -813,8 +833,8 @@ impl App {
             let max_w = (ui.available_width() * 0.75).clamp(160.0, 480.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let frame = egui::Frame::new()
-                    .fill(self.theme.self_bg)
-                    .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
+                    .fill(highlight_fill.unwrap_or(self.theme.self_bg))
+                    .stroke(row_stroke)
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
@@ -843,8 +863,8 @@ impl App {
             ui.add_space(if grouped { GROUPED_GAP } else { MESSAGE_GAP });
         } else {
             let frame = egui::Frame::new()
-                .fill(self.theme.message_hover)
-                .stroke(egui::Stroke::new(1.0_f32, self.theme.divider))
+                .fill(highlight_fill.unwrap_or(self.theme.message_hover))
+                .stroke(row_stroke)
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {

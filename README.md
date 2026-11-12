@@ -1,9 +1,10 @@
 # Wyvern
 
 A lightweight Discord client in Rust + egui. Token and a local password, servers
-and channels, history that pages in as you scroll up, images and GIFs, and a
-debug log in the platform cache directory. Everything runs on your own machine;
-there is no server of its own.
+and channels, history that pages in as you scroll up, images and GIFs, reactions
+and an emoji picker, Ctrl+F over the loaded messages, and a debug log in the
+platform cache directory. Everything runs on your own machine; there is no
+server of its own.
 
 Licensed under AGPL-3.0 (see `LICENSE`).
 
@@ -54,10 +55,11 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 | `src/paths.rs` | cross-platform data/cache paths and legacy migration |
 | `src/settings.rs` | settings model, `settings.json` load/save |
 | `src/deleted.rs` | deleted-message store (`deleted.json`) |
+| `src/search.rs` | local message search and snippet cutting |
 | `src/emoji.rs` | curated emoji table and its search |
 | `src/util.rs` | base64 and client-fingerprint helpers |
 | `src/file_picker.rs` | native "choose files" dialog for uploads |
-| `src/ui/*` | screens: login, sidebar, chat, attachments, input, emoji picker, overlays, settings, markdown |
+| `src/ui/*` | screens: login, sidebar, chat, attachments, input, emoji picker, search, overlays, settings, markdown |
 | `src/crypto.rs` | account vault encryption |
 | `src/ss.rs` | native Shadowsocks (SIP002 parsing, AEAD ciphers, stream) |
 | `src/vless.rs` | native VLESS (TLS + WebSocket/TCP, lazy response stripping) |
@@ -67,7 +69,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 353 tests (350 + 3 ignored)
+cargo test --release                                        # 368 tests (365 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

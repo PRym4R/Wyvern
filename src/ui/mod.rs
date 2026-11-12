@@ -7,6 +7,7 @@ mod input;
 mod login;
 mod markdown;
 mod overlays;
+mod search;
 mod settings_window;
 mod sidebar;
 

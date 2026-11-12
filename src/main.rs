@@ -24,6 +24,7 @@ mod models;
 mod net;
 mod notify;
 mod paths;
+mod search;
 mod settings;
 mod ss;
 mod proxybridge;
