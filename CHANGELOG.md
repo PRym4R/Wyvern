@@ -3,6 +3,22 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.12.0 - 2026-11-12
+
+- **Voice channels, control plane**: clicking a voice channel in the sidebar
+  joins it (gateway op 4). Clicking the one you are already joining or in, or
+  the Leave button, disconnects. Stage channels stay inert.
+- The channel list shows who is in voice under the channel name plus a
+  participant count. `GUILD_CREATE` fills the roster on startup, so it is not
+  empty until the first state change arrives.
+- A strip at the bottom of the channel list shows the current voice channel and
+  the number of people in it, with mic and sound toggles and Leave. Deafening
+  implies mute, unmuting clears deafen, and each toggle sends an op 4 update.
+- Joining is honest: the strip says "Connecting…" until Discord confirms with
+  `VOICE_STATE_UPDATE`, so a silent refusal never looks like a connection.
+- No audio yet: this release carries voice state only. The voice WebSocket,
+  receiving and sending Opus packets come next.
+
 ## 0.11.1 - 2026-11-12
 
 - **Guild-wide search**: the Ctrl+F window grew a "Search this server" button

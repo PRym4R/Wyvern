@@ -787,6 +787,135 @@ fn remote_search_hit_opens_its_channel_and_anchors() {
     assert_eq!(app.search_highlight.as_deref(), Some("m7"), "подсветка переживает загрузку");
 }
 
+/// A voice user as Discord reports them.
+fn voice_user(id: &str, name: &str) -> crate::models::VoiceUser {
+    crate::models::VoiceUser {
+        user_id: id.into(),
+        name: name.into(),
+        mute: false,
+        deaf: false,
+        self_mute: false,
+        self_deaf: false,
+    }
+}
+
+/// A voice state moves the user instead of duplicating them, and keeps flags.
+#[test]
+fn voice_state_moves_a_user_between_channels() {
+    let ctx = egui::Context::default();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+
+    tx.send(ToApp::VoiceState {
+        channel: Some("v1".into()),
+        user: voice_user("u2", "Bob"),
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert_eq!(app.voice.get("v1").map(Vec::len), Some(1), "Боб в первом канале");
+
+    let mut muted = voice_user("u2", "Bob");
+    muted.self_mute = true;
+    tx.send(ToApp::VoiceState {
+        channel: Some("v2".into()),
+        user: muted,
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert!(app.voice.get("v1").is_none(), "старый канал не должен хранить копию");
+    let v2 = app.voice.get("v2").expect("Боб переехал во второй канал");
+    assert_eq!(v2.len(), 1);
+    assert!(v2[0].silenced(), "мьют должен быть виден");
+
+    // Leaving voice removes the entry entirely.
+    tx.send(ToApp::VoiceState {
+        channel: None,
+        user: voice_user("u2", "Bob"),
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert!(app.voice.is_empty(), "вышедший не остаётся в списке");
+}
+
+/// Joining waits for Discord's confirmation before calling itself connected,
+/// and leaving clears the panel and tells the gateway.
+#[test]
+fn joining_voice_waits_for_confirmation_then_leaves() {
+    let ctx = egui::Context::default();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (to_gw, mut cmds) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.to_gw = Some(to_gw);
+    app.user_id = "me".into();
+    app.channels.push(test_channel("c1", "general"));
+    app.channels.push(ChatChannel {
+        id: "v1".into(),
+        name: "Voice".into(),
+        guild_id: Some("g1".into()),
+        channel_type: 2,
+        topic: None,
+        position: 1,
+        parent_id: None,
+        last_message_id: None,
+    });
+    app.selected_channel = Some(0);
+    app.open_channel("c1");
+    while cmds.try_recv().is_ok() {}
+
+    app.join_voice("v1");
+    match cmds.try_recv() {
+        Ok(ToGateway::JoinVoice { guild_id, channel_id, .. }) => {
+            assert_eq!(guild_id, "g1");
+            assert_eq!(channel_id, "v1");
+        }
+        other => panic!("ожидался вход в голос, а пришло {:?}", other),
+    }
+    assert!(app.voice_pending.is_some(), "до ответа показываем «connecting»");
+    assert!(app.voice_channel.is_none(), "нельзя врать о подключении");
+
+    tx.send(ToApp::VoiceState {
+        channel: Some("v1".into()),
+        user: voice_user("me", "Me"),
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert_eq!(app.voice_channel.as_deref(), Some("v1"), "Discord подтвердил вход");
+    assert!(app.voice_pending.is_none(), "подсказка о входе снимается");
+
+    app.leave_voice();
+    match cmds.try_recv() {
+        Ok(ToGateway::LeaveVoice { guild_id, .. }) => assert_eq!(guild_id, "g1"),
+        other => panic!("ожидался выход из голоса, а пришло {:?}", other),
+    }
+    assert!(app.voice_channel.is_none() && app.voice_pending.is_none());
+    assert!(app.voice_guild.is_none());
+    assert!(app.voice.is_empty(), "себя из списка тоже убираем");
+}
+
+/// Deafening forces mute; unmuting drops deafen as well (Discord semantics).
+#[test]
+fn deafen_implies_mute_and_unmuting_clears_it() {
+    let (_, rx) = mpsc::unbounded_channel();
+    let (to_gw, mut cmds) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.to_gw = Some(to_gw);
+    app.voice_guild = Some("g1".into());
+    app.voice_channel = Some("v1".into());
+    while cmds.try_recv().is_ok() {}
+
+    app.toggle_self_deafen();
+    assert!(app.self_deaf && app.self_mute, "глушим и звук, и микрофон");
+    match cmds.try_recv() {
+        Ok(ToGateway::VoiceFlags { self_mute, self_deaf, .. }) => {
+            assert!(self_mute && self_deaf, "флаги уходят вместе");
+        }
+        other => panic!("ожидалась команда флагов, а пришло {:?}", other),
+    }
+
+    app.toggle_self_mute();
+    assert!(!app.self_mute && !app.self_deaf, "включённый микрофон снимает и глушение звука");
+}
+
 /// Scroll-up history: the page prepends instead of replacing, and the boundary message isn't duplicated.
 #[test]
 fn older_page_is_prepended_without_duplicates() {

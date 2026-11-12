@@ -3,7 +3,8 @@
 A lightweight Discord client in Rust + egui. Token and a local password, servers
 and channels, history that pages in as you scroll up, images and GIFs, reactions
 and an emoji picker, Ctrl+F over both the loaded messages and the whole server,
-and a debug log in the platform cache directory. Everything runs on your own machine; there is no
+voice channel presence with join/mute/deafen controls, and a debug log in the
+platform cache directory. Everything runs on your own machine; there is no
 server of its own.
 
 Licensed under AGPL-3.0 (see `LICENSE`).
@@ -45,7 +46,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 |---|---|
 | `src/main.rs` | window startup, assets, panics to the log |
 | `src/app.rs` | application state, channels, messages, login |
-| `src/gateway.rs` | WebSocket gateway, connect/reconnect loop |
+| `src/gateway.rs` | WebSocket gateway, connect/reconnect loop, voice state |
 | `src/gateway/rest.rs` | REST calls: messages, history pages, guild search, DMs, friends, reactions |
 | `src/gateway/parse.rs` | lenient JSON → models, shared by live and history |
 | `src/messages.rs` | gateway → app event enum and read state |
@@ -69,7 +70,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 376 tests (373 + 3 ignored)
+cargo test --release                                        # 383 tests (380 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

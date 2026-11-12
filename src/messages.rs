@@ -1,4 +1,4 @@
-use crate::models::{ChatChannel, ChatMessage, Guild, Reaction, UserProfile};
+use crate::models::{ChatChannel, ChatMessage, Guild, Reaction, UserProfile, VoiceUser};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadState {
@@ -71,6 +71,12 @@ pub(crate) enum ToApp {
     /// Guild search failed (no permission, network, rate limit). The overlay
     /// shows the reason instead of a spinner that never ends.
     SearchFailed { query: String, reason: String },
+    /// One participant's voice state changed. `channel` is `None` when the user
+    /// is no longer in any voice channel; that also covers a disconnect.
+    VoiceState {
+        channel: Option<String>,
+        user: VoiceUser,
+    },
     Guild(Guild),
     Channel(ChatChannel),
     GuildChannels { guild_id: String, channels: Vec<ChatChannel> },
@@ -134,6 +140,24 @@ pub(crate) enum ToGateway {
     /// Search the whole guild's messages. `guild_id` scopes it; the answer is
     /// `SearchResults` / `SearchFailed` with the query echoed.
     SearchGuild { guild_id: String, query: String },
+    /// Join a voice channel (op 4). Discord answers with `VOICE_STATE_UPDATE`
+    /// and `VOICE_SERVER_UPDATE`; this step only does the control plane, so the
+    /// answer pins the participant list and our own state.
+    JoinVoice {
+        guild_id: String,
+        channel_id: String,
+        self_mute: bool,
+        self_deaf: bool,
+    },
+    /// Leave whatever voice channel we are in (op 4 with a null channel).
+    LeaveVoice { guild_id: String, self_mute: bool, self_deaf: bool },
+    /// Change mic/deafen flags without leaving the channel.
+    VoiceFlags {
+        guild_id: String,
+        channel_id: String,
+        self_mute: bool,
+        self_deaf: bool,
+    },
     /// Tell Discord the channel was read up to `message_id`. Best-effort: the
     /// local unread badge is cleared regardless of the reply.
     AckMessage { channel_id: String, message_id: String },

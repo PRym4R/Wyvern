@@ -263,6 +263,36 @@ pub(crate) struct Attachment {
     pub(crate) size: Option<[u32; 2]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoiceUser {
+    pub(crate) user_id: String,
+    /// Display name if Discord sent a member/user object; empty otherwise.
+    pub(crate) name: String,
+    /// Server-side mute/deaf, applied by moderators.
+    pub(crate) mute: bool,
+    pub(crate) deaf: bool,
+    pub(crate) self_mute: bool,
+    pub(crate) self_deaf: bool,
+}
+
+impl VoiceUser {
+    /// Name to show in the sidebar: the real one, else a short id so two
+    /// unknown users are still distinguishable.
+    pub(crate) fn label(&self) -> &str {
+        if self.name.is_empty() {
+            // `get` instead of slicing: a non-ASCII id must not panic.
+            self.user_id.get(..6).unwrap_or(&self.user_id)
+        } else {
+            &self.name
+        }
+    }
+
+    /// Whether the user cannot be heard right now: any mute wins.
+    pub(crate) fn silenced(&self) -> bool {
+        self.mute || self.self_mute
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ChatChannel {
     pub(crate) id: String,

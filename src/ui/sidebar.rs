@@ -215,38 +215,52 @@ impl App {
             });
     }
     /// One channel row with its unread badge. Text and announcement channels
-    /// open on click; a voice channel is shown greyed out and non-clickable
-    /// (we don't connect to voice).
+    /// Row in the channel list. Text channels open on click; a voice channel
+    /// joins on click, or leaves when it is the one we are in, and shows who is
+    /// already inside. Stage channels stay inert: joining one is another flow.
     fn draw_channel_row(&mut self, ui: &mut egui::Ui, i: usize) {
         let Some(ch) = self.channels.get(i) else { return };
-        let voice = ch.channel_type == 2;
+        let cid = ch.id.clone();
+        let name = ch.name.clone();
+        let ctype = ch.channel_type;
+        let voice = ctype == 2;
+        let clickable = ctype != 13;
         let anim_time = if self.animations_enabled() { 0.22 } else { 0.0 };
-        let prefix = match ch.channel_type {
+        let prefix = match ctype {
             2 => "🔊",
             5 => "📢",
             _ => "#",
         };
         let is_sel = self.selected_channel == Some(i);
+        let joined = voice && self.voice_channel.as_deref() == Some(cid.as_str());
+        let connecting = voice && self.voice_pending.as_deref() == Some(cid.as_str());
         let sel = ui.ctx().animate_bool_with_time_and_easing(
-            egui::Id::new(("chan_sel", &ch.id)),
+            egui::Id::new(("chan_sel", &cid)),
             is_sel,
             anim_time,
             crate::ui::ease_out_cubic,
         );
-        let (unread, mentions) = self.channel_badge(&ch.id);
-        let dot = unread == 0 && mentions == 0 && self.unread_dot.contains(&ch.id);
-        let label = if mentions > 0 {
-            format!("{} {}  @{}", prefix, ch.name, mentions)
+        let (unread, mentions) = self.channel_badge(&cid);
+        let dot = unread == 0 && mentions == 0 && self.unread_dot.contains(&cid);
+        let occupants = self.voice.get(&cid).map(Vec::len).unwrap_or(0);
+        let mut label = if mentions > 0 {
+            format!("{} {}  @{}", prefix, name, mentions)
         } else if unread > 0 {
-            format!("{} {}  ({})", prefix, ch.name, unread)
+            format!("{} {}  ({})", prefix, name, unread)
         } else if dot {
-            format!("{} {}  •", prefix, ch.name)
+            format!("{} {}  •", prefix, name)
         } else {
-            format!("{} {}", prefix, ch.name)
+            format!("{} {}", prefix, name)
         };
+        if occupants > 0 {
+            label.push_str(&format!("  ({})", occupants));
+        }
+        if connecting {
+            label.push_str("  …");
+        }
         let base = if mentions > 0 {
             Color32::WHITE
-        } else if unread > 0 || dot {
+        } else if unread > 0 || dot || joined || connecting {
             self.theme.text
         } else {
             self.theme.text_secondary
@@ -254,23 +268,95 @@ impl App {
         let mut text = RichText::new(&label)
             .size(14.0)
             .color(base.lerp_to_gamma(Color32::WHITE, sel));
-        if is_sel || mentions > 0 {
+        if is_sel || mentions > 0 || joined {
             text = text.strong();
         }
         let button = egui::Button::new(text)
             .fill(Color32::TRANSPARENT.lerp_to_gamma(self.theme.accent, sel));
-        // Voice rows stay visible but inert, so they don't pretend to open.
         let response = ui
-            .add_enabled_ui(!voice, |ui| {
+            .add_enabled_ui(clickable, |ui| {
                 ui.add_sized([ui.available_width(), 32.0], button)
             })
             .inner;
+        #[cfg(test)]
+        self.probe_channel_rows.push((response.rect, cid.clone()));
         if response.clicked() {
-            let cid = ch.id.clone();
-            self.selected_channel = Some(i);
-            self.scroll_to_bottom = true;
-            self.open_channel(&cid);
+            if voice {
+                self.join_voice(&cid);
+            } else {
+                self.selected_channel = Some(i);
+                self.scroll_to_bottom = true;
+                self.open_channel(&cid);
+            }
         }
+        if occupants > 0 {
+            // Names under the channel, like Discord's roster. Only occupied
+            // channels draw them, so an idle list looks the same as before.
+            let users: Vec<(String, bool)> = self
+                .voice
+                .get(&cid)
+                .map(|v| v.iter().map(|u| (u.label().to_string(), u.silenced())).collect())
+                .unwrap_or_default();
+            for (who, silenced) in users {
+                let line = if silenced {
+                    format!("   🔇 {}", who)
+                } else {
+                    format!("   {}", who)
+                };
+                ui.label(
+                    RichText::new(line)
+                        .size(11.0)
+                        .color(self.theme.text_secondary),
+                );
+            }
+        }
+    }
+    /// Bottom strip of the channel list while in voice: where we are, the two
+    /// toggles and the way out. Audio itself is a later step; this shows the
+    /// control plane honestly as "connected" with a participant count.
+    pub(crate) fn draw_voice_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(cid) = self
+            .voice_channel
+            .clone()
+            .or_else(|| self.voice_pending.clone())
+        else {
+            return;
+        };
+        let connecting = self.voice_channel.is_none();
+        let label = self.channel_label(&cid);
+        let count = self.voice.get(&cid).map(Vec::len).unwrap_or(0);
+        let status = if connecting {
+            "Connecting…".to_string()
+        } else if count > 0 {
+            format!("{} in voice", count)
+        } else {
+            "Connected".to_string()
+        };
+        ui.label(RichText::new(label).size(13.0).strong().color(self.theme.text));
+        ui.label(RichText::new(status).size(11.0).color(self.theme.text_secondary));
+        ui.horizontal(|ui| {
+            let mic = if self.self_mute { "🔇" } else { "🎙" };
+            let mic_resp = ui
+                .add(egui::Button::new(RichText::new(mic).size(14.0)))
+                .on_hover_text(if self.self_mute { "Unmute" } else { "Mute" });
+            if mic_resp.clicked() {
+                self.toggle_self_mute();
+            }
+            let sound = if self.self_deaf { "🔕" } else { "🎧" };
+            let sound_resp = ui
+                .add(egui::Button::new(RichText::new(sound).size(14.0)))
+                .on_hover_text(if self.self_deaf { "Undeafen" } else { "Deafen" });
+            if sound_resp.clicked() {
+                self.toggle_self_deafen();
+            }
+            if ui
+                .button(RichText::new("Leave").size(12.0))
+                .on_hover_text("Disconnect from voice")
+                .clicked()
+            {
+                self.leave_voice();
+            }
+        });
     }
     pub(crate) fn draw_channel_list(&mut self, ctx: &egui::Context) {
         let panel = egui::SidePanel::left("channels")
@@ -290,6 +376,22 @@ impl App {
                     );
                 }
                 ui.set_min_width(ui.available_width());
+                #[cfg(test)]
+                {
+                    self.probe_channel_rows.clear();
+                }
+
+                // The voice strip pins itself to the bottom of the panel and
+                // takes its height away from the channel list below.
+                if self.voice_channel.is_some() || self.voice_pending.is_some() {
+                    egui::TopBottomPanel::bottom("voice_bar")
+                        .frame(
+                            egui::Frame::new()
+                                .fill(self.theme.channel_bg)
+                                .inner_margin(egui::Margin::symmetric(8, 6)),
+                        )
+                        .show_inside(ui, |ui| self.draw_voice_panel(ui));
+                }
 
                 match self.selected_guild {
                     Some(guild_idx) => {

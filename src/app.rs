@@ -379,6 +379,16 @@ pub(crate) struct App {
     /// Query the remote results belong to, so a late answer for older text is
     /// dropped instead of replacing fresher hits.
     pub(crate) search_remote_query: String,
+    /// Voice participants by channel id, in the order Discord reported them.
+    pub(crate) voice: HashMap<String, Vec<crate::models::VoiceUser>>,
+    /// Voice channel we are connected to, once Discord confirmed it.
+    pub(crate) voice_channel: Option<String>,
+    /// Guild that owns `voice_channel`; every op 4 update needs it.
+    pub(crate) voice_guild: Option<String>,
+    /// A join was sent and not yet confirmed; the sidebar shows "connecting".
+    pub(crate) voice_pending: Option<String>,
+    pub(crate) self_mute: bool,
+    pub(crate) self_deaf: bool,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -477,6 +487,9 @@ pub(crate) struct App {
     /// Test probe: the "Search this server" button, when it was drawn.
     #[cfg(test)]
     pub(crate) probe_search_button: Option<egui::Rect>,
+    /// Test probe: channel rows drawn by the sidebar last frame.
+    #[cfg(test)]
+    pub(crate) probe_channel_rows: Vec<(egui::Rect, String)>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -563,6 +576,12 @@ impl App {
     search_remote_loading: false,
     search_remote_error: None,
     search_remote_query: String::new(),
+    voice: HashMap::new(),
+    voice_channel: None,
+    voice_guild: None,
+    voice_pending: None,
+    self_mute: false,
+    self_deaf: false,
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -621,6 +640,8 @@ impl App {
             probe_search_rows: Vec::new(),
             #[cfg(test)]
             probe_search_button: None,
+            #[cfg(test)]
+            probe_channel_rows: Vec::new(),
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),
@@ -1027,6 +1048,9 @@ impl App {
                 ToApp::SearchFailed { query, reason } => {
                     self.search_failed(&query, &reason);
                 }
+                ToApp::VoiceState { channel, user } => {
+                    self.apply_voice_state(channel, user);
+                }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
                         self.guilds.push(g);
@@ -1096,6 +1120,14 @@ impl App {
                         self.connected = false;
                         // The login banner is gone after sign-in, so the toast carries the news.
                         self.toast(ToastKind::Warn, s.clone());
+                    }
+                    if s == "Disconnected" {
+                        // Without a gateway there is no voice session either;
+                        // leaving the strip up would lie about being connected.
+                        self.voice.clear();
+                        self.voice_channel = None;
+                        self.voice_guild = None;
+                        self.voice_pending = None;
                     }
                     self.status = s;
                 }
@@ -1245,6 +1277,11 @@ impl App {
         self.reply_to = None;
         self.edit_target = None;
         self.friends.clear();
+        // Voice belongs to the old account entirely.
+        self.voice.clear();
+        self.voice_channel = None;
+        self.voice_guild = None;
+        self.voice_pending = None;
         // Badges belong to the old account's channels.
         self.unread.clear();
         self.mentions.clear();
@@ -1578,6 +1615,118 @@ impl App {
         self.search_remote_loading = false;
         self.search_remote.clear();
         self.search_remote_error = Some(reason.to_string());
+    }
+    /// Applies one `VOICE_STATE_UPDATE`: the user belongs to `channel` (`None`
+    /// = left voice), and our own entry also drives the flags and panel.
+    fn apply_voice_state(
+        &mut self,
+        channel: Option<String>,
+        user: crate::models::VoiceUser,
+    ) {
+        // A user is only ever in one channel: drop the old copy first.
+        for users in self.voice.values_mut() {
+            users.retain(|u| u.user_id != user.user_id);
+        }
+        self.voice.retain(|_, users| !users.is_empty());
+        let is_self = !self.user_id.is_empty() && user.user_id == self.user_id;
+        if is_self {
+            self.self_mute = user.self_mute;
+            self.self_deaf = user.self_deaf;
+            self.voice_channel = channel.clone();
+            // The join is confirmed (or refused), so the "connecting" hint goes.
+            self.voice_pending = None;
+            if channel.is_none() {
+                self.voice_guild = None;
+            }
+        }
+        if let Some(cid) = channel {
+            if is_self && self.voice_guild.is_none() {
+                self.voice_guild = self
+                    .channels
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .and_then(|c| c.guild_id.clone());
+            }
+            self.voice.entry(cid).or_default().push(user);
+        }
+    }
+    /// Joins a voice channel, or leaves it when it is the one we are already in
+    /// (a second click is the natural way to disconnect).
+    pub(crate) fn join_voice(&mut self, channel_id: &str) {
+        if self.voice_channel.as_deref() == Some(channel_id)
+            || self.voice_pending.as_deref() == Some(channel_id)
+        {
+            self.leave_voice();
+            return;
+        }
+        let Some(guild_id) = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .and_then(|c| c.guild_id.clone())
+        else {
+            return;
+        };
+        // The panel appears right away; Discord confirms with a state event.
+        self.voice_guild = Some(guild_id.clone());
+        self.voice_pending = Some(channel_id.to_string());
+        self.send_cmd(ToGateway::JoinVoice {
+            guild_id,
+            channel_id: channel_id.to_string(),
+            self_mute: self.self_mute,
+            self_deaf: self.self_deaf,
+        });
+        let cid_short: String = channel_id.chars().take(14).collect();
+        self.push_debug(format!("Voice: joining {}", cid_short));
+    }
+    /// Leaves voice. The panel goes immediately; Discord's state event only
+    /// confirms what is already on screen.
+    pub(crate) fn leave_voice(&mut self) {
+        let Some(guild_id) = self.voice_guild.clone() else { return };
+        self.send_cmd(ToGateway::LeaveVoice {
+            guild_id,
+            self_mute: self.self_mute,
+            self_deaf: self.self_deaf,
+        });
+        self.voice_channel = None;
+        self.voice_guild = None;
+        self.voice_pending = None;
+        for users in self.voice.values_mut() {
+            users.retain(|u| u.user_id != self.user_id);
+        }
+        self.voice.retain(|_, users| !users.is_empty());
+        self.push_debug("Voice: left".to_string());
+    }
+    /// Mic toggle. Unmuting also clears deafen, which Discord treats as mute.
+    pub(crate) fn toggle_self_mute(&mut self) {
+        self.self_mute = !self.self_mute;
+        if !self.self_mute {
+            self.self_deaf = false;
+        }
+        self.send_voice_flags();
+    }
+    /// Deafen toggle. Deafening implies mute, so the mic icon follows.
+    pub(crate) fn toggle_self_deafen(&mut self) {
+        self.self_deaf = !self.self_deaf;
+        if self.self_deaf {
+            self.self_mute = true;
+        }
+        self.send_voice_flags();
+    }
+    /// Sends the current flags, but only while actually connected.
+    fn send_voice_flags(&mut self) {
+        let (Some(guild_id), Some(channel_id)) = (
+            self.voice_guild.clone(),
+            self.voice_channel.clone(),
+        ) else {
+            return;
+        };
+        self.send_cmd(ToGateway::VoiceFlags {
+            guild_id,
+            channel_id,
+            self_mute: self.self_mute,
+            self_deaf: self.self_deaf,
+        });
     }
     /// Requests older history from the oldest stored message (list is oldest-first).
     /// Skips local echoes, whose ids aren't real, and won't refetch while a page is in flight.

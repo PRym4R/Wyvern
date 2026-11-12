@@ -730,6 +730,67 @@ mod geometry_tests {
         );
     }
 
+    /// A click on a voice channel joins it, and a second click leaves: the row
+    /// is a toggle, not a way to open a text channel.
+    #[test]
+    fn clicking_a_voice_channel_joins_and_leaves() {
+        let mut h = app_with_messages(2);
+        h.app.user_id = "me".into();
+        h.app.guilds.push(crate::models::Guild {
+            id: "g1".into(),
+            name: "Сервер".into(),
+            icon: None,
+        });
+        h.app.channels.push(ChatChannel {
+            id: "v1".into(),
+            name: "Голос".into(),
+            guild_id: Some("g1".into()),
+            channel_type: 2,
+            topic: None,
+            position: 1,
+            parent_id: None,
+            last_message_id: None,
+        });
+        h.app.selected_guild = Some(0);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 2);
+
+        let row = h
+            .app
+            .probe_channel_rows
+            .iter()
+            .find(|(_, id)| id == "v1")
+            .map(|(rect, _)| *rect)
+            .expect("голосовой канал должен быть в списке");
+        widget_click_at(&mut h.app, &ctx, row.center());
+
+        match h.cmds.try_recv() {
+            Ok(ToGateway::JoinVoice { guild_id, channel_id, .. }) => {
+                assert_eq!(guild_id, "g1");
+                assert_eq!(channel_id, "v1");
+            }
+            other => panic!("ожидался вход в голос, а пришло {:?}", other),
+        }
+        assert_eq!(h.app.voice_pending.as_deref(), Some("v1"), "ждём подтверждения");
+        assert_eq!(h.app.selected_channel, Some(0), "чат не должен переключаться");
+
+        // A second click cancels the pending join instead of stacking requests.
+        let row = h
+            .app
+            .probe_channel_rows
+            .iter()
+            .find(|(_, id)| id == "v1")
+            .map(|(rect, _)| *rect)
+            .expect("канал всё ещё в списке");
+        widget_click_at(&mut h.app, &ctx, row.center());
+        match h.cmds.try_recv() {
+            Ok(ToGateway::LeaveVoice { guild_id, .. }) => assert_eq!(guild_id, "g1"),
+            other => panic!("ожидался выход из голоса, а пришло {:?}", other),
+        }
+        assert!(h.app.voice_pending.is_none(), "подсказка снимается");
+        assert!(h.app.voice_channel.is_none());
+    }
+
     /// The server-wide button exists only in guild channels and sends one
     /// `SearchGuild` for the typed text.
     #[test]

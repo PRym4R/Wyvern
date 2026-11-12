@@ -984,3 +984,55 @@ mod reaction_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod voice_tests {
+    use super::{parse_voice_state, voice_state_payload};
+    use serde_json::json;
+
+    #[test]
+    fn join_payload_carries_channel_and_flags() {
+        let p = voice_state_payload("g1", Some("v1"), true, false);
+        assert_eq!(p["op"], 4, "опкод голосового состояния");
+        assert_eq!(p["d"]["guild_id"], "g1");
+        assert_eq!(p["d"]["channel_id"], "v1");
+        assert_eq!(p["d"]["self_mute"], true);
+        assert_eq!(p["d"]["self_deaf"], false);
+
+        let leave = voice_state_payload("g1", None, false, true);
+        assert!(leave["d"]["channel_id"].is_null(), "выход — это null в channel_id");
+        assert_eq!(leave["d"]["self_deaf"], true);
+    }
+
+    #[test]
+    fn voice_state_prefers_the_nick_and_reads_flags() {
+        let d = json!({
+            "user_id": "u1",
+            "channel_id": "v1",
+            "mute": true,
+            "deaf": false,
+            "self_mute": true,
+            "self_deaf": false,
+            "member": {"nick": "Ник", "user": {"username": "login", "global_name": "Имя"}}
+        });
+        let (channel, user) = parse_voice_state(&d).expect("состояние должно разбираться");
+        assert_eq!(channel.as_deref(), Some("v1"));
+        assert_eq!(user.name, "Ник", "ник важнее имени аккаунта");
+        assert!(user.silenced(), "любой мьют означает «не слышно»");
+        assert_eq!(user.label(), "Ник");
+    }
+
+    #[test]
+    fn voice_state_without_member_falls_back_and_allows_leave() {
+        let d = json!({"user_id": "1234567", "channel_id": null});
+        let (channel, user) = parse_voice_state(&d).expect("без member тоже разбирается");
+        assert!(channel.is_none(), "null означает выход из голоса");
+        assert_eq!(user.label(), "123456", "без имени показываем короткий id");
+        assert!(!user.silenced());
+
+        assert!(
+            parse_voice_state(&json!({"channel_id": "v1"})).is_none(),
+            "без user_id запись бесполезна"
+        );
+    }
+}

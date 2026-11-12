@@ -23,6 +23,7 @@ mod ratelimit;
 mod rest;
 
 use self::parse::parse_message_value;
+use self::parse::parse_voice_state;
 use self::parse::reaction_event_emoji;
 use self::rest::{
     ack_message, api_client, delete_message, edit_message, fetch_around, fetch_guild_search,
@@ -32,7 +33,9 @@ use self::rest::{
 // Re-exported so the `crate::gateway::...` paths used by the test modules keep
 // resolving without changes.
 #[cfg(test)]
-pub(crate) use self::parse::{parse_history_page, parse_history_page_lenient, parse_search_results};
+pub(crate) use self::parse::{
+    parse_history_page, parse_history_page_lenient, parse_search_results,
+};
 #[cfg(test)]
 pub(crate) use self::rest::{
     around_url, client_with_timeout, delete_message_to, edit_message_to, encode_path_segment,
@@ -326,6 +329,25 @@ fn guild_subscribe_payload(guild_id: &str, channel_id: &str) -> serde_json::Valu
             "activities": true,
             "members": [],
             "channels": channels,
+        }
+    })
+}
+
+/// OP 4 "voice state update". A channel joins it, `None` leaves voice
+/// entirely; the flags are echoed so a mute survives a reconnect.
+fn voice_state_payload(
+    guild_id: &str,
+    channel_id: Option<&str>,
+    self_mute: bool,
+    self_deaf: bool,
+) -> serde_json::Value {
+    json!({
+        "op": 4,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
         }
     })
 }
@@ -937,6 +959,15 @@ async fn gw_inner(
                                     message_ids: ids,
                                 });
                             }
+                            "VOICE_STATE_UPDATE" => {
+                                let d = &v["d"];
+                                // One user moved/joined/left or toggled a flag.
+                                // Unknown users still count: the id is enough
+                                // to show somebody is in the channel.
+                                if let Some((channel, user)) = parse_voice_state(d) {
+                                    let _ = event_tx.send(ToApp::VoiceState { channel, user });
+                                }
+                            }
                             "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
                                 let d = &v["d"];
                                 // One event is one user and one emoji; the app
@@ -1018,6 +1049,16 @@ async fn gw_inner(
                                             parent_id: ch["parent_id"].as_str().map(|s| s.to_string()),
                                             last_message_id: ch["last_message_id"].as_str().map(|s| s.to_string()),
                                         }));
+                                    }
+                                }
+                                // Who is already sitting in voice channels.
+                                // Without this the sidebar looks empty until
+                                // the first state change arrives.
+                                if let Some(states) = d["voice_states"].as_array() {
+                                    for st in states {
+                                        if let Some((channel, user)) = parse_voice_state(st) {
+                                            let _ = event_tx.send(ToApp::VoiceState { channel, user });
+                                        }
                                     }
                                 }
                             }
@@ -1187,6 +1228,29 @@ async fn gw_inner(
                         tokio::spawn(async move {
                             fetch_guild_search(httpc, tkc, ev, guild_id, query).await;
                         });
+                    }
+                    ToGateway::JoinVoice { guild_id, channel_id, self_mute, self_deaf } => {
+                        let _ = event_tx.send(ToApp::Debug(format!(
+                            "Голос: вход в канал {}",
+                            channel_id
+                        )));
+                        let p = voice_state_payload(&guild_id, Some(&channel_id), self_mute, self_deaf);
+                        if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    ToGateway::LeaveVoice { guild_id, self_mute, self_deaf } => {
+                        let _ = event_tx.send(ToApp::Debug("Голос: выход из канала".to_string()));
+                        let p = voice_state_payload(&guild_id, None, self_mute, self_deaf);
+                        if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    ToGateway::VoiceFlags { guild_id, channel_id, self_mute, self_deaf } => {
+                        let p = voice_state_payload(&guild_id, Some(&channel_id), self_mute, self_deaf);
+                        if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
+                            break;
+                        }
                     }
                     ToGateway::AckMessage { channel_id, message_id } => {
                         // Best-effort read receipt; the badge is already cleared

@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::models::{
     image_size_of, message_preview, size_from, Attachment, ChatMessage, Embed, Reaction, ReplyRef,
+    VoiceUser,
 };
 
 /// Deserialize a field that may not be a string (e.g. `content` can be a
@@ -373,8 +374,37 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
     })
 }
 
-/// Guild search response: `{"messages": [[hit, context...], ...]}`.
+/// One `voice_states` entry (from `GUILD_CREATE` or `VOICE_STATE_UPDATE`).
 ///
+/// Returns the channel (`None` = left voice) and the participant. Only a user
+/// id is required: names are best-effort, because a state can arrive before the
+/// member object and a missing name must not hide the participant.
+pub(crate) fn parse_voice_state(d: &Value) -> Option<(Option<String>, VoiceUser)> {
+    let user_id = d["user_id"].as_str()?.to_string();
+    let name = d["member"]["nick"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| d["member"]["user"]["global_name"].as_str())
+        .or_else(|| d["member"]["user"]["username"].as_str())
+        .or_else(|| d["user"]["global_name"].as_str())
+        .or_else(|| d["user"]["username"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let flag = |key: &str| d[key].as_bool().unwrap_or(false);
+    Some((
+        d["channel_id"].as_str().map(|s| s.to_string()),
+        VoiceUser {
+            user_id,
+            name,
+            mute: flag("mute"),
+            deaf: flag("deaf"),
+            self_mute: flag("self_mute"),
+            self_deaf: flag("self_deaf"),
+        },
+    ))
+}
+
+/// Guild search response: `{"messages": [[hit, context...], ...]}`.
 /// Each group starts with the hit; the rest is surrounding context and is not
 /// shown. Lenient like the history parse: one broken message must not lose the
 /// whole answer.
