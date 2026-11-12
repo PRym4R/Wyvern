@@ -52,6 +52,18 @@ fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     !n.is_empty() && h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
+/// Cap on redirects when fetching media; Discord's CDN does redirect, but a
+/// chain longer than this is a loop or an attack.
+const MAX_REDIRECTS: usize = 5;
+
+/// Whether a media fetch may follow one more hop to `next`, `hops` redirects
+/// deep already. A fetchable URL can still redirect to `http` or to a literal
+/// address, so every hop gets the same check; checking only the first one is a
+/// suggestion. The hop cap catches loops that would otherwise spin forever.
+fn redirect_allowed(hops: usize, next: &str) -> bool {
+    hops < MAX_REDIRECTS && is_fetchable_media_url(next)
+}
+
 /// One shared client; per-image clients would create a new pool and TLS session.
 /// `None` when the client cannot be built (no TLS backend): that must cost
 /// images, not the whole UI thread.
@@ -62,6 +74,13 @@ fn http() -> Option<&'static reqwest::blocking::Client> {
             crate::net::with_proxy_blocking(reqwest::blocking::Client::builder())
                 .timeout(Duration::from_secs(20))
                 .pool_max_idle_per_host(8)
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if redirect_allowed(attempt.previous().len(), attempt.url().as_str()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error("blocked media redirect")
+                    }
+                }))
                 .build()
                 .ok()
         })
@@ -74,6 +93,12 @@ fn http() -> Option<&'static reqwest::blocking::Client> {
 /// point at `http://127.0.0.1:…` and turn the client into a local-network
 /// prober. Only `https` on a real hostname passes; literal addresses (loopback,
 /// RFC1918, link-local, v6) fail the address check below.
+///
+/// Odd numeric forms need no special case: the URL parser normalises
+/// `2130706433`, `0x7f000001`, `0177.0.0.1` and `127.1` all to `127.0.0.1`
+/// before `host_str` is asked (a test pins that). Names that *resolve* to a
+/// local address (DNS rebinding) are out of scope here: resolving would make
+/// this check depend on the network, and the response is still just an image.
 fn is_fetchable_media_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;

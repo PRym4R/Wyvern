@@ -3,6 +3,21 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.8 - 2026-11-12
+
+- **Media redirects are checked hop by hop**: the https/hostname rule only
+  covered the URL that arrived in Discord's JSON, so a CDN-style `302` could
+  still bounce a fetch to `http://` or to a literal address. Every hop now goes
+  through the same check, with a five-hop cap so a redirect loop ends instead of
+  spinning.
+- Numeric hosts in unusual notations (`2130706433`, `0x7f000001`, `0177.0.0.1`,
+  `127.1`) were already refused - the URL parser normalises them to `127.0.0.1`
+  before the check sees them - and a test now pins that. Names that *resolve* to
+  a local address (DNS rebinding) remain out of scope: resolving would make the
+  check depend on the network.
+- The rate-limit key splits a route on the first colon, so a major parameter
+  that itself contains a colon no longer changes the bucket key by accident.
+
 ## 0.10.7 - 2026-11-11
 
 - **Reproducible release size**: the release profile strips symbols, so a plain

@@ -537,6 +537,79 @@ mod tests {
             egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
         );
     }
+
+    /// A one-shot server that answers with a 302 to `target`.
+    fn redirect_server(target: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+        });
+        addr
+    }
+
+    /// A redirect is a new URL, so it is checked again: the same rules apply,
+    /// plus a cap on the chain length.
+    #[test]
+    fn media_redirects_are_checked_on_every_hop() {
+        let cdn = "https://cdn.discordapp.com/a.png";
+        assert!(redirect_allowed(0, cdn), "первый хоп на https-хост разрешён");
+        assert!(
+            redirect_allowed(MAX_REDIRECTS - 1, cdn),
+            "последний хоп в пределах лимита разрешён"
+        );
+        assert!(
+            !redirect_allowed(MAX_REDIRECTS, cdn),
+            "цепочка длиннее лимита должна отсекаться"
+        );
+        assert!(
+            !redirect_allowed(0, "http://cdn.discordapp.com/a.png"),
+            "редирект на http должен отсекаться"
+        );
+        assert!(
+            !redirect_allowed(0, "https://127.0.0.1:8080/a.png"),
+            "редирект на литеральный адрес должен отсекаться"
+        );
+    }
+
+    /// The policy is wired into the shared client, not just tested on its own.
+    #[test]
+    fn client_refuses_a_redirect_to_a_literal_address() {
+        let bounce = redirect_server("https://127.0.0.1:9/blocked.png".to_string());
+        let client = http().expect("клиент для теста");
+        assert!(
+            client.get(format!("http://{bounce}/start.png")).send().is_err(),
+            "клиент не должен идти по такому редиректу"
+        );
+    }
+
+    /// Numeric hosts in unusual notations reach loopback just like `127.0.0.1`;
+    /// the URL parser normalises them, and the check must keep refusing them.
+    #[test]
+    fn odd_ip_notations_are_refused() {
+        for url in [
+            "https://2130706433/",
+            "https://0x7f000001/",
+            "https://0177.0.0.1/",
+            "https://127.1/",
+            "https://0x7f.1/",
+        ] {
+            assert!(
+                !is_fetchable_media_url(url),
+                "{url} должен отсекаться как локальный адрес"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

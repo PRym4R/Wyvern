@@ -86,10 +86,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The major parameter of a route: Discord counts limits per `channel_id`,
-/// `guild_id` and `webhook_id`. Routes are named `kind:{id}`, so the suffix is
-/// the major parameter; routes without one (`dm`) share a single limit.
+/// `guild_id` and `webhook_id`. Routes are named `kind:<major>`, so the part
+/// after the first colon is the major parameter; routes without one (`dm`,
+/// `relationships`) share a single limit. Splitting on the first colon keeps
+/// any later colon inside the parameter instead of silently changing the key.
 fn major_param(route: &str) -> &str {
-    route.rsplit_once(':').map_or("", |(_, major)| major)
+    route.split_once(':').map_or("", |(_, major)| major)
 }
 
 /// The wait key for a bucket, qualified by the major parameter. The
@@ -397,6 +399,15 @@ mod tests {
             Duration::ZERO,
             "другой канал с тем же хешем ждать не должен"
         );
+    }
+
+    /// The major parameter is the part after the first colon: a route without
+    /// one shares a single limit, and a later colon never changes the key.
+    #[test]
+    fn major_param_splits_on_the_first_colon() {
+        assert_eq!(super::major_param("messages:42"), "42");
+        assert_eq!(super::major_param("dm"), "");
+        assert_eq!(super::major_param("messages:42:7"), "42:7");
     }
 
     /// A wait recorded before the bucket was known moves into the bucket when
