@@ -21,7 +21,7 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   only for running from the repo root; it is not committed).
   Never run that `cp` on Windows — it would put an `.exe` where the Linux
   binary is expected.
-- Tests: `cargo test` - 339 tests (336 + 3 ignored); keep that count in sync
+- Tests: `cargo test` — 339 tests (336 + 3 ignored); keep that count in sync
   with README.
 - 0 warnings required.
 - Windows has no MSVC linker (`link.exe`), so `cargo` alone fails. Use the gnu
