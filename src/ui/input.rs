@@ -289,6 +289,16 @@ impl App {
                             );
                         }
                         ui.add_space(6.0);
+                        let emoji_btn = ui
+                            .add(
+                                egui::Button::new(RichText::new("🙂").size(16.0))
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Emoji");
+                        if emoji_btn.clicked() {
+                            self.open_emoji_picker(crate::app::EmojiTarget::Insert);
+                        }
+                        ui.add_space(6.0);
                         let attach = ui
                             .add(
                                 egui::Button::new(RichText::new("📎").size(16.0))

@@ -212,6 +212,15 @@ pub(crate) struct EditTarget {
     pub(crate) message_id: String,
 }
 
+/// What the emoji picker does with the chosen glyph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EmojiTarget {
+    /// Append to the composer, where the cursor already is.
+    Insert,
+    /// React to one message. The ids are kept so the picker survives frames.
+    React { channel_id: String, message_id: String },
+}
+
 /// Severity of a toast, which only picks its accent colour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ToastKind {
@@ -343,6 +352,10 @@ pub(crate) struct App {
     /// Quick-switch dialog open (Ctrl+K).
     pub(crate) quick_switch_open: bool,
     pub(crate) quick_switch_query: String,
+    /// Emoji picker: what the chosen glyph is for, plus the current query.
+    pub(crate) emoji_picker: Option<(EmojiTarget, String)>,
+    /// Whether the picker still has to take keyboard focus (set on open).
+    pub(crate) emoji_picker_focus: bool,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -432,6 +445,9 @@ pub(crate) struct App {
     /// Test probe: quick-reaction cells drawn last frame.
     #[cfg(test)]
     pub(crate) probe_quick_rects: Vec<(egui::Rect, String)>,
+    /// Test probe: emoji picker cells drawn last frame.
+    #[cfg(test)]
+    pub(crate) probe_emoji_cells: Vec<(egui::Rect, String)>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -505,6 +521,8 @@ impl App {
             pending_copy_image: None,
             quick_switch_open: false,
             quick_switch_query: String::new(),
+            emoji_picker: None,
+            emoji_picker_focus: false,
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -557,6 +575,8 @@ impl App {
             probe_msg_rows: Vec::new(),
             #[cfg(test)]
             probe_quick_rects: Vec::new(),
+            #[cfg(test)]
+            probe_emoji_cells: Vec::new(),
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),

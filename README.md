@@ -54,9 +54,10 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 | `src/paths.rs` | cross-platform data/cache paths and legacy migration |
 | `src/settings.rs` | settings model, `settings.json` load/save |
 | `src/deleted.rs` | deleted-message store (`deleted.json`) |
+| `src/emoji.rs` | curated emoji table and its search |
 | `src/util.rs` | base64 and client-fingerprint helpers |
 | `src/file_picker.rs` | native "choose files" dialog for uploads |
-| `src/ui/*` | screens: login, sidebar, chat, attachments, input, overlays, settings, markdown |
+| `src/ui/*` | screens: login, sidebar, chat, attachments, input, emoji picker, overlays, settings, markdown |
 | `src/crypto.rs` | account vault encryption |
 | `src/ss.rs` | native Shadowsocks (SIP002 parsing, AEAD ciphers, stream) |
 | `src/vless.rs` | native VLESS (TLS + WebSocket/TCP, lazy response stripping) |
@@ -66,7 +67,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 339 tests (336 + 3 ignored)
+cargo test --release                                        # 353 tests (350 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

@@ -14,6 +14,7 @@ mod memcheck;
 mod app;
 mod crypto;
 mod deleted;
+mod emoji;
 mod file_picker;
 mod fsutil;
 mod gateway;

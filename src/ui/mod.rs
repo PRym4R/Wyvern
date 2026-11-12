@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, RichText};
 
 mod attachments;
 mod chat;
+mod emoji_picker;
 mod input;
 mod login;
 mod markdown;

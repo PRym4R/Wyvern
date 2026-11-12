@@ -364,6 +364,32 @@ mod geometry_tests {
         let _ = ctx.run(release, |ctx| app.draw_chat(ctx));
     }
 
+    /// Clicking a real widget: egui counts a click only when the press lands on
+    /// a widget that was already hovered, so the pointer settles one frame
+    /// first. The quick-reaction strip needs no such care — it is hit-tested by
+    /// hand, which is why `click_at` is enough for it.
+    fn widget_click_at(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) {
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut hover = screen();
+        hover.events.push(egui::Event::PointerMoved(pos));
+        let _ = ctx.run(hover, |ctx| app.draw_chat(ctx));
+
+        let mut press = screen();
+        press.events.push(egui::Event::PointerMoved(pos));
+        press.events.push(button(true));
+        let _ = ctx.run(press, |ctx| app.draw_chat(ctx));
+
+        let mut release = screen();
+        release.events.push(egui::Event::PointerMoved(pos));
+        release.events.push(button(false));
+        let _ = ctx.run(release, |ctx| app.draw_chat(ctx));
+    }
+
     /// Clicking a reaction pill toggles it even though the message frame and
     /// the scroll area also sense clicks and are registered later; that is the
     /// case the manual pointer hit-test exists for.
@@ -435,10 +461,15 @@ mod geometry_tests {
         let cells = h.app.probe_quick_rects.clone();
         assert_eq!(
             cells.len(),
-            crate::ui::chat::QUICK_REACTIONS.len(),
-            "на каждый быстрый эмодзи должна быть своя ячейка"
+            crate::ui::chat::QUICK_REACTIONS.len() + 1,
+            "восемь быстрых эмодзи и ячейка, открывающая пикер"
         );
         assert_eq!(cells[0].1, "👍", "первым идёт «палец вверх»");
+        assert_eq!(
+            cells.last().map(|(_, label)| label.as_str()),
+            Some("+"),
+            "последняя ячейка открывает пикер"
+        );
 
         // Полоска висит над строкой: точка ячейки заведомо вне сообщения.
         let (cell, _) = cells[0].clone();
@@ -463,6 +494,107 @@ mod geometry_tests {
             }
         }
         assert!(sent, "команда реакции должна уйти в гейтвей");
+    }
+
+    /// The "+" cell is the way to any emoji outside the eight: it must open the
+    /// picker for the message it floats over.
+    #[test]
+    fn the_strip_plus_cell_opens_the_picker() {
+        let mut h = app_with_messages(1);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        let (row, _) = h.app.probe_msg_rows.first().cloned().expect("строка");
+        let mut input = screen();
+        input.events.push(egui::Event::PointerMoved(row.center()));
+        let _ = ctx.run(input, |ctx| h.app.draw_chat(ctx));
+
+        let (cell, label) = h
+            .app
+            .probe_quick_rects
+            .last()
+            .cloned()
+            .expect("ячейка пикера");
+        assert_eq!(label, "+", "последняя ячейка — «+»");
+
+        click_at(&mut h.app, &ctx, cell.center());
+
+        let (target, query) = h.app.emoji_picker.clone().expect("пикер должен открыться");
+        assert!(query.is_empty(), "пикер открывается с пустым запросом");
+        assert!(
+            matches!(
+                target,
+                crate::app::EmojiTarget::React { ref channel_id, ref message_id }
+                    if channel_id == "c0" && message_id == "m0000"
+            ),
+            "пикер должен помнить, к какому сообщению ставить реакцию"
+        );
+    }
+
+    /// Picking a glyph in React mode reacts to the message the picker was
+    /// opened for; the click goes through `reaction_click` like the strip.
+    #[test]
+    fn picker_click_adds_a_reaction() {
+        let mut h = app_with_messages(1);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        h.app.emoji_picker = Some((
+            crate::app::EmojiTarget::React {
+                channel_id: "c0".into(),
+                message_id: "m0000".into(),
+            },
+            "thumbs up".into(),
+        ));
+        let _ = ctx.run(screen(), |ctx| h.app.draw_chat(ctx));
+
+        let (cell, glyph) = h
+            .app
+            .probe_emoji_cells
+            .iter()
+            .find(|(_, glyph)| glyph == "👍")
+            .cloned()
+            .expect("«палец вверх» должен попасть в выдачу");
+
+        widget_click_at(&mut h.app, &ctx, cell.center());
+        // The click sets `reaction_click`; the next frame applies it.
+        frame(&mut h.app, &ctx);
+
+        let msg = &h.app.messages["c0"][0];
+        assert_eq!(msg.reactions.len(), 1, "пикер должен поставить реакцию");
+        assert!(msg.reactions[0].me, "реакция должна быть нашей");
+        assert_eq!(msg.reactions[0].label(), glyph);
+        assert!(h.app.emoji_picker.is_none(), "после выбора пикер закрывается");
+    }
+
+    /// In Insert mode the glyph goes into the composer, not to a message.
+    #[test]
+    fn picker_click_inserts_into_the_composer() {
+        let mut h = app_with_messages(1);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 3);
+
+        h.app.input = "hello ".into();
+        h.app.emoji_picker = Some((crate::app::EmojiTarget::Insert, "fire".into()));
+        let _ = ctx.run(screen(), |ctx| h.app.draw_chat(ctx));
+
+        let (cell, _) = h
+            .app
+            .probe_emoji_cells
+            .iter()
+            .find(|(_, glyph)| glyph == "🔥")
+            .cloned()
+            .expect("огонь должен быть в выдаче");
+
+        widget_click_at(&mut h.app, &ctx, cell.center());
+        frame(&mut h.app, &ctx);
+
+        assert_eq!(h.app.input, "hello 🔥", "эмодзи должен вставиться в текст");
+        assert!(h.app.emoji_picker.is_none(), "после выбора пикер закрывается");
+        assert!(
+            h.app.messages["c0"][0].reactions.is_empty(),
+            "в режиме вставки реакция не ставится"
+        );
     }
 
     /// Without the pointer over a row there is no strip: it must not clutter

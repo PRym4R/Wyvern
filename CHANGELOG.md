@@ -3,6 +3,20 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.10.9 - 2026-11-12
+
+- **Emoji picker**: the composer has an emoji button, the hover strip ends with
+  a `+`, and "Add reaction" grew a "More…" item. All three open the same
+  searchable window, which either inserts the glyph into the message or reacts
+  to the message it was opened for. Search matches names (`thu` → 👍), Russian
+  and English keywords (`сердце`, `party`), several words at once (`red heart`)
+  and the glyph itself; Enter takes the first hit.
+- The table is deliberately small: ~180 glyphs with short keyword lists in one
+  static slice, a linear scan and no dependency. A full Unicode table would add
+  ~40 KB of source for names nobody types.
+- The eight quick reactions are unchanged; the `+` cell is one more cell in the
+  same strip, so a message can still be reacted to with one click.
+
 ## 0.10.8 - 2026-11-12
 
 - **Media redirects are checked hop by hop**: the https/hostname rule only

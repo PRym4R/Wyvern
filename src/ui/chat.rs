@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::app::{App, ConfirmAction, ConfirmDialog, EditTarget, ReplyTarget};
+use crate::app::{App, ConfirmAction, ConfirmDialog, EditTarget, EmojiTarget, ReplyTarget};
 use crate::models::{ChatMessage, MsgHeight};
 use crate::ui::attachments::{display_size, for_each_image, reserved_size};
 use crate::ui::markdown::render_message_text;
@@ -157,6 +157,7 @@ impl App {
         self.draw_main_chat(ctx);
         self.draw_lightbox(ctx);
         self.draw_settings(ctx);
+        self.draw_emoji_picker(ctx);
         let r4 = ctx.available_rect();
         if self.debug_frames % 15 == 0 {
             self.push_debug(format!("FRAME: screen={:.0}x{:.0} servers={:.0}x{:.0} channels={:.0}x{:.0} input={:.0}x{:.0} chat={:.0}x{:.0}",
@@ -299,6 +300,16 @@ impl App {
                         }
                     }
                 });
+                if ui
+                    .add_enabled(menu.react, egui::Button::new("More…"))
+                    .clicked()
+                {
+                    self.open_emoji_picker(EmojiTarget::React {
+                        channel_id: msg.channel_id.clone(),
+                        message_id: msg.id.clone(),
+                    });
+                    ui.close_menu();
+                }
             });
             if ui
                 .add_enabled(menu.reply, egui::Button::new("Reply"))
@@ -994,7 +1005,7 @@ impl App {
         }
 
         let strip = egui::vec2(
-            QUICK_REACTIONS.len() as f32 * QUICK_CELL + 2.0 * QUICK_PAD,
+            (QUICK_REACTIONS.len() + 1) as f32 * QUICK_CELL + 2.0 * QUICK_PAD,
             QUICK_CELL + 2.0 * QUICK_PAD,
         );
         let row = response.rect;
@@ -1017,7 +1028,12 @@ impl App {
         );
 
         let mut clicked: Option<String> = None;
-        for (i, emoji) in QUICK_REACTIONS.iter().enumerate() {
+        let mut open_picker = false;
+        // The eight fast ones, then a "+" cell for the full picker.
+        let cells = QUICK_REACTIONS.len() + 1;
+        for i in 0..cells {
+            let emoji = QUICK_REACTIONS.get(i).copied();
+            let label = emoji.unwrap_or("+");
             let cell = egui::Rect::from_min_size(
                 egui::pos2(
                     rect.left() + QUICK_PAD + i as f32 * QUICK_CELL,
@@ -1026,7 +1042,7 @@ impl App {
                 egui::Vec2::splat(QUICK_CELL),
             );
             #[cfg(test)]
-            self.probe_quick_rects.push((cell, emoji.to_string()));
+            self.probe_quick_rects.push((cell, label.to_string()));
             let over = pointer.is_some_and(|p| cell.contains(p));
             if over {
                 painter.rect_filled(cell, 5.0, self.theme.message_hover);
@@ -1035,17 +1051,26 @@ impl App {
             painter.text(
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
-                emoji,
+                label,
                 egui::FontId::proportional(15.0),
                 self.theme.text,
             );
             if over && ui.ctx().input(|i| i.pointer.primary_clicked()) {
-                clicked = Some(emoji.to_string());
+                match emoji {
+                    Some(emoji) => clicked = Some(emoji.to_string()),
+                    None => open_picker = true,
+                }
             }
         }
         if let Some(emoji) = clicked {
             // Applied after the frame: the list is out of `messages` while drawn.
             self.reaction_click = Some((msg.channel_id.clone(), msg.id.clone(), emoji));
+        }
+        if open_picker {
+            self.open_emoji_picker(EmojiTarget::React {
+                channel_id: msg.channel_id.clone(),
+                message_id: msg.id.clone(),
+            });
         }
     }
     pub(crate) fn draw_lightbox(&mut self, ctx: &egui::Context) {
