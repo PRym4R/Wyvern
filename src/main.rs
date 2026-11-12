@@ -12,6 +12,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod memcheck;
 
 mod app;
+mod audio;
 mod crypto;
 mod deleted;
 mod emoji;
@@ -31,6 +32,7 @@ mod proxybridge;
 mod vless;
 mod ui;
 mod util;
+mod voice;
 
 use eframe::egui;
 use tokio::sync::mpsc;

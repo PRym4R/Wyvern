@@ -389,6 +389,13 @@ pub(crate) struct App {
     pub(crate) voice_pending: Option<String>,
     pub(crate) self_mute: bool,
     pub(crate) self_deaf: bool,
+    /// Playback really started (the voice handshake finished and a device
+    /// opened). Without it the panel must not claim "Connected".
+    pub(crate) voice_audio: bool,
+    /// Why playback failed, shown in the voice bar.
+    pub(crate) voice_error: Option<String>,
+    /// Users currently speaking, by user id.
+    pub(crate) voice_speaking: HashSet<String>,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -582,6 +589,9 @@ impl App {
     voice_pending: None,
     self_mute: false,
     self_deaf: false,
+    voice_audio: false,
+    voice_error: None,
+    voice_speaking: HashSet::new(),
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -1051,6 +1061,21 @@ impl App {
                 ToApp::VoiceState { channel, user } => {
                     self.apply_voice_state(channel, user);
                 }
+                ToApp::VoiceAudio { ready, reason } => {
+                    self.voice_audio = ready;
+                    self.voice_error = reason.clone();
+                    match reason {
+                        Some(why) => self.push_debug(format!("Голос: звук недоступен: {}", why)),
+                        None => self.push_debug("Голос: звук пошёл".to_string()),
+                    }
+                }
+                ToApp::VoiceSpeaking { user_id, speaking } => {
+                    if speaking {
+                        self.voice_speaking.insert(user_id);
+                    } else {
+                        self.voice_speaking.remove(&user_id);
+                    }
+                }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
                         self.guilds.push(g);
@@ -1128,6 +1153,9 @@ impl App {
                         self.voice_channel = None;
                         self.voice_guild = None;
                         self.voice_pending = None;
+                        self.voice_audio = false;
+                        self.voice_error = None;
+                        self.voice_speaking.clear();
                     }
                     self.status = s;
                 }
@@ -1282,6 +1310,9 @@ impl App {
         self.voice_channel = None;
         self.voice_guild = None;
         self.voice_pending = None;
+        self.voice_audio = false;
+        self.voice_error = None;
+        self.voice_speaking.clear();
         // Badges belong to the old account's channels.
         self.unread.clear();
         self.mentions.clear();
@@ -1628,6 +1659,10 @@ impl App {
             users.retain(|u| u.user_id != user.user_id);
         }
         self.voice.retain(|_, users| !users.is_empty());
+        if channel.is_none() {
+            // Someone who is not in the channel cannot be talking.
+            self.voice_speaking.remove(&user.user_id);
+        }
         let is_self = !self.user_id.is_empty() && user.user_id == self.user_id;
         if is_self {
             self.self_mute = user.self_mute;
@@ -1637,6 +1672,9 @@ impl App {
             self.voice_pending = None;
             if channel.is_none() {
                 self.voice_guild = None;
+                self.voice_audio = false;
+                self.voice_error = None;
+                self.voice_speaking.clear();
             }
         }
         if let Some(cid) = channel {
@@ -1670,6 +1708,9 @@ impl App {
         // The panel appears right away; Discord confirms with a state event.
         self.voice_guild = Some(guild_id.clone());
         self.voice_pending = Some(channel_id.to_string());
+        self.voice_audio = false;
+        self.voice_error = None;
+        self.voice_speaking.clear();
         self.send_cmd(ToGateway::JoinVoice {
             guild_id,
             channel_id: channel_id.to_string(),
@@ -1691,6 +1732,9 @@ impl App {
         self.voice_channel = None;
         self.voice_guild = None;
         self.voice_pending = None;
+        self.voice_audio = false;
+        self.voice_error = None;
+        self.voice_speaking.clear();
         for users in self.voice.values_mut() {
             users.retain(|u| u.user_id != self.user_id);
         }

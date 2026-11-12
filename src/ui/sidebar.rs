@@ -292,14 +292,26 @@ impl App {
         if occupants > 0 {
             // Names under the channel, like Discord's roster. Only occupied
             // channels draw them, so an idle list looks the same as before.
-            let users: Vec<(String, bool)> = self
+            let users: Vec<(String, bool, bool)> = self
                 .voice
                 .get(&cid)
-                .map(|v| v.iter().map(|u| (u.label().to_string(), u.silenced())).collect())
+                .map(|v| {
+                    v.iter()
+                        .map(|u| {
+                            (
+                                u.label().to_string(),
+                                u.silenced(),
+                                self.voice_speaking.contains(&u.user_id),
+                            )
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            for (who, silenced) in users {
+            for (who, silenced, speaking) in users {
                 let line = if silenced {
                     format!("   🔇 {}", who)
+                } else if speaking {
+                    format!("   🔊 {}", who)
                 } else {
                     format!("   {}", who)
                 };
@@ -325,12 +337,20 @@ impl App {
         let connecting = self.voice_channel.is_none();
         let label = self.channel_label(&cid);
         let count = self.voice.get(&cid).map(Vec::len).unwrap_or(0);
-        let status = if connecting {
+        let status = if let Some(err) = &self.voice_error {
+            format!("No audio: {}", err)
+        } else if connecting {
             "Connecting…".to_string()
+        } else if self.voice_audio {
+            if count > 0 {
+                format!("{} in voice · audio on", count)
+            } else {
+                "Connected · audio on".to_string()
+            }
         } else if count > 0 {
-            format!("{} in voice", count)
+            format!("{} in voice · starting audio…", count)
         } else {
-            "Connected".to_string()
+            "Connected · starting audio…".to_string()
         };
         ui.label(RichText::new(label).size(13.0).strong().color(self.theme.text));
         ui.label(RichText::new(status).size(11.0).color(self.theme.text_secondary));

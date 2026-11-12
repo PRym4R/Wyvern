@@ -77,6 +77,11 @@ pub(crate) enum ToApp {
         channel: Option<String>,
         user: VoiceUser,
     },
+    /// Voice audio: `ready` once playback started, otherwise `reason` says why
+    /// (no output device, failed handshake, UDP blocked).
+    VoiceAudio { ready: bool, reason: Option<String> },
+    /// Someone started or stopped talking in the current voice channel.
+    VoiceSpeaking { user_id: String, speaking: bool },
     Guild(Guild),
     Channel(ChatChannel),
     GuildChannels { guild_id: String, channels: Vec<ChatChannel> },

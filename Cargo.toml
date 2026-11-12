@@ -1,6 +1,6 @@
 [package]
 name = "wyvern"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 
 [dependencies]
@@ -26,6 +26,11 @@ pbkdf2 = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 dirs = "6"
+# Voice receive: RTP decryption, Opus decoding and audio output. All three are
+# pure Rust or thin platform bindings; no libopus/FFI.
+xsalsa20poly1305 = "0.9"
+opus-decoder = "0.1"
+cpal = "0.18"
 
 # Release binaries are ~2x smaller without the symbol table, and the release
 # asset is stripped; keep a plain `cargo build --release` matching it instead

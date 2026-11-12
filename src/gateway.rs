@@ -274,10 +274,86 @@ fn classify_raw(raw: &str) -> RawFrame {
 #[derive(Default)]
 struct SessionState {
     session_id: Option<String>,
+    /// Our own user id from READY; voice events are matched against it.
+    user_id: Option<String>,
     seq: Option<i64>,
+    /// Voice channel we asked to join, kept across reconnects so the new
+    /// connection can rebuild the audio session.
+    voice_target: Option<(String, String)>,
     /// "Channel, page" pairs with a history request in flight. Lives with the
     /// session, not one connection, so duplicate protection survives a reconnect.
     history_inflight: HistoryInflight,
+}
+
+/// Connection-scoped voice state: Discord sends the pieces in two separate
+/// events, and the audio task needs a stop handle.
+#[derive(Default)]
+struct VoiceLink {
+    /// `VOICE_STATE_UPDATE.session_id` for our own user.
+    session_id: Option<String>,
+    /// `VOICE_SERVER_UPDATE` endpoint and token.
+    server: Option<(String, String)>,
+    /// Set while a voice task runs; dropping the sender would stop it too, but
+    /// an explicit `true` tells the task why.
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl VoiceLink {
+    /// Stops the audio task, if any.
+    fn stop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(true);
+        }
+    }
+
+    /// Forgets everything about the previous channel.
+    fn reset(&mut self) {
+        self.stop();
+        self.session_id = None;
+        self.server = None;
+    }
+}
+
+/// Starts the voice task once both halves arrived (`VOICE_STATE_UPDATE` and
+/// `VOICE_SERVER_UPDATE`) and a join is pending.
+fn start_voice(session: &SessionState, link: &mut VoiceLink, event_tx: &EventTx) {
+    if link.stop.is_some() {
+        return;
+    }
+    let Some((guild_id, _)) = session.voice_target.clone() else { return };
+    let Some(session_id) = link.session_id.clone() else { return };
+    let Some((endpoint, token)) = link.server.clone() else { return };
+    let Some(user_id) = session.user_id.clone() else { return };
+
+    // Voice audio is raw UDP: a TCP proxy cannot carry it, and pretending
+    // otherwise would leave the user staring at "Connecting…".
+    if crate::net::proxy().is_some() {
+        let _ = event_tx.send(ToApp::VoiceAudio {
+            ready: false,
+            reason: Some("voice needs direct UDP; a proxy is not supported yet".into()),
+        });
+        let _ = event_tx.send(ToApp::Debug(
+            "Голос: прокси не поддерживается, UDP идёт напрямую".into(),
+        ));
+        // Keep the slot busy so later events don't repeat the same message.
+        let (tx, _rx) = tokio::sync::watch::channel(true);
+        link.stop = Some(tx);
+        return;
+    }
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    link.stop = Some(tx);
+    let conn = crate::voice::VoiceConnect {
+        endpoint,
+        token,
+        session_id,
+        guild_id,
+        user_id,
+    };
+    let event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        crate::voice::run(conn, event_tx, rx).await;
+    });
 }
 
 /// Set of in-flight history requests, keyed by channel and page (`before`).
@@ -638,6 +714,9 @@ async fn gw_inner(
     heartbeat.tick().await;
     let mut seq: Option<i64> = session.seq;
     let mut hb = HeartbeatBook::default();
+    // Voice is per connection: the session id and token both change on
+    // reconnect, so the audio task is rebuilt from the new events.
+    let mut voice = VoiceLink::default();
 
     loop {
         tokio::select! {
@@ -710,6 +789,7 @@ async fn gw_inner(
                                 let uid = d["user"]["id"].as_str().unwrap_or("").to_string();
                                 let avatar = d["user"]["avatar"].as_str().map(|s| s.to_string());
                                 session.session_id = d["session_id"].as_str().map(|s| s.to_string());
+                                session.user_id = if uid.is_empty() { None } else { Some(uid.clone()) };
                                 session.seq = seq;
                                 let _ = event_tx.send(ToApp::Ready { username: u, user_id: uid, avatar });
 
@@ -966,6 +1046,45 @@ async fn gw_inner(
                                 // to show somebody is in the channel.
                                 if let Some((channel, user)) = parse_voice_state(d) {
                                     let _ = event_tx.send(ToApp::VoiceState { channel, user });
+                                }
+                                // Our own event carries the voice session id:
+                                // without it the voice gateway cannot identify
+                                // us. A null channel means we left voice.
+                                let is_self = session
+                                    .user_id
+                                    .as_deref()
+                                    .is_some_and(|id| d["user_id"].as_str() == Some(id));
+                                if is_self {
+                                    match (session.voice_target.as_ref(), d["channel_id"].as_str()) {
+                                        (Some((_, target)), Some(cid)) if cid == target => {
+                                            if let Some(sid) = d["session_id"].as_str() {
+                                                voice.session_id = Some(sid.to_string());
+                                                start_voice(&session, &mut voice, &event_tx);
+                                            }
+                                        }
+                                        // Discord moved or removed us; stop
+                                        // the audio that belongs to the old
+                                        // channel.
+                                        (Some(_), None) => {
+                                            session.voice_target = None;
+                                            voice.reset();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            "VOICE_SERVER_UPDATE" => {
+                                let d = &v["d"];
+                                let guild = d["guild_id"].as_str().unwrap_or("");
+                                let endpoint = d["endpoint"].as_str().unwrap_or("");
+                                let token = d["token"].as_str().unwrap_or("");
+                                let ours = session
+                                    .voice_target
+                                    .as_ref()
+                                    .is_some_and(|(id, _)| id == guild);
+                                if ours && !endpoint.is_empty() && !token.is_empty() {
+                                    voice.server = Some((endpoint.to_string(), token.to_string()));
+                                    start_voice(&session, &mut voice, &event_tx);
                                 }
                             }
                             "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
@@ -1234,6 +1353,9 @@ async fn gw_inner(
                             "Голос: вход в канал {}",
                             channel_id
                         )));
+                        // A new join replaces any previous session outright.
+                        voice.reset();
+                        session.voice_target = Some((guild_id.clone(), channel_id.clone()));
                         let p = voice_state_payload(&guild_id, Some(&channel_id), self_mute, self_deaf);
                         if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
                             break;
@@ -1241,6 +1363,8 @@ async fn gw_inner(
                     }
                     ToGateway::LeaveVoice { guild_id, self_mute, self_deaf } => {
                         let _ = event_tx.send(ToApp::Debug("Голос: выход из канала".to_string()));
+                        session.voice_target = None;
+                        voice.reset();
                         let p = voice_state_payload(&guild_id, None, self_mute, self_deaf);
                         if write.send(WsMessage::Text(serde_json::to_string(&p).unwrap().into())).await.is_err() {
                             break;

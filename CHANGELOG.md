@@ -3,6 +3,31 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.12.1 - 2026-11-12
+
+- **Voice receive**: joining a voice channel now actually plays the people in
+  it. The client opens the voice gateway (op 8/0/2, then op 1 select protocol),
+  does UDP IP discovery, decrypts RTP with `xsalsa20_poly1305`, decodes Opus at
+  48 kHz stereo and feeds a local output stream.
+- The voice strip reports the real state: "Connecting…" until Discord confirms,
+  then "starting audio…", then "audio on", or the actual reason audio is
+  unavailable (no output device, blocked UDP, rejected handshake). It never
+  claims to be receiving when it is not.
+- Speakers get a 🔊 next to their name from the voice gateway's speaking events;
+  muted users keep the 🔇.
+- Audio is mixed in a 500 ms ring buffer, 100 ms ahead of playback, with RTP
+  timestamps placing each speaker so two people talking at once are heard
+  together instead of one after the other. Device rates other than 48 kHz and
+  mono outputs are resampled at the callback.
+- Opus decoding is pure Rust (`opus-decoder`, RFC 8251) and output is `cpal`;
+  no libopus or other native codec. On Linux this adds an ALSA build
+  dependency (`libasound2-dev`).
+- Voice audio uses raw UDP, so the configured HTTPS/SOCKS proxy is not used:
+  the strip says so instead of hanging on "Connecting…". TURN/STUN comes later.
+- Tests: 13 new (RTP headers, nonce/decrypt roundtrip, discovery packet and
+  reply, mixer summing/clipping/clearing, pre-buffer, resampling, PLC), 396
+  total.
+
 ## 0.12.0 - 2026-11-12
 
 - **Voice channels, control plane**: clicking a voice channel in the sidebar
