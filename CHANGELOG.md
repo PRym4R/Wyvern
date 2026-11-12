@@ -3,6 +3,26 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.13.1 - 2026-11-12
+
+- **Voice transport encryption**: Discord closed the voice socket with 4016
+  ("unsupported voice encryption mode") because the client selected
+  `xsalsa20_poly1305`, which new voice connections no longer accept. The client
+  now takes the offered modes from op 2 and prefers
+  `aead_xchacha20_poly1305_rtpsize`, falling back to
+  `aead_aes256_gcm_rtpsize`, and to xsalsa only if an older server offers
+  nothing else.
+- The rtpsize AEAD framing is implemented as specified: the last 4 bytes of the
+  packet are the nonce counter (the nonce is that counter followed by zeros),
+  the plain RTP header (plus CSRCs and the extension header) is the additional
+  data, and the extension payload is encrypted, so it is skipped after
+  decryption. DAVE frames still sit inside the decrypted payload and are
+  handled as before.
+- The mode echoed in op 4 is what decryption uses, not the one requested, so a
+  server that answers with a different accepted mode still works.
+- Tests: 3 new (xchacha and AES-GCM rtpsize roundtrips, mode preference), 408
+  total.
+
 ## 0.13.0 - 2026-11-12
 
 - **Sound settings**: a new Sound tab controls other people's voices, your own

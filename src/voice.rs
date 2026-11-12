@@ -19,8 +19,11 @@ use tokio::sync::watch;
 use tokio::time;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use aes_gcm::Aes256Gcm;
+use chacha20poly1305::aead::Payload;
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use xsalsa20poly1305::aead::{Aead, KeyInit};
-use xsalsa20poly1305::{Nonce, XSalsa20Poly1305};
+use xsalsa20poly1305::{Nonce as XsalsaNonce, XSalsa20Poly1305};
 
 use crate::audio::Player;
 use crate::gateway::EventTx;
@@ -42,6 +45,52 @@ pub(crate) struct VoiceConnect {
 }
 
 type VoiceSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Voice transport encryption. Discord stopped accepting plain
+/// `xsalsa20_poly1305` on new connections (close 4016), so the modern
+/// `*_rtpsize` AEAD modes are preferred; the choice itself comes from the
+/// `modes` list in op 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EncryptionMode {
+    Xsalsa20Poly1305,
+    AeadXChaCha20Poly1305Rtpsize,
+    AeadAes256GcmRtpsize,
+}
+
+impl EncryptionMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Xsalsa20Poly1305 => "xsalsa20_poly1305",
+            Self::AeadXChaCha20Poly1305Rtpsize => "aead_xchacha20_poly1305_rtpsize",
+            Self::AeadAes256GcmRtpsize => "aead_aes256_gcm_rtpsize",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "xsalsa20_poly1305" => Some(Self::Xsalsa20Poly1305),
+            "aead_xchacha20_poly1305_rtpsize" => Some(Self::AeadXChaCha20Poly1305Rtpsize),
+            "aead_aes256_gcm_rtpsize" => Some(Self::AeadAes256GcmRtpsize),
+            _ => None,
+        }
+    }
+}
+
+/// Picks the best transport encryption from op 2's `modes` list. Unknown and
+/// unsupported names (the `_lite`/`_suffix` xsalsa variants) are skipped;
+/// without a list the server is old enough for header-nonce xsalsa.
+pub(crate) fn pick_mode(modes: &[Value]) -> EncryptionMode {
+    for wanted in [
+        EncryptionMode::AeadXChaCha20Poly1305Rtpsize,
+        EncryptionMode::AeadAes256GcmRtpsize,
+        EncryptionMode::Xsalsa20Poly1305,
+    ] {
+        if modes.iter().any(|mode| mode.as_str() == Some(wanted.name())) {
+            return wanted;
+        }
+    }
+    EncryptionMode::Xsalsa20Poly1305
+}
 
 /// One event from the voice gateway. DAVE opcodes arrive as binary frames on
 /// gateway v8+, with a 2-byte sequence number in front of the opcode.
@@ -420,6 +469,10 @@ async fn run_inner(
     }
     let (public_ip, public_port) = public.ok_or("voice udp discovery timed out")?;
 
+    // Take the best transport encryption the server lists. Sending a mode it
+    // no longer supports gets the socket closed with 4016 before any audio.
+    let modes = ready["modes"].as_array().cloned().unwrap_or_default();
+    let requested = pick_mode(&modes);
     let select = json!({
         "op": 1,
         "d": {
@@ -427,12 +480,15 @@ async fn run_inner(
             "data": {
                 "address": public_ip,
                 "port": public_port,
-                "mode": "xsalsa20_poly1305",
+                "mode": requested.name(),
             }
         }
     });
     send_json(&mut ws, &select).await?;
 
+    // The answer repeats the accepted mode; use it rather than assuming the
+    // server took our preference.
+    let selected: EncryptionMode;
     let dave_version;
     let key = loop {
         tokio::select! {
@@ -448,9 +504,13 @@ async fn run_inner(
                     VoiceEvent::Json(v) => match v["op"].as_i64() {
                         Some(4) => {
                             let mode = v["d"]["mode"].as_str().unwrap_or("");
-                            if !mode.is_empty() && mode != "xsalsa20_poly1305" {
-                                return Err(format!("voice: unsupported encryption mode {}", mode));
-                            }
+                            selected = if mode.is_empty() {
+                                requested
+                            } else {
+                                EncryptionMode::from_name(mode).ok_or_else(|| {
+                                    format!("voice: unsupported encryption mode {}", mode)
+                                })?
+                            };
                             let bytes: Vec<u8> = v["d"]["secret_key"]
                                 .as_array()
                                 .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
@@ -502,6 +562,7 @@ async fn run_inner(
         &mut ws,
         &socket,
         &key,
+        selected,
         &player,
         &mut dave,
         event_tx,
@@ -518,6 +579,7 @@ async fn receive_loop(
     ws: &mut VoiceSocket,
     socket: &UdpSocket,
     key: &[u8],
+    mode: EncryptionMode,
     player: &Player,
     dave: &mut Option<DaveState>,
     event_tx: &EventTx,
@@ -541,7 +603,7 @@ async fn receive_loop(
                 let n = received.map_err(|e| format!("voice udp: {}", e))?;
                 let packet = &udp_buf[..n];
                 let Some(header) = parse_rtp(packet) else { continue };
-                let Some(plain) = decrypt_rtp(&packet[..12], &packet[header.len..], key) else {
+                let Some(plain) = decrypt_rtp(packet, key, mode) else {
                     continue;
                 };
                 if plain.is_empty() {
@@ -809,8 +871,13 @@ pub(crate) fn parse_discovery_reply(buf: &[u8]) -> Option<(String, u16)> {
 
 /// One parsed RTP packet header.
 pub(crate) struct RtpHeader {
-    /// Length of the header including CSRCs and the extension.
+    /// Full header length including CSRCs and the extension payload.
     pub(crate) len: usize,
+    /// Fixed header + CSRCs + extension header: the part AEAD authenticates
+    /// without encrypting.
+    pub(crate) aad_len: usize,
+    /// Extension payload size in 32-bit words; AEAD encrypts it with the frame.
+    pub(crate) extension_words: usize,
     pub(crate) ssrc: u32,
     /// 48 kHz sample clock; places the packet on the mixer timeline.
     pub(crate) timestamp: u32,
@@ -824,13 +891,17 @@ pub(crate) fn parse_rtp(packet: &[u8]) -> Option<RtpHeader> {
     }
     let csrc_count = (packet[0] & 0x0f) as usize;
     let mut len = 12 + csrc_count * 4;
+    let mut aad_len = len;
+    let mut extension_words = 0;
     if packet[0] & 0x10 != 0 {
-        // One extension: 16-bit profile, 16-bit length in 32-bit words.
+        // One extension: 16-bit profile, 16-bit length in 32-bit words. The
+        // extension payload itself is encrypted in the AEAD modes.
         if packet.len() < len + 4 {
             return None;
         }
-        let words = u16::from_be_bytes([packet[len + 2], packet[len + 3]]) as usize;
-        len += 4 + words * 4;
+        extension_words = u16::from_be_bytes([packet[len + 2], packet[len + 3]]) as usize;
+        aad_len = len + 4;
+        len += 4 + extension_words * 4;
     }
     // Ciphertext plus the 16-byte Poly1305 tag.
     if packet.len() < len + 16 {
@@ -838,19 +909,78 @@ pub(crate) fn parse_rtp(packet: &[u8]) -> Option<RtpHeader> {
     }
     let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
     let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-    Some(RtpHeader { len, ssrc, timestamp })
+    Some(RtpHeader {
+        len,
+        aad_len,
+        extension_words,
+        ssrc,
+        timestamp,
+    })
 }
 
-/// Decrypts an `xsalsa20_poly1305` RTP body. The nonce is the first 12 header
-/// bytes followed by 12 zeros, per the Discord voice protocol.
-pub(crate) fn decrypt_rtp(header: &[u8], body: &[u8], key: &[u8]) -> Option<Vec<u8>> {
-    if header.len() < 12 {
-        return None;
+/// Decrypts one transport-encrypted RTP packet according to `mode`.
+///
+/// `xsalsa20_poly1305` takes the first 12 header bytes as the nonce and leaves
+/// the extension payload in clear text. The `*_rtpsize` AEAD modes keep a
+/// 4-byte counter at the very end of the packet (the nonce is that counter
+/// followed by zeros), authenticate the plain header as additional data and
+/// encrypt the extension payload together with the Opus frame.
+pub(crate) fn decrypt_rtp(packet: &[u8], key: &[u8], mode: EncryptionMode) -> Option<Vec<u8>> {
+    let header = parse_rtp(packet)?;
+    match mode {
+        EncryptionMode::Xsalsa20Poly1305 => {
+            let cipher = XSalsa20Poly1305::new_from_slice(key).ok()?;
+            let mut nonce = [0u8; 24];
+            nonce[..12].copy_from_slice(&packet[..12]);
+            cipher
+                .decrypt(XsalsaNonce::from_slice(&nonce), &packet[header.len..])
+                .ok()
+        }
+        EncryptionMode::AeadXChaCha20Poly1305Rtpsize
+        | EncryptionMode::AeadAes256GcmRtpsize => {
+            if packet.len() < header.aad_len + 16 + 4 {
+                return None;
+            }
+            // Ciphertext (tag included) up to the trailing 4-byte nonce.
+            let split = packet.len() - 4;
+            let ciphertext = &packet[header.aad_len..split];
+            let nonce_bytes = &packet[split..];
+            let aad = &packet[..header.aad_len];
+            let plain = if mode == EncryptionMode::AeadXChaCha20Poly1305Rtpsize {
+                let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
+                let mut nonce = [0u8; 24];
+                nonce[..4].copy_from_slice(nonce_bytes);
+                cipher
+                    .decrypt(
+                        XNonce::from_slice(&nonce),
+                        Payload {
+                            msg: ciphertext,
+                            aad,
+                        },
+                    )
+                    .ok()?
+            } else {
+                let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(nonce_bytes);
+                cipher
+                    .decrypt(
+                        aes_gcm::Nonce::from_slice(&nonce),
+                        Payload {
+                            msg: ciphertext,
+                            aad,
+                        },
+                    )
+                    .ok()?
+            };
+            // Drop the decrypted extension payload; Opus starts after it.
+            let skip = header.extension_words * 4;
+            if plain.len() < skip {
+                return None;
+            }
+            Some(plain[skip..].to_vec())
+        }
     }
-    let cipher = XSalsa20Poly1305::new_from_slice(key).ok()?;
-    let mut nonce = [0u8; 24];
-    nonce[..12].copy_from_slice(&header[..12]);
-    cipher.decrypt(Nonce::from_slice(&nonce), body).ok()
 }
 
 #[cfg(test)]
@@ -914,6 +1044,8 @@ mod tests {
         packet[12 + 4 + 2..12 + 4 + 4].copy_from_slice(&1u16.to_be_bytes());
         let header = parse_rtp(&packet).expect("расширение должно учитываться");
         assert_eq!(header.len, 12 + 4 + 4 + 4, "длина с CSRC и расширением");
+        assert_eq!(header.aad_len, 12 + 4 + 4, "AAD включает заголовок расширения");
+        assert_eq!(header.extension_words, 1, "длина расширения потерялась");
     }
 
     #[test]
@@ -926,14 +1058,125 @@ mod tests {
         let mut nonce = [0u8; 24];
         nonce[..12].copy_from_slice(&header);
         let body = cipher
-            .encrypt(Nonce::from_slice(&nonce), b"opus-frame".as_slice())
+            .encrypt(XsalsaNonce::from_slice(&nonce), b"opus-frame".as_slice())
             .unwrap();
-        let plain = decrypt_rtp(&header, &body, &key).expect("расшифровка должна пройти");
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(&body);
+        let plain = decrypt_rtp(&packet, &key, EncryptionMode::Xsalsa20Poly1305)
+            .expect("расшифровка должна пройти");
         assert_eq!(plain, b"opus-frame", "данные повреждены");
 
-        let mut tampered = body.clone();
-        tampered[0] ^= 0xff;
-        assert!(decrypt_rtp(&header, &tampered, &key).is_none(), "подмена должна ломать тег");
+        let mut tampered = packet.clone();
+        tampered[12] ^= 0xff;
+        assert!(
+            decrypt_rtp(&tampered, &key, EncryptionMode::Xsalsa20Poly1305).is_none(),
+            "подмена должна ломать тег"
+        );
+    }
+
+    /// Builds an AEAD rtpsize packet: header + ciphertext||tag + 4-byte nonce.
+    fn rtpsize_packet(mode: EncryptionMode, header: &[u8], frame: &[u8], counter: [u8; 4]) -> Vec<u8> {
+        let key = [0x24u8; 32];
+        let sealed = match mode {
+            EncryptionMode::AeadXChaCha20Poly1305Rtpsize => {
+                let mut nonce = [0u8; 24];
+                nonce[..4].copy_from_slice(&counter);
+                XChaCha20Poly1305::new_from_slice(&key)
+                    .unwrap()
+                    .encrypt(XNonce::from_slice(&nonce), Payload { msg: frame, aad: header })
+                    .unwrap()
+            }
+            EncryptionMode::AeadAes256GcmRtpsize => {
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(&counter);
+                Aes256Gcm::new_from_slice(&key)
+                    .unwrap()
+                    .encrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: frame, aad: header })
+                    .unwrap()
+            }
+            other => panic!("не AEAD-режим: {other:?}"),
+        };
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(&sealed);
+        packet.extend_from_slice(&counter);
+        packet
+    }
+
+    #[test]
+    fn rtpsize_nonce_comes_from_the_packet_tail() {
+        let mut header = [0u8; 12];
+        header[0] = 0x80;
+        header[8..12].copy_from_slice(&9u32.to_be_bytes());
+        let key = [0x24u8; 32];
+        let packet = rtpsize_packet(
+            EncryptionMode::AeadXChaCha20Poly1305Rtpsize,
+            &header,
+            b"opus-frame",
+            [0, 0, 0, 7],
+        );
+        let plain = decrypt_rtp(&packet, &key, EncryptionMode::AeadXChaCha20Poly1305Rtpsize)
+            .expect("xchacha rtpsize должен расшифровываться");
+        assert_eq!(plain, b"opus-frame", "данные повреждены");
+
+        let mut tampered = packet.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(
+            decrypt_rtp(&tampered, &key, EncryptionMode::AeadXChaCha20Poly1305Rtpsize).is_none(),
+            "чужой счётчик nonce должен ломать тег"
+        );
+    }
+
+    #[test]
+    fn aes_gcm_rtpsize_roundtrip() {
+        let mut header = [0u8; 12];
+        header[0] = 0x80;
+        header[8..12].copy_from_slice(&11u32.to_be_bytes());
+        let key = [0x24u8; 32];
+        let packet = rtpsize_packet(
+            EncryptionMode::AeadAes256GcmRtpsize,
+            &header,
+            b"opus-frame",
+            [0, 0, 1, 0],
+        );
+        let plain = decrypt_rtp(&packet, &key, EncryptionMode::AeadAes256GcmRtpsize)
+            .expect("aes-gcm rtpsize должен расшифровываться");
+        assert_eq!(plain, b"opus-frame", "данные повреждены");
+    }
+
+    #[test]
+    fn mode_choice_prefers_modern_rtpsize() {
+        let modes = json!([
+            "xsalsa20_poly1305",
+            "aead_aes256_gcm_rtpsize",
+            "aead_xchacha20_poly1305_rtpsize"
+        ]);
+        let list = modes.as_array().unwrap().clone();
+        assert_eq!(
+            pick_mode(&list),
+            EncryptionMode::AeadXChaCha20Poly1305Rtpsize,
+            "предпочтителен xchacha rtpsize"
+        );
+
+        let aes = json!(["xsalsa20_poly1305", "aead_aes256_gcm_rtpsize"]);
+        assert_eq!(
+            pick_mode(aes.as_array().unwrap()),
+            EncryptionMode::AeadAes256GcmRtpsize,
+            "без xchacha берём AES-GCM"
+        );
+
+        let old = json!(["xsalsa20_poly1305_lite", "xsalsa20_poly1305"]);
+        assert_eq!(
+            pick_mode(old.as_array().unwrap()),
+            EncryptionMode::Xsalsa20Poly1305,
+            "старый сервер без AEAD"
+        );
+
+        assert_eq!(
+            pick_mode(&[]),
+            EncryptionMode::Xsalsa20Poly1305,
+            "без списка режимов — xsalsa"
+        );
     }
 
     #[test]
