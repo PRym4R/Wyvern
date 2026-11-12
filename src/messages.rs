@@ -57,6 +57,20 @@ pub(crate) enum ToApp {
     /// this the loading spinner never clears. `before` selects which flag to
     /// clear: `None` for the first page, `Some` for loading older messages.
     HistoryFailed { channel_id: String, before: Option<String>, reason: String },
+    /// One page fetched around a message, so the view can land on a search hit
+    /// that is far back in history. `target_id` is the row to anchor on.
+    HistoryAround {
+        channel_id: String,
+        messages: Vec<ChatMessage>,
+        more: bool,
+        target_id: String,
+    },
+    /// Guild-wide search results, newest first. `query` is echoed so a late
+    /// answer for an older query can be dropped.
+    SearchResults { query: String, messages: Vec<ChatMessage> },
+    /// Guild search failed (no permission, network, rate limit). The overlay
+    /// shows the reason instead of a spinner that never ends.
+    SearchFailed { query: String, reason: String },
     Guild(Guild),
     Channel(ChatChannel),
     GuildChannels { guild_id: String, channels: Vec<ChatChannel> },
@@ -114,6 +128,12 @@ pub(crate) enum ToGateway {
     /// History page. `before` is the oldest shown id: `None` for the first
     /// page, otherwise paging upward.
     FetchHistory { channel_id: String, before: Option<String> },
+    /// Fetch 25 messages around one id: a search hit may be far from the
+    /// newest page. The answer replaces that channel's list.
+    JumpToMessage { channel_id: String, message_id: String },
+    /// Search the whole guild's messages. `guild_id` scopes it; the answer is
+    /// `SearchResults` / `SearchFailed` with the query echoed.
+    SearchGuild { guild_id: String, query: String },
     /// Tell Discord the channel was read up to `message_id`. Best-effort: the
     /// local unread badge is cleared regardless of the reply.
     AckMessage { channel_id: String, message_id: String },

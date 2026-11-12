@@ -29,6 +29,10 @@ pub(crate) struct Snippet {
 #[derive(Clone, Debug)]
 pub(crate) struct Hit {
     pub(crate) message_id: String,
+    pub(crate) channel_id: String,
+    /// Where the hit lives, for server-wide results: `# general`. Local hits
+    /// leave it empty because the channel is already on screen.
+    pub(crate) origin: Option<String>,
     pub(crate) author: String,
     pub(crate) snippet: Snippet,
 }
@@ -86,11 +90,30 @@ pub(crate) fn snippet(text: &str, at: usize, len: usize) -> Snippet {
     Snippet { before, hit, after }
 }
 
+/// One message matched against a lowered query: `Some` when the body contains
+/// it. `len` is the query length in chars, used to cut the snippet.
+pub(crate) fn hit_for(msg: &ChatMessage, needle: &str, len: usize) -> Option<Hit> {
+    // An optimistic echo has no id yet and cannot be jumped to.
+    if msg.id.is_empty() {
+        return None;
+    }
+    let at = find_at(&msg.content, needle)?;
+    Some(Hit {
+        message_id: msg.id.clone(),
+        channel_id: msg.channel_id.clone(),
+        origin: None,
+        author: msg
+            .nickname
+            .clone()
+            .unwrap_or_else(|| msg.author_name.clone()),
+        snippet: snippet(&msg.content, at, len),
+    })
+}
+
 /// Messages whose body contains `query`, newest first.
 ///
 /// Newest first because a search usually looks for something recent; the order
-/// also makes Enter jump to the freshest hit. Optimistic echoes are skipped:
-/// they have no id yet, so the view could not jump to them.
+/// also makes Enter jump to the freshest hit.
 pub(crate) fn hits(msgs: &[Arc<ChatMessage>], query: &str) -> Vec<Hit> {
     let query = query.trim();
     if query.is_empty() {
@@ -100,32 +123,36 @@ pub(crate) fn hits(msgs: &[Arc<ChatMessage>], query: &str) -> Vec<Hit> {
     let len = query.chars().count();
     let mut out = Vec::new();
     for msg in msgs.iter().rev() {
-        if msg.id.is_empty() {
-            continue;
-        }
-        let Some(at) = find_at(&msg.content, &needle) else {
-            continue;
-        };
-        out.push(Hit {
-            message_id: msg.id.clone(),
-            author: msg
-                .nickname
-                .clone()
-                .unwrap_or_else(|| msg.author_name.clone()),
-            snippet: snippet(&msg.content, at, len),
-        });
-        if out.len() == MAX_HITS {
-            break;
+        if let Some(hit) = hit_for(msg, &needle, len) {
+            out.push(hit);
+            if out.len() == MAX_HITS {
+                break;
+            }
         }
     }
     out
+}
+
+/// Same rules over messages the caller owns — the REST search hands them back
+/// by value, newest first already.
+pub(crate) fn hits_in(msgs: &[ChatMessage], query: &str) -> Vec<Hit> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let needle = query.to_lowercase();
+    let len = query.chars().count();
+    msgs.iter()
+        .filter_map(|m| hit_for(m, &needle, len))
+        .take(MAX_HITS)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use super::{find_at, hits, snippet, MAX_HITS, SNIPPET_CHARS};
+    use super::{find_at, hits, hits_in, snippet, MAX_HITS, SNIPPET_CHARS};
     use crate::models::ChatMessage;
 
     fn message(i: usize, content: &str) -> Arc<ChatMessage> {
@@ -230,5 +257,26 @@ mod tests {
         msg.nickname = Some("Ник".into());
         let got = hits(&[Arc::new(msg)], "needle");
         assert_eq!(got[0].author, "Ник", "в выдаче показывается ник");
+    }
+
+    #[test]
+    fn server_hits_keep_their_channel() {
+        let mut msg = (*message(0, "needle")).clone();
+        msg.channel_id = "c9".into();
+        let got = hits_in(&[msg], "needle");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].channel_id, "c9", "результат должен помнить свой канал");
+        assert!(got[0].origin.is_none(), "канал подставляет вызывающий");
+    }
+
+    #[test]
+    fn hits_in_keeps_the_order_it_was_given() {
+        let msgs = vec![
+            (*message(2, "needle новый")).clone(),
+            (*message(0, "needle старый")).clone(),
+        ];
+        let got = hits_in(&msgs, "needle");
+        assert_eq!(got[0].message_id, "m0002", "ответ Discord уже отсортирован");
+        assert_eq!(got[1].message_id, "m0000");
     }
 }

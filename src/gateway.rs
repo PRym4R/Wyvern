@@ -25,20 +25,20 @@ mod rest;
 use self::parse::parse_message_value;
 use self::parse::reaction_event_emoji;
 use self::rest::{
-    ack_message, api_client, delete_message, edit_message, fetch_history_page, fetch_relationships,
-    open_dm, send_files, send_message, set_reaction,
+    ack_message, api_client, delete_message, edit_message, fetch_around, fetch_guild_search,
+    fetch_history_page, fetch_relationships, open_dm, send_files, send_message, set_reaction,
 };
 
 // Re-exported so the `crate::gateway::...` paths used by the test modules keep
 // resolving without changes.
 #[cfg(test)]
-pub(crate) use self::parse::{parse_history_page, parse_history_page_lenient};
+pub(crate) use self::parse::{parse_history_page, parse_history_page_lenient, parse_search_results};
 #[cfg(test)]
 pub(crate) use self::rest::{
-    client_with_timeout, delete_message_to, edit_message_to, encode_path_segment, history_url,
-    message_action_reason, message_url, more_history_available, next_before_id,
-    reaction_url, send_failure_reason, send_message_to, send_retry_delay, send_retryable,
-    API_TIMEOUT, HISTORY_PAGE,
+    around_url, client_with_timeout, delete_message_to, edit_message_to, encode_path_segment,
+    history_url, message_action_reason, message_url, more_history_available, next_before_id,
+    reaction_url, search_url, send_failure_reason, send_message_to, send_retry_delay,
+    send_retryable, API_TIMEOUT, AROUND_PAGE, HISTORY_PAGE, SEARCH_PAGE,
 };
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -1158,6 +1158,34 @@ async fn gw_inner(
                             }
                             fetch_history_page(httpc, tkc, ev.clone(), cid.clone(), before).await;
                             release_history(&inflight, &key).await;
+                        });
+                    }
+                    ToGateway::JumpToMessage { channel_id, message_id } => {
+                        // A search hit can sit far from the newest page, so this
+                        // is a separate page request — not a history refresh.
+                        let inflight = session.history_inflight.clone();
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        // Same map as history, tagged so it never dedupes a
+                        // plain history page for the same channel.
+                        let key = (channel_id.clone(), Some(format!("around:{}", message_id)));
+                        tokio::spawn(async move {
+                            if !claim_history(&inflight, key.clone()).await {
+                                return;
+                            }
+                            fetch_around(httpc, tkc, ev.clone(), channel_id, message_id).await;
+                            release_history(&inflight, &key).await;
+                        });
+                    }
+                    ToGateway::SearchGuild { guild_id, query } => {
+                        // Three REST attempts with backoff: keep them off the
+                        // loop so incoming messages keep flowing meanwhile.
+                        let httpc = http.clone();
+                        let tkc = tkn.clone();
+                        let ev = event_tx.clone();
+                        tokio::spawn(async move {
+                            fetch_guild_search(httpc, tkc, ev, guild_id, query).await;
                         });
                     }
                     ToGateway::AckMessage { channel_id, message_id } => {

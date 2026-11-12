@@ -497,7 +497,7 @@ mod close_tests {
 
 #[cfg(test)]
 mod parse_tests {
-    use super::{parse_history_page, parse_history_page_lenient, parse_message_value};
+    use super::{parse_history_page, parse_history_page_lenient, parse_message_value, parse_search_results};
 
     /// A message as Discord sends it, with many fields the client ignores.
     const REAL: &str = r#"[{
@@ -778,6 +778,51 @@ mod parse_tests {
         assert!(msgs.is_empty());
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("History parse error"), "{}", warns[0]);
+    }
+
+    /// Guild search wraps every hit in an array of context messages; the hit
+    /// itself is first, and the surrounding ones must not show up as results.
+    #[test]
+    fn search_results_take_the_first_message_of_each_group() {
+        let body = r#"{
+            "total_results": 2,
+            "messages": [
+                [
+                    {"id": "10", "channel_id": "c1", "content": "нашли",
+                     "author": {"id": "u1", "username": "vasya"}},
+                    {"id": "11", "channel_id": "c1", "content": "контекст ниже",
+                     "author": {"id": "u2", "username": "petya"}}
+                ],
+                [
+                    {"id": "20", "channel_id": "c2", "content": "второй",
+                     "author": {"id": "u1", "username": "vasya"}}
+                ]
+            ]
+        }"#;
+        let mut warns = Vec::new();
+        let msgs = parse_search_results(body, &mut |m| warns.push(m));
+        assert_eq!(msgs.len(), 2, "по одному хиту на группу");
+        assert_eq!(msgs[0].id, "10");
+        assert_eq!(msgs[0].channel_id, "c1", "канал берётся из самого сообщения");
+        assert_eq!(msgs[1].id, "20");
+        assert_eq!(msgs[1].channel_id, "c2");
+        assert!(warns.is_empty(), "нормальный ответ не должен ругаться");
+    }
+
+    /// A broken answer ends up as an empty list plus one log line, never a panic.
+    #[test]
+    fn search_results_survive_garbage() {
+        let mut warns = Vec::new();
+        let msgs = parse_search_results("не json", &mut |m| warns.push(m));
+        assert!(msgs.is_empty());
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("Search parse error"), "{}", warns[0]);
+
+        // Well-formed JSON without the field is also just "nothing found".
+        let mut warns = Vec::new();
+        let msgs = parse_search_results(r#"{"total_results":0}"#, &mut |m| warns.push(m));
+        assert!(msgs.is_empty());
+        assert_eq!(warns.len(), 1);
     }
 }
 

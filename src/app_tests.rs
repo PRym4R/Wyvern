@@ -632,6 +632,161 @@ fn history_pagination_uses_oldest_id() {
     assert!(second.ends_with(&format!("/channels/42/messages?limit={}&before=101", crate::gateway::HISTORY_PAGE)), "{}", second);
 }
 
+/// A guild text channel for the search tests.
+fn test_channel(id: &str, name: &str) -> ChatChannel {
+    ChatChannel {
+        id: id.into(),
+        name: name.into(),
+        guild_id: Some("g1".into()),
+        channel_type: 0,
+        topic: None,
+        position: 0,
+        parent_id: None,
+        last_message_id: None,
+    }
+}
+
+/// Guild search URLs keep the user's text intact and carry the page size;
+/// `around` asks for the page holding one specific message.
+#[test]
+fn search_and_around_urls_carry_their_parameters() {
+    let url = crate::gateway::search_url("g1", "привет мир #1");
+    let parsed = reqwest::Url::parse(&url).expect("URL поиска должен разбираться");
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert!(url.contains("/guilds/g1/messages/search?"), "{}", url);
+    assert!(
+        pairs.contains(&("content".to_string(), "привет мир #1".to_string())),
+        "запрос должен дойти без искажений: {}",
+        url
+    );
+    assert!(
+        pairs.contains(&("limit".to_string(), crate::gateway::SEARCH_PAGE.to_string())),
+        "{}",
+        url
+    );
+    assert!(!url.contains(' '), "пробел в URL должен быть закодирован: {}", url);
+
+    let around = crate::gateway::around_url("c1", "m9");
+    assert!(
+        around.ends_with(&format!(
+            "/channels/c1/messages?limit={}&around=m9",
+            crate::gateway::AROUND_PAGE
+        )),
+        "{}",
+        around
+    );
+}
+
+/// A server answer for text the user has already typed over must be dropped,
+/// and hits from the open channel are left out (they are in the local list).
+#[test]
+fn server_search_keeps_only_the_current_query() {
+    let ctx = egui::Context::default();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.channels.push(test_channel("c1", "general"));
+    app.channels.push(test_channel("c2", "random"));
+    app.selected_channel = Some(0);
+    app.open_channel("c1");
+
+    app.search_query = "нашли".into();
+    app.search_guild();
+    assert!(app.search_remote_loading, "пока ответа нет, идёт поиск");
+
+    // Late answer for older text: ignored, and the real search is still waited on.
+    tx.send(ToApp::SearchResults {
+        query: "старое".into(),
+        messages: vec![test_msg("m1", "c2", "старое нашли")],
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert!(app.search_remote.is_empty(), "устаревший ответ не должен показываться");
+    assert!(app.search_remote_loading, "настоящий поиск всё ещё ждём");
+
+    // Current answer: the open channel is filtered out, the other one is kept.
+    tx.send(ToApp::SearchResults {
+        query: "нашли".into(),
+        messages: vec![
+            test_msg("m1", "c2", "тут нашли"),
+            test_msg("m2", "c1", "и тут нашли"),
+        ],
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert_eq!(app.search_remote.len(), 1, "свой канал не дублируем в серверной выдаче");
+    assert_eq!(app.search_remote[0].message_id, "m1");
+    assert_eq!(
+        app.search_remote[0].origin.as_deref(),
+        Some("#random"),
+        "у находки должен быть виден канал"
+    );
+    assert!(!app.search_remote_loading, "ответ снимает спиннер");
+
+    // A refusal shows its reason instead of spinning forever.
+    app.search_query = "другое".into();
+    app.search_guild();
+    tx.send(ToApp::SearchFailed {
+        query: "другое".into(),
+        reason: "no permission (403)".into(),
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert!(!app.search_remote_loading);
+    assert_eq!(app.search_remote_error.as_deref(), Some("no permission (403)"));
+}
+
+/// Clicking a hit from another channel opens it, keeps the tint, and the
+/// `?around=` page anchors the view on that message instead of the bottom.
+#[test]
+fn remote_search_hit_opens_its_channel_and_anchors() {
+    let ctx = egui::Context::default();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(rx);
+    app.channels.push(test_channel("c1", "general"));
+    app.channels.push(test_channel("c2", "random"));
+    app.selected_channel = Some(0);
+    app.open_channel("c1");
+    app.search_query = "нашли".into();
+    app.search_guild();
+    tx.send(ToApp::SearchResults {
+        query: "нашли".into(),
+        messages: vec![test_msg("m7", "c2", "тут нашли")],
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert_eq!(app.search_remote.len(), 1);
+
+    app.open_search();
+    app.open_search_result(0);
+    assert!(!app.search_open, "переход закрывает окно поиска");
+    assert_eq!(app.current_channel_id(), Some("c2"), "открывается канал находки");
+    assert_eq!(
+        app.search_highlight.as_deref(),
+        Some("m7"),
+        "найденная строка остаётся подсвеченной"
+    );
+
+    // The around page arrives: it replaces the list and anchors on the hit.
+    tx.send(ToApp::HistoryAround {
+        channel_id: "c2".into(),
+        messages: vec![test_msg("m6", "c2", "до"), test_msg("m7", "c2", "тут нашли")],
+        more: false,
+        target_id: "m7".into(),
+    })
+    .unwrap();
+    app.poll(&ctx);
+    assert_eq!(
+        app.chat_anchor.as_ref().map(|(id, _)| id.as_str()),
+        Some("m7"),
+        "вид цепляется за найденное сообщение"
+    );
+    assert!(!app.scroll_to_bottom, "прокрутка вниз не должна перебивать якорь");
+    assert_eq!(app.search_highlight.as_deref(), Some("m7"), "подсветка переживает загрузку");
+}
+
 /// Scroll-up history: the page prepends instead of replacing, and the boundary message isn't duplicated.
 #[test]
 fn older_page_is_prepended_without_duplicates() {

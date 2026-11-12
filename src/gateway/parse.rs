@@ -372,3 +372,32 @@ pub(crate) fn parse_message_value(m: &Value, fallback_channel: &str) -> Option<C
         is_own: false,
     })
 }
+
+/// Guild search response: `{"messages": [[hit, context...], ...]}`.
+///
+/// Each group starts with the hit; the rest is surrounding context and is not
+/// shown. Lenient like the history parse: one broken message must not lose the
+/// whole answer.
+pub(crate) fn parse_search_results(body: &str, warn: &mut dyn FnMut(String)) -> Vec<ChatMessage> {
+    let value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            warn(format!("Search parse error: {}", e));
+            return Vec::new();
+        }
+    };
+    let Some(groups) = value.get("messages").and_then(|m| m.as_array()) else {
+        warn("Search response has no messages".to_string());
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .filter_map(|group| {
+            let hit = group
+                .as_array()
+                .and_then(|g| g.first())
+                .unwrap_or(group);
+            parse_message_value(hit, "")
+        })
+        .collect()
+}

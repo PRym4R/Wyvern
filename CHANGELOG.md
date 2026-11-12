@@ -3,6 +3,24 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.11.1 - 2026-11-12
+
+- **Guild-wide search**: the Ctrl+F window grew a "Search this server" button
+  that asks Discord (`GET /guilds/{id}/messages/search`) for matches the client
+  never loaded. The local list stays instant; the server answer appears below it
+  under "Elsewhere in the server", each row prefixed with its channel.
+- An answer for text the user has already typed over is dropped instead of
+  replacing fresher hits, and hits from the open channel are left to the local
+  list so nothing shows twice.
+- Clicking a server hit opens its channel and lands on the message through
+  `?around=`. The window closes but the tint stays on the row until the next
+  search, so the jump is visible after a channel switch.
+- The window shows a spinner while the request is in flight, the reason when it
+  is refused (`no permission (403)`, network, rate limit), and "Nothing else on
+  the server" when the answer is empty.
+- History, guild search and `?around=` now share one paging helper: three
+  attempts, `retry-after` on 429, an immediate stop on 403.
+
 ## 0.11.0 - 2026-11-12
 
 - **Ctrl+F search** over the messages already loaded in the open channel. A

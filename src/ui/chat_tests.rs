@@ -730,6 +730,41 @@ mod geometry_tests {
         );
     }
 
+    /// The server-wide button exists only in guild channels and sends one
+    /// `SearchGuild` for the typed text.
+    #[test]
+    fn server_search_button_asks_for_the_guild() {
+        let mut h = app_with_messages(2);
+        let ctx = egui::Context::default();
+        frames(&mut h.app, &ctx, 2);
+
+        // A DM has no guild to search; the button is not drawn at all.
+        h.app.open_search();
+        h.app.search_query = "номер".into();
+        frame(&mut h.app, &ctx);
+        assert!(
+            h.app.probe_search_button.is_none(),
+            "в личном канале серверный поиск не предлагаем"
+        );
+
+        h.app.channels[0].guild_id = Some("g1".into());
+        frame(&mut h.app, &ctx);
+        let btn = h
+            .app
+            .probe_search_button
+            .expect("в канале гильдии кнопка должна быть");
+        widget_click_at(&mut h.app, &ctx, btn.center());
+
+        match h.cmds.try_recv() {
+            Ok(ToGateway::SearchGuild { guild_id, query }) => {
+                assert_eq!(guild_id, "g1", "поиск идёт по гильдии канала");
+                assert_eq!(query, "номер", "в запрос уходит то, что набрано");
+            }
+            other => panic!("ожидалась команда поиска по серверу, а пришло {:?}", other),
+        }
+        assert!(h.app.search_remote_loading, "до ответа виден спиннер");
+    }
+
     /// Escape closes the overlay and takes the tint with it, but leaves the
     /// reply target alone: the composer must not treat the modal's Esc as its own.
     #[test]

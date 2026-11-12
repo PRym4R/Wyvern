@@ -370,6 +370,15 @@ pub(crate) struct App {
     pub(crate) search_key: (String, String, usize),
     /// Message the view jumped to; its row stays tinted while the search is open.
     pub(crate) search_highlight: Option<String>,
+    /// Guild search results: hits from channels other than the open one.
+    pub(crate) search_remote: Vec<crate::search::Hit>,
+    /// A guild search request is in flight; the overlay shows a spinner.
+    pub(crate) search_remote_loading: bool,
+    /// Why the last guild search failed, shown in place of the list.
+    pub(crate) search_remote_error: Option<String>,
+    /// Query the remote results belong to, so a late answer for older text is
+    /// dropped instead of replacing fresher hits.
+    pub(crate) search_remote_query: String,
     /// Gateway generation (see `Generation`); switching accounts bumps it so the old thread goes quiet.
     pub(crate) gateway_generation: Arc<Generation>,
     pub(crate) avatar_cache: BoundedCache<TextureHandle>,
@@ -465,6 +474,9 @@ pub(crate) struct App {
     /// Test probe: search result rows drawn last frame.
     #[cfg(test)]
     pub(crate) probe_search_rows: Vec<(egui::Rect, String)>,
+    /// Test probe: the "Search this server" button, when it was drawn.
+    #[cfg(test)]
+    pub(crate) probe_search_button: Option<egui::Rect>,
     pub(crate) autoselected: bool,
     pub(crate) accounts_unlocked: bool,
     pub(crate) theme_index: u8,
@@ -547,6 +559,10 @@ impl App {
             search_focus: false,
             search_key: (String::new(), String::new(), 0),
             search_highlight: None,
+    search_remote: Vec::new(),
+    search_remote_loading: false,
+    search_remote_error: None,
+    search_remote_query: String::new(),
             gateway_generation: Arc::new(Generation::default()),
             accounts_unlocked: false,
             avatar_cache: BoundedCache::with_budget(MAX_AVATAR_CACHE, AVATAR_CACHE_BUDGET),
@@ -603,6 +619,8 @@ impl App {
             probe_emoji_cells: Vec::new(),
             #[cfg(test)]
             probe_search_rows: Vec::new(),
+            #[cfg(test)]
+            probe_search_button: None,
             autoselected: false,
             theme_index: 0,
             last_render_key: String::new(),
@@ -1000,6 +1018,15 @@ impl App {
                 ToApp::HistoryFailed { channel_id, before, reason } => {
                     self.history_failed(&channel_id, before.as_deref(), &reason);
                 }
+                ToApp::HistoryAround { channel_id, messages, more, target_id } => {
+                    self.apply_history_around(&channel_id, messages, more, &target_id);
+                }
+                ToApp::SearchResults { query, messages } => {
+                    self.apply_search_results(&query, messages);
+                }
+                ToApp::SearchFailed { query, reason } => {
+                    self.search_failed(&query, &reason);
+                }
                 ToApp::Guild(g) => {
                     if !self.guilds.iter().any(|x| x.id == g.id) {
                         self.guilds.push(g);
@@ -1295,6 +1322,12 @@ impl App {
     }
     /// Open a channel; other channels' messages can be dropped since history reloads anyway.
     pub(crate) fn open_channel(&mut self, channel_id: &str) {
+        self.open_channel_with(channel_id, None);
+    }
+    /// Opens a channel landing on `around` (a search hit) instead of the newest
+    /// page. Discord may have thousands of messages after the hit, so the first
+    /// page alone would not show it.
+    pub(crate) fn open_channel_with(&mut self, channel_id: &str, around: Option<&str>) {
         // Save the draft of the channel the composer was showing, then show this
         // channel's own draft (empty if none). Reopening the same channel keeps
         // what is already typed.
@@ -1335,7 +1368,22 @@ impl App {
                 channel_id: channel_id.to_string(),
             });
         }
-        self.send_cmd(ToGateway::FetchHistory { channel_id: channel_id.to_string(), before: None });
+        match around {
+            Some(target) => {
+                // Keep the tint so the row stands out once the page arrives.
+                self.search_highlight = Some(target.to_string());
+                self.send_cmd(ToGateway::JumpToMessage {
+                    channel_id: channel_id.to_string(),
+                    message_id: target.to_string(),
+                });
+            }
+            None => {
+                self.send_cmd(ToGateway::FetchHistory {
+                    channel_id: channel_id.to_string(),
+                    before: None,
+                });
+            }
+        }
         self.write_settings();
     }
     /// Stores a history page: the first page replaces, `prepend` inserts at the front.
@@ -1432,6 +1480,40 @@ impl App {
         self.push_debug(format!("Stored {} msgs ({} new) for channel {}{}", stored, added, cid_short,
             if for_current { "" } else { " (не текущий канал)" }));
     }
+    /// A page fetched around a message: stored like a first page, but the view
+    /// lands on the target hit instead of the bottom of the channel.
+    fn apply_history_around(
+        &mut self,
+        channel_id: &str,
+        messages: Vec<ChatMessage>,
+        more: bool,
+        target_id: &str,
+    ) {
+        self.apply_history(channel_id, messages, more, false);
+        if self.current_channel_id() != Some(channel_id) {
+            return;
+        }
+        let found = self
+            .messages
+            .get(channel_id)
+            .map(|v| v.iter().any(|m| m.id == target_id))
+            .unwrap_or(false);
+        if !found {
+            // Deleted since the search, or outside the returned window: the
+            // chat stays at the bottom rather than anchoring on nothing.
+            let cid_short: String = channel_id.chars().take(14).collect();
+            self.push_debug(format!(
+                "Around page for {} has no target {}",
+                cid_short, target_id
+            ));
+            return;
+        }
+        // An explicit move: holding the bottom would override the anchor.
+        self.scroll_to_bottom = false;
+        self.chat_at_bottom = false;
+        self.chat_anchor = Some((target_id.to_string(), 0.0));
+        self.search_highlight = Some(target_id.to_string());
+    }
     /// History page failed: clear the matching wait and show the reason.
     /// `before` picks which wait: `None` for the first page, `Some` for older history.
     fn history_failed(&mut self, channel_id: &str, before: Option<&str>, reason: &str) {
@@ -1452,6 +1534,50 @@ impl App {
         // Truncate by chars; a byte slice would panic on non-ASCII ids.
         let cid_short: String = channel_id.chars().take(14).collect();
         self.push_debug(format!("History failed for {} ({}): {}", cid_short, before.is_some(), reason));
+    }
+    /// Label for a channel id, shown on cross-channel search hits.
+    pub(crate) fn channel_label(&self, channel_id: &str) -> String {
+        let Some(ch) = self.channels.iter().find(|c| c.id == channel_id) else {
+            return "unknown channel".to_string();
+        };
+        match ch.channel_type {
+            1 | 3 => ch.name.clone(),
+            2 => format!("🔊 {}", ch.name),
+            _ => format!("#{}", ch.name),
+        }
+    }
+    /// Guild search answer: keep the hits that are not in the open channel (its
+    /// own messages are already in the local list) and tag each with its channel.
+    fn apply_search_results(&mut self, query: &str, messages: Vec<ChatMessage>) {
+        if query != self.search_remote_query {
+            // The user typed past this query while the request was in flight.
+            self.push_debug(format!(
+                "Dropping stale search results for {:?}",
+                query
+            ));
+            return;
+        }
+        self.search_remote_loading = false;
+        self.search_remote_error = None;
+        let current = self.current_channel_id().unwrap_or_default().to_string();
+        let mut hits: Vec<crate::search::Hit> = crate::search::hits_in(&messages, query)
+            .into_iter()
+            .filter(|h| h.channel_id != current)
+            .collect();
+        for hit in &mut hits {
+            hit.origin = Some(self.channel_label(&hit.channel_id));
+        }
+        self.push_debug(format!("Server search: {} hits for {:?}", hits.len(), query));
+        self.search_remote = hits;
+    }
+    /// Guild search failed (403, network): show the reason instead of a spinner.
+    fn search_failed(&mut self, query: &str, reason: &str) {
+        if query != self.search_remote_query {
+            return;
+        }
+        self.search_remote_loading = false;
+        self.search_remote.clear();
+        self.search_remote_error = Some(reason.to_string());
     }
     /// Requests older history from the oldest stored message (list is oldest-first).
     /// Skips local echoes, whose ids aren't real, and won't refetch while a page is in flight.

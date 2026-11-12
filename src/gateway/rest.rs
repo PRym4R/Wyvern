@@ -9,13 +9,20 @@ use crate::messages::ToApp;
 use crate::models::{ChatChannel, ChatMessage, UserProfile};
 use crate::util::super_props;
 
-use super::parse::parse_history_page_lenient;
+use super::parse::{parse_history_page_lenient, parse_search_results};
 use super::ratelimit;
 use super::{EventTx, API_BASE};
 
 /// Messages per history page. Discord allows up to 100, but loading three
 /// pages at once shows an empty channel; 50, then more on scroll.
 pub(crate) const HISTORY_PAGE: usize = 50;
+
+/// Results per guild search answer: enough for a list, cheap on the limit.
+pub(crate) const SEARCH_PAGE: usize = 25;
+
+/// Messages fetched around a jumped-to hit, the same order of magnitude as a
+/// history page so the context above and below is readable.
+pub(crate) const AROUND_PAGE: usize = 25;
 
 /// Browser fingerprint Discord expects on every REST call. A user token
 /// without it gets flagged, so the headers live in one place: a new endpoint
@@ -502,6 +509,66 @@ fn parse_relationships(body: &str) -> Result<Vec<UserProfile>, String> {
 
 /// Load one history page and send it to the UI. `before` is the oldest id on
 /// screen; `None` loads the first page.
+/// GET one page with the retry policy every REST page shares: three attempts,
+/// honoring 429's `retry-after` and giving up on any other refusal. `label`
+/// shows up only in the debug log and in the final reason.
+async fn get_page(
+    httpc: &reqwest::Client,
+    tkn: &str,
+    event_tx: &EventTx,
+    url: &str,
+    route: &str,
+    label: &str,
+) -> Result<String, String> {
+    let mut reason = String::new();
+    let mut attempt = 0u32;
+    while attempt < 3 {
+        attempt += 1;
+        ratelimit::wait(route).await;
+        let req = browser_headers(httpc.get(url), tkn);
+        match req.send().await {
+            Ok(resp) => {
+                let limit = ratelimit::note(route, resp.headers());
+                let status = resp.status();
+                let _ = event_tx.send(ToApp::Debug(format!("{label} response: {status}")));
+                if status == 429 {
+                    let wait = limit.map(|l| l.wait).unwrap_or(Duration::from_secs(2));
+                    let _ = event_tx.send(ToApp::Debug(format!(
+                        "{label} 429, retrying in {wait:?}"
+                    )));
+                    reason = "Discord asks you to wait (rate limit)".to_string();
+                    time::sleep(wait).await;
+                    continue;
+                }
+                if !status.is_success() {
+                    let _ = event_tx.send(ToApp::Debug(format!("{label} error {status}")));
+                    return Err(if status == 403 {
+                        "no permission (403)".to_string()
+                    } else {
+                        format!("server responded {status}")
+                    });
+                }
+                match resp.text().await {
+                    Ok(body) => return Ok(body),
+                    Err(e) => {
+                        let _ = event_tx.send(ToApp::Debug(format!("{label} body error: {e}")));
+                        reason = "couldn't read the response".to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = event_tx.send(ToApp::Debug(format!("{label} request error: {e}")));
+                reason = "no connection to Discord".to_string();
+                time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if reason.is_empty() {
+        reason = format!("{label} didn't arrive");
+    }
+    Err(reason)
+}
+
 pub(super) async fn fetch_history_page(
     httpc: reqwest::Client,
     tkn: String,
@@ -510,76 +577,20 @@ pub(super) async fn fetch_history_page(
     before: Option<String>,
 ) {
     let url = history_url(&channel_id, before.as_deref());
-
-    let mut page: Vec<ChatMessage> = Vec::new();
-    let mut got_page = false;
-    let mut failed = false;
-    let mut reason = String::new();
     let route = format!("history:{}", channel_id);
-    let mut attempt = 0u32;
-    while !got_page && attempt < 3 && !failed {
-        attempt += 1;
-        ratelimit::wait(&route).await;
-        let req = browser_headers(httpc.get(&url), &tkn);
-        match req.send().await {
-            Ok(resp) => {
-                let limit = ratelimit::note(&route, resp.headers());
-                let status = resp.status();
-                let _ = event_tx.send(ToApp::Debug(format!("History response: {}", status)));
-                if status == 429 {
-                    let wait = limit
-                        .map(|l| l.wait)
-                        .unwrap_or(Duration::from_secs(2));
-                    let _ = event_tx.send(ToApp::Debug(format!(
-                        "History 429, retrying in {:?}",
-                        wait
-                    )));
-                    reason = "Discord asks you to wait (rate limit)".to_string();
-                    time::sleep(wait).await;
-                    continue;
-                }
-                if !status.is_success() {
-                    let _ = event_tx.send(ToApp::Debug(format!("History error {}", status)));
-                    // 403 = no channel access; retrying won't help, and the
-                    // user sees an empty channel.
-                    reason = if status == 403 {
-                        "no permission for the channel".to_string()
-                    } else {
-                        format!("server responded {}", status)
-                    };
-                    failed = true;
-                    break;
-                }
-                match resp.text().await {
-                    Ok(body) => {
-                        let mut warn = |m: String| {
-                            let _ = event_tx.send(ToApp::Debug(m));
-                        };
-                        page = parse_history_page_lenient(&body, &channel_id, &mut warn);
-                        got_page = true;
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(ToApp::Debug(format!("History body error: {}", e)));
-                        reason = "couldn't read the response".to_string();
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = event_tx.send(ToApp::Debug(format!("History request error: {}", e)));
-                reason = "no connection to Discord".to_string();
-                time::sleep(Duration::from_secs(2)).await;
-            }
+    let body = match get_page(&httpc, &tkn, &event_tx, &url, &route, "History").await {
+        Ok(body) => body,
+        Err(reason) => {
+            // Nothing arrived: report failure so the loading spinner clears
+            // instead of waiting forever.
+            let _ = event_tx.send(ToApp::HistoryFailed { channel_id, before, reason });
+            return;
         }
-    }
-    if failed || !got_page {
-        // Nothing arrived: report failure so the loading spinner clears
-        // instead of waiting forever.
-        if reason.is_empty() {
-            reason = "history didn't arrive".to_string();
-        }
-        let _ = event_tx.send(ToApp::HistoryFailed { channel_id, before, reason });
-        return;
-    }
+    };
+    let mut warn = |m: String| {
+        let _ = event_tx.send(ToApp::Debug(m));
+    };
+    let page = parse_history_page_lenient(&body, &channel_id, &mut warn);
 
     let got = page.len();
     let more = more_history_available(got) && next_before_id(&page, before.as_deref()).is_some();
@@ -623,6 +634,98 @@ pub(crate) fn next_before_id(page: &[ChatMessage], current: Option<&str>) -> Opt
 /// exhausted.
 pub(crate) fn more_history_available(got: usize) -> bool {
     got >= HISTORY_PAGE
+}
+
+/// Guild search URL. Built through `reqwest::Url` so `content` is percent-
+/// encoded: it is user text and may hold spaces, `#` or Cyrillic.
+pub(crate) fn search_url(guild_id: &str, query: &str) -> String {
+    let base = format!("{}/guilds/{}/messages/search", API_BASE, guild_id);
+    match reqwest::Url::parse(&base) {
+        Ok(mut url) => {
+            url.query_pairs_mut()
+                .append_pair("content", query)
+                .append_pair("limit", &SEARCH_PAGE.to_string());
+            url.into()
+        }
+        // The base is a constant, so this is unreachable in practice; a plain
+        // URL is still better than a panic.
+        Err(_) => base,
+    }
+}
+
+/// Page around one message, used to land on a search hit that is far from the
+/// newest page.
+pub(crate) fn around_url(channel_id: &str, message_id: &str) -> String {
+    format!(
+        "{}/channels/{}/messages?limit={}&around={}",
+        API_BASE, channel_id, AROUND_PAGE, message_id
+    )
+}
+
+/// Guild-wide search. The query is echoed back with the answer so the app can
+/// drop results for text the user has already typed over.
+pub(super) async fn fetch_guild_search(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    guild_id: String,
+    query: String,
+) {
+    let url = search_url(&guild_id, &query);
+    let route = format!("search:{}", guild_id);
+    let body = match get_page(&httpc, &tkn, &event_tx, &url, &route, "Search").await {
+        Ok(body) => body,
+        Err(reason) => {
+            let _ = event_tx.send(ToApp::SearchFailed { query, reason });
+            return;
+        }
+    };
+    let mut warn = |m: String| {
+        let _ = event_tx.send(ToApp::Debug(m));
+    };
+    let messages = parse_search_results(&body, &mut warn);
+    let _ = event_tx.send(ToApp::Debug(format!(
+        "Search: {} results for {:?}",
+        messages.len(),
+        query
+    )));
+    let _ = event_tx.send(ToApp::SearchResults { query, messages });
+}
+
+/// Messages around one id, so a hit can be shown with its context.
+pub(super) async fn fetch_around(
+    httpc: reqwest::Client,
+    tkn: String,
+    event_tx: EventTx,
+    channel_id: String,
+    message_id: String,
+) {
+    let url = around_url(&channel_id, &message_id);
+    let route = format!("history:{}", channel_id);
+    let body = match get_page(&httpc, &tkn, &event_tx, &url, &route, "Around").await {
+        Ok(body) => body,
+        Err(reason) => {
+            // Reuse the history failure: the spinner clears and the reason
+            // shows up in the chat either way.
+            let _ = event_tx.send(ToApp::HistoryFailed { channel_id, before: None, reason });
+            return;
+        }
+    };
+    let mut warn = |m: String| {
+        let _ = event_tx.send(ToApp::Debug(m));
+    };
+    let page = parse_history_page_lenient(&body, &channel_id, &mut warn);
+    let got = page.len();
+    let _ = event_tx.send(ToApp::Debug(format!(
+        "Around page: {} messages (target {})",
+        got, message_id
+    )));
+    let _ = event_tx.send(ToApp::HistoryAround {
+        channel_id,
+        messages: page,
+        more: got >= AROUND_PAGE,
+        target_id: message_id,
+    });
 }
 
 pub(super) async fn send_files(
