@@ -1,6 +1,6 @@
 [package]
 name = "wyvern"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 
 [dependencies]
@@ -31,6 +31,8 @@ dirs = "6"
 xsalsa20poly1305 = "0.9"
 opus-decoder = "0.1"
 cpal = "0.18"
+# Voice E2EE: Discord rejects clients without DAVE (MLS) since March 2026.
+davey = "0.1.4"
 
 # Release binaries are ~2x smaller without the symbol table, and the release
 # asset is stripped; keep a plain `cargo build --release` matching it instead

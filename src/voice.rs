@@ -7,8 +7,10 @@
 //! -> RTP audio, with op 3 heartbeats throughout.
 
 use std::collections::HashMap;
+use std::num::NonZeroU16;
 use std::time::Duration;
 
+use davey::{DaveSession, MediaType, ProposalsOperationType, DAVE_PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
 use opus_decoder::OpusDecoder;
 use serde_json::{json, Value};
@@ -34,10 +36,266 @@ pub(crate) struct VoiceConnect {
     pub(crate) session_id: String,
     /// Guild id: `server_id` in the identify payload.
     pub(crate) guild_id: String,
+    /// Channel id: the DAVE MLS group id and v9 `channel_id`.
+    pub(crate) channel_id: String,
     pub(crate) user_id: String,
 }
 
 type VoiceSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// One event from the voice gateway. DAVE opcodes arrive as binary frames on
+/// gateway v8+, with a 2-byte sequence number in front of the opcode.
+enum VoiceEvent {
+    Json(Value),
+    Binary {
+        /// v8 sequence number; heartbeats must acknowledge the last one.
+        seq: u16,
+        op: u8,
+        payload: Vec<u8>,
+    },
+}
+
+/// A DAVE message to send: JSON for transition bookkeeping, binary for MLS.
+enum DaveSend {
+    Json(Value),
+    Binary { op: u8, payload: Vec<u8> },
+}
+
+/// DAVE receive state. The MLS group itself lives in `davey`; this wrapper
+/// only tracks the handshake pieces that arrive as separate gateway messages.
+struct DaveState {
+    session: DaveSession,
+    user_id: u64,
+    channel_id: u64,
+    version: NonZeroU16,
+    /// External sender package from op 25; no group can be created without it.
+    external: Option<Vec<u8>>,
+    /// Set when a fresh key package must go out (connect, epoch reset, recovery).
+    key_package_pending: bool,
+    /// False while the gateway selected protocol version 0; an upgrade can
+    /// still arrive later as op 24 with epoch 1.
+    active: bool,
+}
+
+impl DaveState {
+    fn new(version: u16, user_id: u64, channel_id: u64, active: bool) -> Option<Self> {
+        let version = NonZeroU16::new(version)?;
+        let session = DaveSession::new(version, user_id, channel_id, None)
+            .map_err(|e| eprintln!("[dave] session: {:?}", e))
+            .ok()?;
+        Some(Self {
+            session,
+            user_id,
+            channel_id,
+            version,
+            external: None,
+            key_package_pending: false,
+            active,
+        })
+    }
+
+    /// Applies op 25. Returns false once we are in a group: the external
+    /// sender is fixed for the lifetime of that group.
+    fn apply_external(&mut self, data: &[u8]) -> bool {
+        if self.session.is_ready() {
+            return false;
+        }
+        self.external = Some(data.to_vec());
+        match self.session.set_external_sender(data) {
+            Ok(()) => {
+                self.key_package_pending = true;
+                true
+            }
+            Err(e) => {
+                eprintln!("[dave] external sender: {:?}", e);
+                false
+            }
+        }
+    }
+
+    /// Enables E2EE after a transport-only start (op 24 upgrade).
+    fn enable(&mut self) {
+        self.active = true;
+        if self.external.is_some() && !self.session.is_ready() {
+            self.key_package_pending = true;
+        }
+    }
+
+    /// Creates the next one-time key package, if one is due.
+    fn take_key_package(&mut self) -> Option<Vec<u8>> {
+        if !self.active || !self.key_package_pending {
+            return None;
+        }
+        match self.session.create_key_package() {
+            Ok(bytes) => {
+                self.key_package_pending = false;
+                Some(bytes)
+            }
+            Err(e) => {
+                eprintln!("[dave] key package: {:?}", e);
+                None
+            }
+        }
+    }
+
+    fn key_package(&mut self) -> Option<DaveSend> {
+        self.take_key_package()
+            .map(|payload| DaveSend::Binary { op: 26, payload })
+    }
+
+    /// Drops the MLS group and starts a new pending one (op 24 epoch = 1).
+    fn reset(&mut self) {
+        match DaveSession::new(self.version, self.user_id, self.channel_id, None) {
+            Ok(session) => self.session = session,
+            Err(e) => {
+                eprintln!("[dave] reset: {:?}", e);
+                return;
+            }
+        }
+        if let Some(external) = self.external.clone() {
+            if let Err(e) = self.session.set_external_sender(&external) {
+                eprintln!("[dave] external sender after reset: {:?}", e);
+                return;
+            }
+            self.key_package_pending = true;
+        }
+    }
+
+    /// Handles one server-sent DAVE binary opcode (payload after the opcode).
+    fn on_binary(&mut self, op: u8, payload: &[u8]) -> Vec<DaveSend> {
+        match op {
+            25 => {
+                if self.apply_external(payload) {
+                    self.key_package().into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            27 => {
+                if payload.is_empty() {
+                    return Vec::new();
+                }
+                let operation = match payload[0] {
+                    0 => ProposalsOperationType::APPEND,
+                    1 => ProposalsOperationType::REVOKE,
+                    other => {
+                        eprintln!("[dave] unknown proposal operation {}", other);
+                        return Vec::new();
+                    }
+                };
+                match self
+                    .session
+                    .process_proposals(operation, &payload[1..], None)
+                {
+                    Ok(Some(commit)) => {
+                        // Commit and welcome are serialized back to back; the
+                        // welcome is absent unless the commit added members.
+                        let mut body = commit.commit;
+                        body.extend_from_slice(&commit.welcome.unwrap_or_default());
+                        vec![DaveSend::Binary { op: 28, payload: body }]
+                    }
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        eprintln!("[dave] proposals: {:?}", e);
+                        Vec::new()
+                    }
+                }
+            }
+            29 => {
+                let Some(transition_id) = payload
+                    .get(..2)
+                    .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                else {
+                    return Vec::new();
+                };
+                match self.session.process_commit(&payload[2..]) {
+                    Ok(()) => vec![ready(transition_id)],
+                    Err(e) => {
+                        eprintln!("[dave] commit: {:?}", e);
+                        self.invalid(transition_id)
+                    }
+                }
+            }
+            30 => {
+                let Some(transition_id) = payload
+                    .get(..2)
+                    .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                else {
+                    return Vec::new();
+                };
+                match self.session.process_welcome(&payload[2..]) {
+                    Ok(()) => vec![ready(transition_id)],
+                    Err(e) => {
+                        eprintln!("[dave] welcome: {:?}", e);
+                        self.invalid(transition_id)
+                    }
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Handles the JSON DAVE opcodes that can arrive during a session.
+    fn on_json(&mut self, op: i64, d: &Value) -> Vec<DaveSend> {
+        match op {
+            21 => {
+                // Prepare transition. Version 0 is a downgrade to
+                // transport-only encryption: plaintext frames must flow again
+                // as soon as it is announced. A non-zero version is an
+                // upgrade, and passthrough must stay off.
+                if d["protocol_version"].as_u64().unwrap_or(0) == 0 {
+                    self.session.set_passthrough_mode(true, None);
+                } else {
+                    self.enable();
+                }
+                let transition_id = d["transition_id"].as_u64().unwrap_or(0) as u16;
+                // Transition 0 is the sole-member reset and executes at once.
+                if transition_id == 0 {
+                    Vec::new()
+                } else {
+                    vec![ready(transition_id)]
+                }
+            }
+            24 => {
+                if d["epoch"].as_u64() == Some(1) {
+                    // A new group is being created: this is also the signal
+                    // that an upgrade from transport-only encryption started.
+                    if d["protocol_version"].as_u64().unwrap_or(0) > 0 {
+                        self.enable();
+                    }
+                    self.reset();
+                    self.key_package().into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Reports an unprocessable commit/welcome and rebuilds our key package.
+    fn invalid(&mut self, transition_id: u16) -> Vec<DaveSend> {
+        let mut out = vec![DaveSend::Json(json!({
+            "op": 31,
+            "d": { "transition_id": transition_id }
+        }))];
+        self.reset();
+        out.extend(self.key_package());
+        out
+    }
+
+    /// Decrypts one DAVE frame from `user_id`. `None` means the frame must be
+    /// dropped: a protocol frame we cannot authenticate is noise to Opus.
+    fn decrypt(&mut self, user_id: u64, packet: &[u8]) -> Option<Vec<u8>> {
+        self.session
+            .decrypt(user_id, MediaType::AUDIO, packet)
+            .ok()
+    }
+}
+
+fn ready(transition_id: u16) -> DaveSend {
+    DaveSend::Json(json!({ "op": 23, "d": { "transition_id": transition_id } }))
+}
 
 /// Runs one voice session until `stop` is set or the socket fails. Errors are
 /// reported to the app, which shows them in the voice bar.
@@ -60,7 +318,21 @@ async fn run_inner(
         .await
         .map_err(|e| format!("voice gateway: {}", e))?;
 
-    let hello = read_json(&mut ws).await?;
+    // Op 25 (external sender) may arrive before the session description, so
+    // keep it for the DAVE session that op 4 creates.
+    let mut external_sender: Option<Vec<u8>> = None;
+    // Last numbered binary message, echoed in every heartbeat (v8).
+    let mut last_seq: Option<u16> = None;
+    let hello = loop {
+        match read_event(&mut ws).await? {
+            VoiceEvent::Json(value) => break value,
+            VoiceEvent::Binary { seq, op: 25, payload } => {
+                last_seq = Some(seq);
+                external_sender = Some(payload);
+            }
+            VoiceEvent::Binary { seq, .. } => last_seq = Some(seq),
+        }
+    };
     if hello["op"].as_i64() != Some(8) {
         return Err(format!("voice hello: unexpected op {}", hello["op"]));
     }
@@ -72,10 +344,14 @@ async fn run_inner(
         "op": 0,
         "d": {
             "server_id": conn.guild_id,
+            "channel_id": conn.channel_id,
             "user_id": conn.user_id,
             "session_id": conn.session_id,
             "token": conn.token,
             "video": false,
+            // Without this Discord closes the socket with 4017 on every
+            // non-stage voice channel since March 2026.
+            "max_dave_protocol_version": DAVE_PROTOCOL_VERSION,
         }
     });
     send_json(&mut ws, &identify).await?;
@@ -88,15 +364,20 @@ async fn run_inner(
     // select protocol) op 4 with the secret key.
     while ready.is_none() {
         tokio::select! {
-            _ = heartbeat.tick() => send_heartbeat(&mut ws, &mut nonce).await?,
+            _ = heartbeat.tick() => send_heartbeat(&mut ws, &mut nonce, last_seq).await?,
             _ = stop.changed() => return Ok(()),
-            msg = read_json(&mut ws) => {
-                let v = msg?;
-                match v["op"].as_i64() {
-                    Some(2) => ready = Some(v["d"].clone()),
-                    Some(4) => return Err("voice: session description before ready".into()),
-                    Some(6) => {}
-                    _ => {}
+            event = read_event(&mut ws) => {
+                match event? {
+                    VoiceEvent::Binary { seq, op: 25, payload } => {
+                        last_seq = Some(seq);
+                        external_sender = Some(payload);
+                    }
+                    VoiceEvent::Binary { seq, .. } => last_seq = Some(seq),
+                    VoiceEvent::Json(v) => match v["op"].as_i64() {
+                        Some(2) => ready = Some(v["d"].clone()),
+                        Some(4) => return Err("voice: session description before ready".into()),
+                        _ => {}
+                    },
                 }
             }
         }
@@ -152,33 +433,62 @@ async fn run_inner(
     });
     send_json(&mut ws, &select).await?;
 
+    let dave_version;
     let key = loop {
         tokio::select! {
-            _ = heartbeat.tick() => send_heartbeat(&mut ws, &mut nonce).await?,
+            _ = heartbeat.tick() => send_heartbeat(&mut ws, &mut nonce, last_seq).await?,
             _ = stop.changed() => return Ok(()),
-            msg = read_json(&mut ws) => {
-                let v = msg?;
-                match v["op"].as_i64() {
-                    Some(4) => {
-                        let mode = v["d"]["mode"].as_str().unwrap_or("");
-                        if !mode.is_empty() && mode != "xsalsa20_poly1305" {
-                            return Err(format!("voice: unsupported encryption mode {}", mode));
-                        }
-                        let bytes: Vec<u8> = v["d"]["secret_key"]
-                            .as_array()
-                            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
-                            .unwrap_or_default();
-                        if bytes.len() != 32 {
-                            return Err(format!("voice: secret key has {} bytes, need 32", bytes.len()));
-                        }
-                        break bytes;
+            event = read_event(&mut ws) => {
+                match event? {
+                    VoiceEvent::Binary { seq, op: 25, payload } => {
+                        last_seq = Some(seq);
+                        external_sender = Some(payload);
                     }
-                    Some(5) | Some(6) => {}
-                    _ => {}
+                    VoiceEvent::Binary { seq, .. } => last_seq = Some(seq),
+                    VoiceEvent::Json(v) => match v["op"].as_i64() {
+                        Some(4) => {
+                            let mode = v["d"]["mode"].as_str().unwrap_or("");
+                            if !mode.is_empty() && mode != "xsalsa20_poly1305" {
+                                return Err(format!("voice: unsupported encryption mode {}", mode));
+                            }
+                            let bytes: Vec<u8> = v["d"]["secret_key"]
+                                .as_array()
+                                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+                                .unwrap_or_default();
+                            if bytes.len() != 32 {
+                                return Err(format!("voice: secret key has {} bytes, need 32", bytes.len()));
+                            }
+                            dave_version = v["d"]["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
+                            break bytes;
+                        }
+                        Some(5) | Some(6) => {}
+                        _ => {}
+                    },
                 }
             }
         }
     };
+
+    // The session is prepared even for protocol version 0: the gateway can
+    // upgrade a transport-only call later through op 24 with epoch 1.
+    let mut dave = match (
+        conn.user_id.parse::<u64>(),
+        conn.channel_id.parse::<u64>(),
+    ) {
+        (Ok(user_id), Ok(channel_id)) => {
+            DaveState::new(DAVE_PROTOCOL_VERSION, user_id, channel_id, dave_version > 0)
+        }
+        _ => None,
+    };
+    if let Some(state) = dave.as_mut() {
+        if let Some(external) = external_sender.as_deref() {
+            if state.apply_external(external) {
+                if let Some(message) = state.key_package() {
+                    send_dave(&mut ws, message).await?;
+                }
+            }
+        }
+    }
 
     // Audio output is opened only once the session is negotiated: a failed
     // handshake must not leave a stream running.
@@ -188,7 +498,19 @@ async fn run_inner(
         reason: None,
     });
 
-    receive_loop(&mut ws, &socket, &key, &player, event_tx, &mut stop, &mut heartbeat, &mut nonce).await
+    receive_loop(
+        &mut ws,
+        &socket,
+        &key,
+        &player,
+        &mut dave,
+        event_tx,
+        &mut stop,
+        &mut heartbeat,
+        &mut nonce,
+        &mut last_seq,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,10 +519,12 @@ async fn receive_loop(
     socket: &UdpSocket,
     key: &[u8],
     player: &Player,
+    dave: &mut Option<DaveState>,
     event_tx: &EventTx,
     stop: &mut watch::Receiver<bool>,
     heartbeat: &mut time::Interval,
     nonce: &mut u64,
+    last_seq: &mut Option<u16>,
 ) -> Result<(), String> {
     let mut decoders: HashMap<u32, OpusDecoder> = HashMap::new();
     let mut speakers: HashMap<u32, String> = HashMap::new();
@@ -211,7 +535,7 @@ async fn receive_loop(
 
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => send_heartbeat(ws, nonce).await?,
+            _ = heartbeat.tick() => send_heartbeat(ws, nonce, *last_seq).await?,
             _ = stop.changed() => return Ok(()),
             received = socket.recv(&mut udp_buf) => {
                 let n = received.map_err(|e| format!("voice udp: {}", e))?;
@@ -223,6 +547,22 @@ async fn receive_loop(
                 if plain.is_empty() {
                     continue;
                 }
+                // E2EE frames are decrypted per sender before Opus. A plain
+                // frame has no magic marker and passes through unchanged, as
+                // during the transport-only and downgrade phases.
+                let plain = if is_dave_frame(&plain) {
+                    let Some(user_id) = speakers
+                        .get(&header.ssrc)
+                        .and_then(|id| id.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(state) = dave.as_mut() else { continue };
+                    let Some(frame) = state.decrypt(user_id, &plain) else { continue };
+                    frame
+                } else {
+                    plain
+                };
                 let decoder = match decoders.entry(header.ssrc) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => match OpusDecoder::new(48_000, 2) {
@@ -247,28 +587,48 @@ async fn receive_loop(
                     player.push_at(start, &pcm[..used]);
                 }
             }
-            msg = read_json(ws) => {
-                let v = msg?;
-                match v["op"].as_i64() {
-                    Some(5) => {
-                        // Speaking state: the only place that maps an RTP
-                        // ssrc to a user id. Some events omit the id, so the
-                        // earlier mapping is the fallback.
-                        let d = &v["d"];
-                        let speaking = d["speaking"].as_u64().unwrap_or(0) != 0;
-                        let ssrc = d["ssrc"].as_u64().map(|s| s as u32);
-                        let mut user_id = d["user_id"].as_str().unwrap_or("").to_string();
-                        if let (Some(ssrc), false) = (ssrc, user_id.is_empty()) {
-                            speakers.insert(ssrc, user_id.clone());
-                        } else if let Some(ssrc) = ssrc {
-                            user_id = speakers.get(&ssrc).cloned().unwrap_or_default();
-                        }
-                        if !user_id.is_empty() {
-                            let _ = event_tx.send(ToApp::VoiceSpeaking { user_id, speaking });
+            event = read_event(ws) => {
+                match event? {
+                    VoiceEvent::Json(v) => {
+                        let op = v["op"].as_i64().unwrap_or(0);
+                        match op {
+                            5 => {
+                                // Speaking state: the only place that maps an
+                                // RTP ssrc to a user id. Some events omit the
+                                // id, so the earlier mapping is the fallback.
+                                let d = &v["d"];
+                                let speaking = d["speaking"].as_u64().unwrap_or(0) != 0;
+                                let ssrc = d["ssrc"].as_u64().map(|s| s as u32);
+                                let mut user_id = d["user_id"].as_str().unwrap_or("").to_string();
+                                if let (Some(ssrc), false) = (ssrc, user_id.is_empty()) {
+                                    speakers.insert(ssrc, user_id.clone());
+                                } else if let Some(ssrc) = ssrc {
+                                    user_id = speakers.get(&ssrc).cloned().unwrap_or_default();
+                                }
+                                if !user_id.is_empty() {
+                                    let _ = event_tx.send(ToApp::VoiceSpeaking { user_id, speaking });
+                                }
+                            }
+                            21 | 24 => {
+                                if let Some(state) = dave.as_mut() {
+                                    let outgoing = state.on_json(op, &v["d"]);
+                                    for message in outgoing {
+                                        send_dave(ws, message).await?;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Some(6) => {}
-                    _ => {}
+                    VoiceEvent::Binary { seq, op, payload } => {
+                        *last_seq = Some(seq);
+                        if let Some(state) = dave.as_mut() {
+                            let outgoing = state.on_binary(op, &payload);
+                            for message in outgoing {
+                                send_dave(ws, message).await?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -304,8 +664,23 @@ pub(crate) fn anchor_frame(
     base + timestamp.wrapping_sub(base_ts) as i32 as i64
 }
 
-async fn send_heartbeat(ws: &mut VoiceSocket, nonce: &mut u64) -> Result<(), String> {    *nonce = nonce.wrapping_add(1);
-    send_json(ws, &json!({ "op": 3, "d": *nonce })).await
+/// Heartbeat body. v8 changed `d` from a bare `t` to an object and made
+/// `seq_ack` mandatory once a numbered binary message has arrived: it is what
+/// stops DAVE commits and welcomes from being retransmitted.
+pub(crate) fn heartbeat_payload(t: u64, seq_ack: Option<u16>) -> Value {
+    match seq_ack {
+        Some(seq) => json!({ "op": 3, "d": { "t": t, "seq_ack": seq } }),
+        None => json!({ "op": 3, "d": { "t": t } }),
+    }
+}
+
+async fn send_heartbeat(
+    ws: &mut VoiceSocket,
+    nonce: &mut u64,
+    seq_ack: Option<u16>,
+) -> Result<(), String> {
+    *nonce = nonce.wrapping_add(1);
+    send_json(ws, &heartbeat_payload(*nonce, seq_ack)).await
 }
 
 async fn send_json(ws: &mut VoiceSocket, payload: &Value) -> Result<(), String> {
@@ -314,21 +689,80 @@ async fn send_json(ws: &mut VoiceSocket, payload: &Value) -> Result<(), String> 
         .map_err(|e| format!("voice gateway: {}", e))
 }
 
-async fn read_json(ws: &mut VoiceSocket) -> Result<Value, String> {
+async fn send_dave(ws: &mut VoiceSocket, message: DaveSend) -> Result<(), String> {
+    match message {
+        DaveSend::Json(payload) => send_json(ws, &payload).await,
+        DaveSend::Binary { op, payload } => {
+            // Client-to-server binary messages carry no sequence number.
+            let mut frame = Vec::with_capacity(payload.len() + 1);
+            frame.push(op);
+            frame.extend_from_slice(&payload);
+            ws.send(WsMessage::Binary(frame.into()))
+                .await
+                .map_err(|e| format!("voice gateway: {}", e))
+        }
+    }
+}
+
+async fn read_event(ws: &mut VoiceSocket) -> Result<VoiceEvent, String> {
     loop {
         match ws.next().await {
             Some(Ok(WsMessage::Text(text))) => {
-                return serde_json::from_str(&text).map_err(|e| format!("voice gateway: {}", e));
+                let value =
+                    serde_json::from_str(&text).map_err(|e| format!("voice gateway: {}", e))?;
+                return Ok(VoiceEvent::Json(value));
+            }
+            Some(Ok(WsMessage::Binary(frame))) => {
+                let (seq, op, payload) =
+                    parse_binary(&frame).ok_or("voice gateway: short binary frame")?;
+                return Ok(VoiceEvent::Binary { seq, op, payload });
             }
             Some(Ok(WsMessage::Close(frame))) => {
                 let code = frame.map(|f| u16::from(f.code)).unwrap_or(0);
-                return Err(format!("voice gateway closed: {}", code));
+                return Err(close_reason(code));
             }
             Some(Ok(_)) => continue,
             Some(Err(e)) => return Err(format!("voice gateway: {}", e)),
             None => return Err("voice gateway closed".to_string()),
         }
     }
+}
+
+/// Splits a server binary frame. Gateway v8 prefixes every binary message
+/// with a 2-byte big-endian sequence number; the opcode follows it.
+pub(crate) fn parse_binary(frame: &[u8]) -> Option<(u16, u8, Vec<u8>)> {
+    if frame.len() < 3 {
+        return None;
+    }
+    let seq = u16::from_be_bytes([frame[0], frame[1]]);
+    Some((seq, frame[2], frame[3..].to_vec()))
+}
+
+/// DAVE protocol frames end with the 0xFAFA magic marker. Anything else is a
+/// plain encoded frame and passes through unchanged during transitions.
+pub(crate) fn is_dave_frame(packet: &[u8]) -> bool {
+    packet.len() >= 12 && packet[packet.len() - 2..] == [0xfa, 0xfa]
+}
+
+/// Turns a voice close code into the sentence shown in the voice bar.
+pub(crate) fn close_reason(code: u16) -> String {
+    let text = match code {
+        4001 => "unknown voice opcode",
+        4002 => "malformed voice identify",
+        4004 => "invalid voice token",
+        4006 => "voice session expired",
+        4011 => "voice server not found",
+        4012 => "unknown voice protocol",
+        4014 => "disconnected by Discord",
+        4015 => "voice server crashed",
+        4016 => "unsupported voice encryption mode",
+        4017 => "Discord requires DAVE end-to-end encryption",
+        4020 => "malformed voice request",
+        4021 => "voice rate limit",
+        4022 => "call ended",
+        _ => return format!("voice gateway closed: {}", code),
+    };
+    format!("voice: {} ({})", text, code)
 }
 
 /// Voice gateway URL from `VOICE_SERVER_UPDATE.endpoint`, which carries no
@@ -500,6 +934,51 @@ mod tests {
         let mut tampered = body.clone();
         tampered[0] ^= 0xff;
         assert!(decrypt_rtp(&header, &tampered, &key).is_none(), "подмена должна ломать тег");
+    }
+
+    #[test]
+    fn binary_frames_drop_the_sequence_number() {
+        let frame = [0x00, 0x2a, 25, 1, 2, 3];
+        let (seq, op, payload) = parse_binary(&frame).expect("бинарный кадр должен разобраться");
+        assert_eq!(seq, 42, "номер последовательности потерялся");
+        assert_eq!(op, 25, "опкод должен идти после номера последовательности");
+        assert_eq!(payload, vec![1, 2, 3], "полезная часть потерялась");
+        assert!(parse_binary(&[0, 1]).is_none(), "короткий кадр не должен приниматься");
+    }
+
+    #[test]
+    fn heartbeat_acknowledges_the_last_binary_frame() {
+        let acked = heartbeat_payload(7, Some(42));
+        assert_eq!(acked["op"], 3, "это должен быть heartbeat");
+        assert_eq!(acked["d"]["t"], 7, "счётчик не попал в t");
+        assert_eq!(acked["d"]["seq_ack"], 42, "номер последнего кадра не подтверждён");
+
+        let plain = heartbeat_payload(8, None);
+        assert_eq!(plain["d"]["t"], 8, "t нужен всегда");
+        assert!(
+            plain["d"].get("seq_ack").is_none(),
+            "без бинарных кадров seq_ack не отправляется"
+        );
+    }
+
+    #[test]
+    fn dave_frame_detection_uses_the_magic_marker() {
+        let mut packet = vec![7u8; 12];
+        packet[10] = 0xfa;
+        packet[11] = 0xfa;
+        assert!(is_dave_frame(&packet), "маркер 0xFAFA должен распознаваться");
+
+        packet[11] = 0;
+        assert!(!is_dave_frame(&packet), "без маркера это обычный Opus-кадр");
+        assert!(!is_dave_frame(&[0xfa, 0xfa]), "слишком короткий кадр не считается DAVE");
+    }
+
+    #[test]
+    fn voice_close_codes_are_explained() {
+        let reason = close_reason(4017);
+        assert!(reason.contains("DAVE"), "4017 должен объяснять требование DAVE: {reason}");
+        assert!(reason.contains("4017"), "код должен оставаться в тексте: {reason}");
+        assert_eq!(close_reason(4999), "voice gateway closed: 4999", "неизвестный код как есть");
     }
 
     #[test]

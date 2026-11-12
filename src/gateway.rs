@@ -320,7 +320,7 @@ fn start_voice(session: &SessionState, link: &mut VoiceLink, event_tx: &EventTx)
     if link.stop.is_some() {
         return;
     }
-    let Some((guild_id, _)) = session.voice_target.clone() else { return };
+    let Some((guild_id, channel_id)) = session.voice_target.clone() else { return };
     let Some(session_id) = link.session_id.clone() else { return };
     let Some((endpoint, token)) = link.server.clone() else { return };
     let Some(user_id) = session.user_id.clone() else { return };
@@ -348,6 +348,7 @@ fn start_voice(session: &SessionState, link: &mut VoiceLink, event_tx: &EventTx)
         token,
         session_id,
         guild_id,
+        channel_id,
         user_id,
     };
     let event_tx = event_tx.clone();

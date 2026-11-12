@@ -3,6 +3,31 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.12.2 - 2026-11-12
+
+- **Voice E2EE (DAVE)**: Discord closed every voice connection with 4017
+  because clients without end-to-end encryption have been rejected since March
+  2026. The voice identify now advertises DAVE protocol 1, and the client joins
+  the call's MLS group through `davey` (OpenMLS, pure Rust, no libopus/libdave).
+- Receive path: handles the voice gateway's binary DAVE opcodes (external
+  sender 25, proposals 27, commit 29, welcome 30), sends key packages (26),
+  commits (28), transition-ready (23) and invalid-commit reports (31), and
+  creates the MLS group with the voice channel id as its group id.
+- Heartbeats follow Gateway v8: `d` is an object with `t` and `seq_ack`, so the
+  server knows which numbered binary messages arrived and stops retransmitting
+  DAVE commits and welcomes.
+- Incoming protocol frames (0xFAFA marker) are decrypted per sender before Opus
+  decoding. Plain frames pass through untouched, including during the
+  transport-only and downgrade phases; a protocol frame that cannot be
+  authenticated is dropped instead of being decoded as noise.
+- Self-listen, microphone capture and audio settings are the next release: this
+  one only restores hearing other people.
+- Voice close codes are now explained instead of shown as bare numbers, e.g.
+  "voice: Discord requires DAVE end-to-end encryption (4017)", "call ended
+  (4022)" or "invalid voice token (4004)".
+- Tests: 4 new (binary framing, DAVE marker detection, close-code text,
+  heartbeat acknowledgement), 400 total.
+
 ## 0.12.1 - 2026-11-12
 
 - **Voice receive**: joining a voice channel now actually plays the people in

@@ -21,12 +21,12 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   only for running from the repo root; it is not committed).
   Never run that `cp` on Windows — it would put an `.exe` where the Linux
   binary is expected.
-- Tests: `cargo test` - 396 tests (393 + 3 ignored); keep that count in sync
+- Tests: `cargo test` - 400 tests (397 + 3 ignored); keep that count in sync
   with README.
 - 0 warnings required.
 - Windows has no MSVC linker (`link.exe`), so `cargo` alone fails. Use the gnu
   toolchain that is installed there (one `#[cfg(unix)]` test is skipped, so
-  Windows reports 395 in total):
+  Windows reports 399 in total):
 
   ```
   $env:Path = 'C:\Users\hackerman\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;' + $env:Path
@@ -66,7 +66,7 @@ tar czf /home/hackerman/backups/wyvern-src-<YYYYMMDD>-<shortsha>.tar.gz \
   data/cache paths; `src/fsutil.rs` atomic private writes; `src/net.rs`
   process-wide proxy; `src/settings.rs` +
   `src/deleted.rs` state files; `src/messages.rs` gateway→app events;
-  `src/voice.rs` voice gateway, RTP and Opus receive; `src/audio.rs` mixer and
+  `src/voice.rs` voice gateway, DAVE/MLS, RTP and Opus receive; `src/audio.rs` mixer and
   cpal output; `src/notify.rs` desktop notifications per OS;
   `src/crypto.rs` vault; `src/ss.rs` + `src/vless.rs` + `src/proxybridge.rs`
   proxies; `src/util.rs` helpers; `src/file_picker.rs` upload dialog;

@@ -28,7 +28,9 @@ On Linux voice output goes through ALSA, so the build needs its headers
 (`sudo apt install libasound2-dev`, or the equivalent for your distribution).
 Without an output device the client still connects to voice but says why audio
 is unavailable in the voice strip. Voice audio is raw UDP and therefore does not
-work through the configured HTTPS/SOCKS proxy yet.
+work through the configured HTTPS/SOCKS proxy yet. Discord requires DAVE
+end-to-end encryption for voice since March 2026, so the client joins the call's
+MLS group and decrypts incoming audio (receiving only for now).
 
 The token goes into the login field. If "Remember this account" is ticked, the
 token is encrypted with a password in `accounts.json` (AES-256-GCM, key derived
@@ -53,7 +55,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 | `src/main.rs` | window startup, assets, panics to the log |
 | `src/app.rs` | application state, channels, messages, login |
 | `src/gateway.rs` | WebSocket gateway, connect/reconnect loop, voice state and session wiring |
-| `src/voice.rs` | voice gateway, UDP discovery, RTP decryption, Opus decode |
+| `src/voice.rs` | voice gateway, DAVE/MLS, UDP discovery, RTP decryption, Opus decode |
 | `src/audio.rs` | mixing ring buffer and cpal output stream |
 | `src/gateway/rest.rs` | REST calls: messages, history pages, guild search, DMs, friends, reactions |
 | `src/gateway/parse.rs` | lenient JSON → models, shared by live and history |
@@ -78,7 +80,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 396 tests (393 + 3 ignored)
+cargo test --release                                        # 400 tests (397 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke
