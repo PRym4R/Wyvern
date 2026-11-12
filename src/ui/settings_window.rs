@@ -4,7 +4,25 @@ use crate::app::{ConfirmAction, ConfirmDialog};
 use crate::settings::Settings;
 
 /// Tabs shown down the left of the settings window.
-const SECTIONS: [&str; 6] = ["Theme", "Interface", "Media", "History", "Network", "Advanced"];
+const SECTIONS: [&str; 7] = [
+    "Theme",
+    "Interface",
+    "Media",
+    "Sound",
+    "History",
+    "Network",
+    "Advanced",
+];
+
+/// Slider formatter: volumes are stored as a multiplier, shown as percent.
+fn percent(value: f64, _: std::ops::RangeInclusive<usize>) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+/// Label for a device slot: the saved name or the default.
+fn device_label(name: &Option<String>) -> String {
+    name.clone().unwrap_or_else(|| "System default".to_string())
+}
 
 /// Proxy kinds for the Network tab dropdown.
 const PROXY_KINDS: [&str; 5] = ["HTTP", "SOCKS5", "SOCKS5 (remote DNS)", "Shadowsocks", "VLESS"];
@@ -206,6 +224,140 @@ impl crate::app::App {
                 }
             }
             3 => {
+                ui.heading("Sound");
+                ui.label(
+                    RichText::new(
+                        "Levels apply immediately. Device changes apply the next time you \
+                         join a voice channel; self-listen keeps the microphone open only \
+                         while you are connected to voice and the box is ticked.",
+                    )
+                    .size(11.0)
+                    .color(self.theme.text_secondary),
+                );
+                ui.add_space(6.0);
+                // Opening the list is a system call: fill it once, then let
+                // the button below pick up a device that was plugged in since.
+                if !self.audio_devices_loaded {
+                    self.refresh_audio_devices();
+                }
+                let mut refresh = false;
+                egui::Grid::new("sound_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Output device");
+                        ui.horizontal(|ui| {
+                            let mut picked = false;
+                            let mut choice = self.settings.output_device.clone();
+                            egui::ComboBox::from_id_salt("audio_output")
+                                .width(240.0)
+                                .selected_text(device_label(&choice))
+                                .show_ui(ui, |ui| {
+                                    picked |= ui
+                                        .selectable_value(&mut choice, None, "System default")
+                                        .clicked();
+                                    for name in &self.audio_outputs {
+                                        picked |= ui
+                                            .selectable_value(&mut choice, Some(name.clone()), name)
+                                            .clicked();
+                                    }
+                                });
+                            if picked {
+                                self.settings.output_device = choice;
+                                self.write_settings();
+                            }
+                            // A device can disappear while the window is open;
+                            // the player falls back to the default by itself.
+                            if ui.button("Refresh").clicked() {
+                                refresh = true;
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Input device");
+                        ui.horizontal(|ui| {
+                            let mut picked = false;
+                            let mut choice = self.settings.input_device.clone();
+                            egui::ComboBox::from_id_salt("audio_input")
+                                .width(240.0)
+                                .selected_text(device_label(&choice))
+                                .show_ui(ui, |ui| {
+                                    picked |= ui
+                                        .selectable_value(&mut choice, None, "System default")
+                                        .clicked();
+                                    for name in &self.audio_inputs {
+                                        picked |= ui
+                                            .selectable_value(&mut choice, Some(name.clone()), name)
+                                            .clicked();
+                                    }
+                                });
+                            if picked {
+                                self.settings.input_device = choice;
+                                self.write_settings();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Other people");
+                        let mut others = self.settings.voice_volume.unwrap_or(1.0);
+                        let resp = ui.add(
+                            egui::Slider::new(&mut others, 0.0..=crate::audio::MAX_GAIN)
+                                .custom_formatter(percent),
+                        );
+                        if resp.changed() {
+                            self.settings.voice_volume = Some(others);
+                            crate::audio::apply_settings(&self.settings);
+                        }
+                        if resp.drag_stopped() || resp.lost_focus() {
+                            self.write_settings();
+                        }
+                        ui.end_row();
+
+                        ui.label("Your voice");
+                        let mut own = self.settings.mic_volume.unwrap_or(1.0);
+                        let resp = ui.add(
+                            egui::Slider::new(&mut own, 0.0..=crate::audio::MAX_GAIN)
+                                .custom_formatter(percent),
+                        );
+                        if resp.changed() {
+                            self.settings.mic_volume = Some(own);
+                            crate::audio::apply_settings(&self.settings);
+                        }
+                        if resp.drag_stopped() || resp.lost_focus() {
+                            self.write_settings();
+                        }
+                        ui.end_row();
+
+                        ui.label("Notifications");
+                        ui.horizontal(|ui| {
+                            let mut notes = self.settings.notify_volume.unwrap_or(1.0);
+                            let resp = ui.add(
+                                egui::Slider::new(&mut notes, 0.0..=1.0)
+                                    .custom_formatter(percent),
+                            );
+                            if resp.changed() {
+                                self.settings.notify_volume = Some(notes);
+                                crate::audio::apply_settings(&self.settings);
+                            }
+                            if resp.drag_stopped() || resp.lost_focus() {
+                                self.write_settings();
+                            }
+                            if ui.button("Test").clicked() {
+                                crate::audio::chime();
+                            }
+                        });
+                        ui.end_row();
+                    });
+                if refresh {
+                    self.refresh_audio_devices();
+                }
+                let mut listen = self.settings.listen_self;
+                if flag(ui, "Listen to myself (while connected to voice)", &mut listen) {
+                    self.settings.listen_self = listen;
+                    self.write_settings();
+                }
+            }
+            4 => {
                 ui.heading("History");
                 let mut keep = self.settings.keep_deleted;
                 if flag(ui, "Keep deleted messages (shown red)", &mut keep) {
@@ -228,7 +380,7 @@ impl crate::app::App {
                     .color(self.theme.text_secondary),
                 );
             }
-            4 => {
+            5 => {
                 ui.heading("Network");
                 ui.label("Route Discord traffic through a proxy. Leave the host empty for a direct connection.");
                 ui.add_space(6.0);

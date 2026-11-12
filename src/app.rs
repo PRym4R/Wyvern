@@ -416,6 +416,11 @@ pub(crate) struct App {
     pub(crate) settings_open: bool,
     /// Selected section in the settings window's left tab list.
     pub(crate) settings_section: usize,
+    /// Audio devices cpal reported, cached for the Sound tab: enumeration is a
+    /// system call, so it happens when the tab opens or on "Refresh".
+    pub(crate) audio_outputs: Vec<String>,
+    pub(crate) audio_inputs: Vec<String>,
+    pub(crate) audio_devices_loaded: bool,
     /// Proxy form fields, kept in sync with `Settings::proxy`.
     pub(crate) proxy_kind: usize,
     pub(crate) proxy_host: String,
@@ -606,6 +611,9 @@ impl App {
             draft_channel: None,
             settings_open: false,
             settings_section: 0,
+            audio_outputs: Vec::new(),
+            audio_inputs: Vec::new(),
+            audio_devices_loaded: false,
             proxy_kind: 0,
             proxy_host: String::new(),
             proxy_port: String::new(),
@@ -672,6 +680,7 @@ impl App {
         self.load_proxy_form();
         let effective = crate::proxybridge::resolve_proxy(self.settings.proxy.as_deref().unwrap_or(""));
         crate::net::set_proxy(&effective);
+        crate::audio::apply_settings(&self.settings);
         self
     }
     /// Attach the on-disk deleted-message store; `None` keeps it read-only.
@@ -756,6 +765,9 @@ impl App {
     }
     /// Write settings to disk if a path is configured; a failure is logged, not fatal.
     pub(crate) fn write_settings(&mut self) {
+        // Sound settings are read by the audio threads, so apply them even
+        // when persistence is disabled (tests, read-only runs).
+        crate::audio::apply_settings(&self.settings);
         let Some(path) = self.settings_path.clone() else {
             return;
         };
@@ -763,6 +775,12 @@ impl App {
         if let Err(e) = self.settings.save_to(&path) {
             self.push_debug(format!("settings: не удалось сохранить: {e}"));
         }
+    }
+    /// Re-enumerates audio devices for the Sound tab.
+    pub(crate) fn refresh_audio_devices(&mut self) {
+        self.audio_outputs = crate::audio::output_devices();
+        self.audio_inputs = crate::audio::input_devices();
+        self.audio_devices_loaded = true;
     }
     /// Write the deleted-message store if a path is configured; failures are logged.
     pub(crate) fn write_deleted(&mut self) {
@@ -821,7 +839,7 @@ impl App {
         }
         crate::notify::desktop(&msg.author_name, text);
         if self.settings.notify_sound {
-            crate::notify::sound();
+            crate::audio::chime();
         }
     }
     /// Queues a corner notice, dropping the oldest if the stack is full.

@@ -584,7 +584,7 @@ async fn receive_loop(
                         header.ssrc,
                         header.timestamp,
                     );
-                    player.push_at(start, &pcm[..used]);
+                    player.push_at_gain(start, &pcm[..used], crate::audio::others_volume());
                 }
             }
             event = read_event(ws) => {

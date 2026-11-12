@@ -1,33 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::{applescript_escape, command_for, powershell_quote, sound_command_for};
-
-    /// The sound uses a player each desktop actually has, and the arguments
-    /// name a real sound rather than starting an empty player.
-    #[test]
-    fn each_platform_has_a_notification_sound() {
-        let (program, args) = sound_command_for("linux");
-        assert_eq!(program, "canberra-gtk-play", "на Linux нужен canberra");
-        assert_eq!(args, vec!["-i", "message-new-instant"]);
-
-        let (program, args) = sound_command_for("windows");
-        assert_eq!(program, "powershell", "на Windows нужен PowerShell");
-        let script = args.last().unwrap();
-        assert!(
-            script.contains("SystemSounds") && script.contains("Play()"),
-            "скрипт должен проигрывать системный звук: {script}"
-        );
-
-        let (program, args) = sound_command_for("macos");
-        assert_eq!(program, "afplay", "на macOS нужен afplay");
-        assert!(
-            args[0].ends_with(".aiff"),
-            "нужен путь к системному звуку, а не пустой аргумент"
-        );
-
-        // An unknown OS falls back to the freedesktop tool.
-        assert_eq!(sound_command_for("freebsd").0, "canberra-gtk-play");
-    }
+    use super::{applescript_escape, command_for, powershell_quote};
 
     /// Each platform gets its own tool; the OS comes from std, so every branch
     /// is reachable in the tests.

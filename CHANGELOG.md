@@ -3,6 +3,32 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.13.0 - 2026-11-12
+
+- **Sound settings**: a new Sound tab controls other people's voices, your own
+  voice in self-listen and the notification chime, each with its own level.
+  Levels apply to a call that is already running, because the audio threads read
+  them from shared state instead of copying them at start-up.
+- **Device selection**: output and input devices are picked by name from what
+  cpal reports, with "System default" for the automatic choice and a Refresh
+  button for a device plugged in after the window opened. A saved device that
+  has since disappeared falls back to the default instead of failing the call.
+- **Self-listen**: the microphone is opened only while the setting is on and you
+  are in a voice channel, resampled to 48 kHz stereo and mixed into the same
+  output stream as everyone else, with its own volume. The OS microphone
+  indicator therefore stays dark unless you ask for it.
+- **Notification chime**: the platform's system sound is replaced by a short
+  synthesized two-tone chime (250 ms, both edges faded). It is the same `cpal`
+  path as voice, so its volume is actually controllable and it honours the
+  chosen output device.
+- Per-source gain is applied before the mix, so a loud speaker cannot drown out
+  the others and self-listen does not scale incoming audio either. Volumes stop
+  at ×2 (+6 dB) for voices and 100 % for notifications.
+- Device changes and the self-listen box take effect the next time you join a
+  voice channel; volume sliders take effect immediately.
+- Tests: 5 new (gain and clamping, capture resampling, chime shape, legacy
+  settings), one removed with the system-sound helper; 405 total.
+
 ## 0.12.2 - 2026-11-12
 
 - **Voice E2EE (DAVE)**: Discord closed every voice connection with 4017

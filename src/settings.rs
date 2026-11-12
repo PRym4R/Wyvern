@@ -23,10 +23,22 @@ pub(crate) struct Settings {
     pub(crate) blur_media: bool,
     /// Show a desktop notification for incoming messages.
     pub(crate) notifications: bool,
-    /// Play the system notification sound together with the notification.
+    /// Play a short chime together with the notification.
     pub(crate) notify_sound: bool,
     /// Do not disturb: no notifications and no sound, not even mention-free ones.
     pub(crate) dnd: bool,
+    /// Output device by name; `None` is the system default.
+    pub(crate) output_device: Option<String>,
+    /// Input device by name; `None` is the system default.
+    pub(crate) input_device: Option<String>,
+    /// Volume of other people's voices, `None` is 1.0.
+    pub(crate) voice_volume: Option<f32>,
+    /// Volume of your own microphone in self-listen, `None` is 1.0.
+    pub(crate) mic_volume: Option<f32>,
+    /// Volume of the notification chime, `None` is 1.0.
+    pub(crate) notify_volume: Option<f32>,
+    /// Hear your own microphone through the output while connected to voice.
+    pub(crate) listen_self: bool,
     /// Keep deleted messages in the list, drawn in red, instead of removing them.
     pub(crate) keep_deleted: bool,
     /// Outbound proxy URL (http/https/socks5); empty or absent means direct.

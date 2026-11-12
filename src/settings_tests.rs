@@ -29,6 +29,12 @@ fn settings_round_trip_through_a_file() {
     s.dnd = true;
     s.keep_deleted = true;
     s.animations = Some(false);
+    s.output_device = Some("Speakers (USB)".into());
+    s.input_device = Some("Microphone (USB)".into());
+    s.voice_volume = Some(0.75);
+    s.mic_volume = Some(0.5);
+    s.notify_volume = Some(0.25);
+    s.listen_self = true;
 
     s.save_to(&path).expect("настройки должны записаться");
     assert!(
@@ -53,6 +59,23 @@ fn missing_or_broken_file_is_empty_settings() {
         "битый файл не должен ронять запуск"
     );
     let _ = std::fs::remove_file(&broken);
+}
+
+#[test]
+fn sound_settings_default_when_a_file_predates_them() {
+    let path = temp_path("legacy-sound");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, br#"{"theme_index":1,"notify_sound":true}"#).unwrap();
+
+    let s = Settings::load_from(&path);
+    assert_eq!(s.theme_index, Some(1), "старое поле должно читаться");
+    assert_eq!(s.output_device, None, "устройство по умолчанию — системное");
+    assert_eq!(s.input_device, None, "микрофон по умолчанию — системный");
+    assert_eq!(s.voice_volume, None, "громкость чужого голоса по умолчанию 1.0");
+    assert_eq!(s.mic_volume, None, "громкость своего голоса по умолчанию 1.0");
+    assert_eq!(s.notify_volume, None, "громкость уведомлений по умолчанию 1.0");
+    assert!(!s.listen_self, "слушать себя по умолчанию нельзя");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
