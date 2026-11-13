@@ -15,10 +15,12 @@ use std::time::Duration;
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 /// Discord voice is always stereo.
 pub(crate) const CHANNELS: usize = 2;
-/// 500 ms of stereo audio: enough headroom for jitter without audible delay.
-pub(crate) const RING_FRAMES: usize = 24_000;
+/// One second of stereo audio: room for a pre-buffer plus a device that pulls
+/// large callbacks, still without leaving audible delay in the normal case.
+pub(crate) const RING_FRAMES: usize = 48_000;
 /// Playback starts only once this much is queued. Without it the first packet
-/// underruns immediately and the stream crackles.
+/// underruns immediately and the stream crackles. A device whose callback is
+/// longer than this raises the threshold, see `Mixer::target`.
 pub(crate) const PREBUFFER_FRAMES: usize = 4_800;
 /// Loudest a volume slider may go: ×2, or +6 dB.
 pub(crate) const MAX_GAIN: f32 = 2.0;
@@ -147,6 +149,14 @@ pub(crate) struct Mixer {
     cleared: i64,
     /// Times playback was re-synced because the queue grew too long.
     dropped: u64,
+    /// Times the queue ran dry and playback waited for the pre-buffer again.
+    underruns: u64,
+    /// Packets refused because their position was already played.
+    late: u64,
+    /// Packets refused because they landed beyond the ring window.
+    ahead: u64,
+    /// Frames per output callback the device last asked for.
+    callback_frames: usize,
 }
 
 impl Mixer {
@@ -158,6 +168,10 @@ impl Mixer {
             started: false,
             cleared: 0,
             dropped: 0,
+            underruns: 0,
+            late: 0,
+            ahead: 0,
+            callback_frames: 0,
         }
     }
 
@@ -191,7 +205,12 @@ impl Mixer {
         let window_end = window_start + RING_FRAMES as i64;
         // Entirely late or too far ahead to fit: dropping is better than
         // wrapping over audio someone is hearing right now.
-        if end <= window_start || end > window_end {
+        if end <= window_start {
+            self.late += 1;
+            return;
+        }
+        if end > window_end {
+            self.ahead += 1;
             return;
         }
         for (i, frame) in pcm.chunks_exact(CHANNELS).enumerate() {
@@ -215,6 +234,18 @@ impl Mixer {
         self.read.round() as i64
     }
 
+    /// Frames playback needs buffered before it starts. The pre-buffer alone is
+    /// not enough when the device asks for a large callback: the callback would
+    /// drain the queue and leave silence in the same buffer, then the packets
+    /// that arrive meanwhile would be late. Two callbacks always leave one
+    /// callback of slack.
+    fn target(&self) -> f64 {
+        let two_callbacks = (self.callback_frames * 2) as f64;
+        (PREBUFFER_FRAMES as f64)
+            .max(two_callbacks)
+            .min((RING_FRAMES / 2) as f64)
+    }
+
     /// Fills `out` with `out.len() / channels` interleaved frames, resampling
     /// 48 kHz to the device rate (`step = 48000 / device_rate`).
     pub(crate) fn pull(&mut self, out: &mut [f32], channels: usize, step: f64) {
@@ -222,10 +253,12 @@ impl Mixer {
             out.fill(0.0);
             return;
         }
+        self.callback_frames = out.len() / channels;
+        let target = self.target();
         // Queue cap: a stalled callback or a burst must not become seconds of
         // delay once playback resumes.
         if self.write as f64 - self.read > RING_FRAMES as f64 {
-            self.read = self.write as f64 - PREBUFFER_FRAMES as f64;
+            self.read = self.write as f64 - target;
             self.started = false;
             self.dropped += 1;
         }
@@ -233,9 +266,10 @@ impl Mixer {
             // Underrun: re-arm the pre-buffer so the next burst starts clean.
             self.read = self.write as f64;
             self.started = false;
+            self.underruns += 1;
         }
         if !self.started {
-            if self.write as f64 - self.read < PREBUFFER_FRAMES as f64 {
+            if self.write as f64 - self.read < target {
                 out.fill(0.0);
                 return;
             }
@@ -379,6 +413,32 @@ impl Player {
     /// Current playback position, used to anchor RTP timestamps.
     pub(crate) fn position(&self) -> i64 {
         self.mixer.lock().map(|m| m.position()).unwrap_or(0)
+    }
+
+    /// How much audio is queued for playback, in 48 kHz frames.
+    pub(crate) fn buffered(&self) -> i64 {
+        self.mixer
+            .lock()
+            .map(|m| m.write - m.read as i64)
+            .unwrap_or(0)
+    }
+
+    /// Playback stalls (queue ran dry), forced resyncs (queue too long) and
+    /// packets refused as late or too far ahead.
+    pub(crate) fn stalls(&self) -> (u64, u64, u64, u64) {
+        self.mixer
+            .lock()
+            .map(|m| (m.underruns, m.dropped, m.late, m.ahead))
+            .unwrap_or((0, 0, 0, 0))
+    }
+
+    /// Size of the last output callback in 48 kHz frames; 0 before the device
+    /// has pulled once.
+    pub(crate) fn callback_frames(&self) -> i64 {
+        self.mixer
+            .lock()
+            .map(|m| m.callback_frames as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -781,6 +841,32 @@ mod tests {
         mixer.pull(&mut out, 2, 1.0);
         assert!(out.iter().all(|&s| s == 0.0), "до пребуфера должен быть нуль");
         assert_eq!(mixer.queued(), 100.0, "очередь не должна расходоваться");
+    }
+
+    #[test]
+    fn prebuffer_covers_device_callbacks_longer_than_the_packets() {
+        // A 200 ms callback with only 100 ms queued would read past the
+        // watermark, leave a hole and make the packets that arrive during the
+        // callback late. Waiting for two callbacks avoids that.
+        let mut mixer = Mixer::new();
+        let packet = vec![1_000i16; 960 * CHANNELS];
+        for i in 0..5 {
+            mixer.push_at(PREBUFFER_FRAMES as i64 + i * 960, &packet);
+        }
+        let mut out = vec![0.0f32; 9_600 * CHANNELS];
+        mixer.pull(&mut out, CHANNELS, 1.0);
+        assert!(out.iter().all(|&s| s == 0.0), "100 мс звука мало для колбэка в 200 мс");
+        assert_eq!(mixer.underruns, 0, "ожидание пребуфера — не провал");
+
+        // Two callbacks' worth is enough to start.
+        for i in 5..25 {
+            mixer.push_at(PREBUFFER_FRAMES as i64 + i * 960, &packet);
+        }
+        mixer.pull(&mut out, CHANNELS, 1.0);
+        assert!(
+            out[PREBUFFER_FRAMES * CHANNELS..].iter().all(|&s| s > 0.0),
+            "после двух колбэков звук должен идти без дыр"
+        );
     }
 
     #[test]

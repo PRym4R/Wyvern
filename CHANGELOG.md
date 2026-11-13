@@ -3,6 +3,22 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.13.2 - 2026-11-13
+
+- **Voice playback with large device buffers**: the mixer used to start playing
+  as soon as 100 ms were queued. A device whose callback asks for a longer
+  buffer than that reads past the watermark, so part of every callback was
+  silence and the packets arriving meanwhile were late — audible as chopped,
+  lagging voice. Playback now waits for two callbacks' worth (still 100 ms for
+  the usual 10–50 ms callbacks), and the ring is 1 s so that threshold always
+  fits.
+- **Voice diagnostics**: while audio arrives, the app log gets a `Голос: ...`
+  line every 5 s with packets, transport/DAVE/Opus failures, frames pushed,
+  queue length, playback stalls, late/ahead refusals, number of sources, average
+  decode time and the device callback length. This separates a crypto problem
+  from a decoder or a timing problem without guessing.
+- 1 new test (pre-buffer for long callbacks), 409 total.
+
 ## 0.13.1 - 2026-11-12
 
 - **Voice transport encryption**: Discord closed the voice socket with 4016

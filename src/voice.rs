@@ -594,16 +594,57 @@ async fn receive_loop(
     let mut anchors: HashMap<u32, (i64, u32)> = HashMap::new();
     let mut pcm = vec![0i16; OpusDecoder::MAX_FRAME_SIZE_48K * 2];
     let mut udp_buf = [0u8; 2048];
+    // Diagnostics: a garbled call must say which stage loses frames. Counters
+    // are reported to the app log every few seconds while audio arrives.
+    let mut packets: u64 = 0;
+    let mut transport_fail: u64 = 0;
+    let mut no_user: u64 = 0;
+    let mut dave_ok: u64 = 0;
+    let mut dave_fail: u64 = 0;
+    let mut plain_frames: u64 = 0;
+    let mut opus_fail: u64 = 0;
+    let mut pushed: u64 = 0;
+    let mut decode_us: u128 = 0;
+    let mut last_toc: u8 = 0;
+    let mut report = time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
             _ = heartbeat.tick() => send_heartbeat(ws, nonce, *last_seq).await?,
             _ = stop.changed() => return Ok(()),
+            _ = report.tick() => {
+                if packets > 0 {
+                    let (stalls, resets, late, ahead) = player.stalls();
+                    let _ = event_tx.send(ToApp::Debug(format!(
+                        "Голос: режим={} пакетов={} транспорт_ошибок={} без_пользователя={} dave_ok={} dave_fail={} plain={} opus_fail={} отправлено={} буфер={}мс toc={:#04x} провалов={} сбросов={} опоздавших={} вперёд={} источников={} декод={}мкс колбэк={}мс",
+                        mode.name(),
+                        packets,
+                        transport_fail,
+                        no_user,
+                        dave_ok,
+                        dave_fail,
+                        plain_frames,
+                        opus_fail,
+                        pushed,
+                        player.buffered() * 1000 / crate::audio::SAMPLE_RATE as i64,
+                        last_toc,
+                        stalls,
+                        resets,
+                        late,
+                        ahead,
+                        decoders.len(),
+                        decode_us / u128::from(pushed.max(1)),
+                        player.callback_frames() * 1000 / crate::audio::SAMPLE_RATE as i64,
+                    )));
+                }
+            }
             received = socket.recv(&mut udp_buf) => {
                 let n = received.map_err(|e| format!("voice udp: {}", e))?;
                 let packet = &udp_buf[..n];
+                packets += 1;
                 let Some(header) = parse_rtp(packet) else { continue };
                 let Some(plain) = decrypt_rtp(packet, key, mode) else {
+                    transport_fail += 1;
                     continue;
                 };
                 if plain.is_empty() {
@@ -617,14 +658,24 @@ async fn receive_loop(
                         .get(&header.ssrc)
                         .and_then(|id| id.parse::<u64>().ok())
                     else {
+                        no_user += 1;
                         continue;
                     };
-                    let Some(state) = dave.as_mut() else { continue };
-                    let Some(frame) = state.decrypt(user_id, &plain) else { continue };
+                    let Some(state) = dave.as_mut() else {
+                        dave_fail += 1;
+                        continue;
+                    };
+                    let Some(frame) = state.decrypt(user_id, &plain) else {
+                        dave_fail += 1;
+                        continue;
+                    };
+                    dave_ok += 1;
                     frame
                 } else {
+                    plain_frames += 1;
                     plain
                 };
+                last_toc = plain[0];
                 let decoder = match decoders.entry(header.ssrc) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => match OpusDecoder::new(48_000, 2) {
@@ -635,7 +686,11 @@ async fn receive_loop(
                 };
                 // 20 ms frame at 48 kHz; the buffer always has room for a
                 // full 120 ms frame.
-                let Ok(samples) = decoder.decode(&plain, &mut pcm, false) else {
+                let started = std::time::Instant::now();
+                let decoded = decoder.decode(&plain, &mut pcm, false);
+                decode_us += started.elapsed().as_micros();
+                let Ok(samples) = decoded else {
+                    opus_fail += 1;
                     continue;
                 };
                 let used = samples * 2;
@@ -647,6 +702,7 @@ async fn receive_loop(
                         header.timestamp,
                     );
                     player.push_at_gain(start, &pcm[..used], crate::audio::others_volume());
+                    pushed += 1;
                 }
             }
             event = read_event(ws) => {
