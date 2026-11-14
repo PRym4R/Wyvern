@@ -26,6 +26,10 @@ cp -f target/release/wyvern ./wyvern   # only to run it from the repo root
 
 On Linux voice output goes through ALSA, so the build needs its headers
 (`sudo apt install libasound2-dev`, or the equivalent for your distribution).
+Opus decoding links the reference libopus: the build finds it with
+`pkg-config` (`sudo apt install libopus-dev`) and otherwise compiles the
+bundled copy, which needs a C compiler and CMake. CMake 4 or newer also needs
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment.
 Without an output device the client still connects to voice but says why audio
 is unavailable in the voice strip. Voice audio is raw UDP and therefore does not
 work through the configured HTTPS/SOCKS proxy yet. Discord requires DAVE
@@ -80,7 +84,7 @@ client sees. `WYVERN_LOG_DIR` moves the directory, and a message dump
 ## Tests and measurements
 
 ```bash
-cargo test --release                                        # 409 tests (406 + 3 ignored)
+cargo test --release                                        # 420 tests (417 + 3 ignored)
 cargo test --release -- --ignored --nocapture memcheck       # memory measurement
 WYVERN_SS_URL='ss://…' cargo test --release -- --ignored live_shadowsocks_proxy_smoke
 WYVERN_VLESS_URL='vless://…' cargo test --release -- --ignored live_vless_proxy_smoke

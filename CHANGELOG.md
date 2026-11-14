@@ -3,6 +3,41 @@
 All notable changes to Wyvern, newest first. The version itself lives in
 `Cargo.toml`.
 
+## 0.13.3 - 2026-11-14
+
+- **Opus decoding uses the reference libopus**: the pure-Rust `opus-decoder`
+  port disagreed with libopus on about a third of the valid RFC 8251
+  conformance packets, sometimes by full scale, and in a call that was heard
+  as loud "пш-пш" bursts and hiss in the background. Decoding now goes through
+  the `opus` bindings to libopus, still mono with a copy into stereo (cheaper,
+  and immune to anti-phase bursts on Discord's mono streams). The build finds
+  libopus through `pkg-config` (`libopus-dev`) and otherwise compiles the
+  bundled copy, which needs a C compiler and CMake; CMake 4 also needs
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+- **Packet validation before decoding**: Opus has no checksum, so ciphertext
+  handed to the decoder is not an error but a loud burst. Payloads are checked
+  against the RFC 6716 §3 framing, and unmarked ones are additionally offered
+  to the DAVE ratchets — frame decryption is authenticated, so a match cannot
+  be a false positive. The `мусор` counter shows how many payloads were
+  dropped.
+- **Decoder blow-ups are discarded**: a frame that decodes into a saturated,
+  nearly square wave, or into a ramp from silence to full scale, never reaches
+  the mixer, and that sender's decoder is reset so the poisoned state cannot
+  spoil the next frames. Reported as `глитчей`.
+- **Mixer timeline**: packets stop drifting when someone pauses. The playback
+  position keeps following the device clock, a hole is concealed only while it
+  still lies in the future and for at most 120 ms, a stream that falls behind
+  is re-anchored to the end of the queue instead of leaving a gap, and RTCP
+  reports no longer count as voice. Buffer stayed at 80–110 ms instead of
+  growing to half a second.
+- **Soft limiter instead of hard clipping**: several simultaneous speakers sum
+  past full scale, and cutting that sum off was heard as crackle. The sum now
+  bends toward full scale above 0.75 FS.
+- `WYVERN_VOICE_DUMP` also saves the undecoded Opus payloads
+  (`packets-<ssrc>.bin`) next to the per-sender PCM, so a decoder or mixer
+  problem can be told apart offline.
+- 11 new tests, 420 total.
+
 ## 0.13.2 - 2026-11-13
 
 - **Voice playback with large device buffers**: the mixer used to start playing

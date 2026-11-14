@@ -1,6 +1,6 @@
 [package]
 name = "wyvern"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 
 [dependencies]
@@ -26,10 +26,13 @@ pbkdf2 = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 dirs = "6"
-# Voice receive: RTP decryption, Opus decoding and audio output. All three are
-# pure Rust or thin platform bindings; no libopus/FFI.
+# Voice receive: RTP decryption, Opus decoding and audio output.
+# Decoding uses the reference libopus through the `opus` bindings. The
+# pure-Rust decoder that used to sit here disagreed with libopus on roughly a
+# third of the RFC conformance packets — sometimes by full scale — which was
+# heard as loud glitches and hiss in calls.
 xsalsa20poly1305 = "0.9"
-opus-decoder = "0.1"
+opus = "0.3"
 cpal = "0.18"
 # Voice E2EE: Discord rejects clients without DAVE (MLS) since March 2026.
 davey = "0.1.4"

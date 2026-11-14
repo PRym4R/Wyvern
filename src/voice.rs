@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use davey::{DaveSession, MediaType, ProposalsOperationType, DAVE_PROTOCOL_VERSION};
 use futures_util::{SinkExt, StreamExt};
-use opus_decoder::OpusDecoder;
+use opus::{Channels, Decoder};
 use serde_json::{json, Value};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::watch;
@@ -102,6 +102,98 @@ enum VoiceEvent {
         op: u8,
         payload: Vec<u8>,
     },
+}
+
+/// Raw dump of everything that reached the mixer, for diagnosing "the sound
+/// is wrong" reports. `WYVERN_VOICE_DUMP=<dir>` writes one
+/// `ssrc-<n>.pcm` file per sender: 48 kHz stereo, little-endian 16-bit, in
+/// playback order, plus `packets-<n>.bin` with the exact Opus payloads
+/// (4-byte little-endian length, then the bytes) so a decoder can be compared
+/// offline. Two minutes at most, so a forgotten variable cannot fill the disk.
+struct VoiceDump {
+    dir: Option<std::path::PathBuf>,
+    files: HashMap<u32, std::fs::File>,
+    written: u64,
+    packets: HashMap<u32, std::fs::File>,
+    packet_bytes: u64,
+}
+
+impl VoiceDump {
+    const LIMIT: u64 = 48_000 * 2 * 120;
+    const PACKET_LIMIT: u64 = 16 * 1024 * 1024;
+
+    fn new() -> Self {
+        let dir = std::env::var("WYVERN_VOICE_DUMP")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from);
+        if let Some(dir) = dir.as_ref() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        Self {
+            dir,
+            files: HashMap::new(),
+            written: 0,
+            packets: HashMap::new(),
+            packet_bytes: 0,
+        }
+    }
+
+    /// Saves a decoded frame, exactly as the mixer will hear it.
+    fn push(&mut self, ssrc: u32, pcm: &[i16]) {
+        let Some(dir) = self.dir.clone() else {
+            return;
+        };
+        if self.written >= Self::LIMIT {
+            return;
+        }
+        let file = match self.files.entry(ssrc) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let Ok(file) = std::fs::File::create(dir.join(format!("ssrc-{}.pcm", ssrc)))
+                else {
+                    return;
+                };
+                e.insert(file)
+            }
+        };
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for sample in pcm {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        if file.write_all(&bytes).is_ok() {
+            self.written += pcm.len() as u64;
+        }
+    }
+
+    /// Saves an Opus payload before it is decoded: the input that decides
+    /// whether a glitch comes from the network, the decoder or the mixer.
+    fn push_packet(&mut self, ssrc: u32, payload: &[u8]) {
+        let Some(dir) = self.dir.clone() else {
+            return;
+        };
+        if self.packet_bytes >= Self::PACKET_LIMIT {
+            return;
+        }
+        let file = match self.packets.entry(ssrc) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let Ok(file) = std::fs::File::create(dir.join(format!("packets-{}.bin", ssrc)))
+                else {
+                    return;
+                };
+                e.insert(file)
+            }
+        };
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(payload.len() + 4);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        if file.write_all(&bytes).is_ok() {
+            self.packet_bytes += bytes.len() as u64;
+        }
+    }
 }
 
 /// A DAVE message to send: JSON for transition bookkeeping, binary for MLS.
@@ -339,6 +431,43 @@ impl DaveState {
         self.session
             .decrypt(user_id, MediaType::AUDIO, packet)
             .ok()
+    }
+
+    /// Decrypts a frame whose sender is `known` if possible, otherwise tries
+    /// every member of the MLS group.
+    ///
+    /// Every sender has its own key ratchet, so a frame can only be opened
+    /// with its sender's id. Trying the group is safe: a wrong id fails the
+    /// AEAD check and, because davey only advances a ratchet on success, it
+    /// does not disturb that sender's stream. The id that authenticates the
+    /// frame is the real owner of the ssrc, which is how the map is filled
+    /// for streams that were already running when we joined — the speaking
+    /// event is only sent when someone starts talking.
+    fn decrypt_best(&mut self, known: Option<u64>, packet: &[u8]) -> Option<(u64, Vec<u8>)> {
+        if let Some(user_id) = known {
+            if let Some(frame) = self.decrypt(user_id, packet) {
+                return Some((user_id, frame));
+            }
+        }
+        for user_id in self.user_ids() {
+            if Some(user_id) == known {
+                continue;
+            }
+            if let Some(frame) = self.decrypt(user_id, packet) {
+                return Some((user_id, frame));
+            }
+        }
+        None
+    }
+
+    /// Members of the current MLS group: everyone who can send audio.
+    fn user_ids(&self) -> Vec<u64> {
+        self.session.get_user_ids().unwrap_or_default()
+    }
+
+    /// Whether the group is joined and frames can be opened.
+    fn is_ready(&self) -> bool {
+        self.session.is_ready()
     }
 }
 
@@ -588,22 +717,39 @@ async fn receive_loop(
     nonce: &mut u64,
     last_seq: &mut Option<u16>,
 ) -> Result<(), String> {
-    let mut decoders: HashMap<u32, OpusDecoder> = HashMap::new();
+    let mut decoders: HashMap<u32, Decoder> = HashMap::new();
     let mut speakers: HashMap<u32, String> = HashMap::new();
     // Per-ssrc RTP timestamp anchor: (mixer frame, timestamp).
     let mut anchors: HashMap<u32, (i64, u32)> = HashMap::new();
-    let mut pcm = vec![0i16; OpusDecoder::MAX_FRAME_SIZE_48K * 2];
+    // Per-ssrc RTP timestamp the next packet should carry; a difference is a
+    // hole that has to be concealed so the decoder stays in step.
+    let mut next_ts: HashMap<u32, u32> = HashMap::new();
+    let mut dump = VoiceDump::new();
+    let mut pcm = vec![0i16; MAX_FRAME_SAMPLES];
+    // Mixer input is interleaved stereo, the codec output is mono.
+    let mut stereo = vec![0i16; MAX_FRAME_SAMPLES * 2];
     let mut udp_buf = [0u8; 2048];
     // Diagnostics: a garbled call must say which stage loses frames. Counters
     // are reported to the app log every few seconds while audio arrives.
     let mut packets: u64 = 0;
     let mut transport_fail: u64 = 0;
+    let mut transport_logged = false;
     let mut no_user: u64 = 0;
     let mut dave_ok: u64 = 0;
     let mut dave_fail: u64 = 0;
     let mut plain_frames: u64 = 0;
     let mut opus_fail: u64 = 0;
+    // Payloads that are neither marked E2EE nor a parseable Opus packet.
+    let mut malformed: u64 = 0;
     let mut pushed: u64 = 0;
+    // Frames the decoder turned into a saturated tone instead of speech.
+    let mut blowups: u64 = 0;
+    let mut concealed: u64 = 0;
+    let mut gap_jumps: u64 = 0;
+    let mut ssrc_learned: u64 = 0;
+    let mut speaking_events: u64 = 0;
+    let mut speaking_with_id: u64 = 0;
+    let mut op5_logged = false;
     let mut decode_us: u128 = 0;
     let mut last_toc: u8 = 0;
     let mut report = time::interval(Duration::from_secs(5));
@@ -615,17 +761,31 @@ async fn receive_loop(
             _ = report.tick() => {
                 if packets > 0 {
                     let (stalls, resets, late, ahead) = player.stalls();
+                    let (clipped, peak) = player.levels();
+                    let (dave_ready, dave_group) = dave
+                        .as_ref()
+                        .map(|s| (s.is_ready(), s.user_ids().len()))
+                        .unwrap_or((false, 0));
                     let _ = event_tx.send(ToApp::Debug(format!(
-                        "Голос: режим={} пакетов={} транспорт_ошибок={} без_пользователя={} dave_ok={} dave_fail={} plain={} opus_fail={} отправлено={} буфер={}мс toc={:#04x} провалов={} сбросов={} опоздавших={} вперёд={} источников={} декод={}мкс колбэк={}мс",
+                        "Голос: режим={} пакетов={} транспорт_ошибок={} без_пользователя={} dave_ok={} dave_fail={} dave_ready={} группа={} выучено={} оп5={} оп5_с_id={} ssrc_известно={} plain={} мусор={} opus_fail={} отправлено={} скрыто={} скачков={} буфер={}мс toc={:#04x} провалов={} сбросов={} опоздавших={} вперёд={} источников={} декод={}мкс колбэк={}мс клипов={} пик={} глитчей={}",
                         mode.name(),
                         packets,
                         transport_fail,
                         no_user,
                         dave_ok,
                         dave_fail,
+                        dave_ready,
+                        dave_group,
+                        ssrc_learned,
+                        speaking_events,
+                        speaking_with_id,
+                        speakers.len(),
                         plain_frames,
+                        malformed,
                         opus_fail,
                         pushed,
+                        concealed,
+                        gap_jumps,
                         player.buffered() * 1000 / crate::audio::SAMPLE_RATE as i64,
                         last_toc,
                         stalls,
@@ -635,6 +795,9 @@ async fn receive_loop(
                         decoders.len(),
                         decode_us / u128::from(pushed.max(1)),
                         player.callback_frames() * 1000 / crate::audio::SAMPLE_RATE as i64,
+                        clipped,
+                        peak,
+                        blowups,
                     )));
                 }
             }
@@ -645,6 +808,23 @@ async fn receive_loop(
                 let Some(header) = parse_rtp(packet) else { continue };
                 let Some(plain) = decrypt_rtp(packet, key, mode) else {
                     transport_fail += 1;
+                    // One sample is enough to tell a stray non-voice packet
+                    // from a real key mismatch.
+                    if !transport_logged {
+                        transport_logged = true;
+                        use std::fmt::Write as _;
+                        let mut hex = String::new();
+                        for byte in &packet[..packet.len().min(16)] {
+                            let _ = write!(hex, "{:02x}", byte);
+                        }
+                        let _ = event_tx.send(ToApp::Debug(format!(
+                            "Голос: не расшифровался пакет len={} pt={:#04x} ssrc={} нач={}",
+                            packet.len(),
+                            packet[1],
+                            header.ssrc,
+                            hex,
+                        )));
+                    }
                     continue;
                 };
                 if plain.is_empty() {
@@ -653,37 +833,125 @@ async fn receive_loop(
                 // E2EE frames are decrypted per sender before Opus. A plain
                 // frame has no magic marker and passes through unchanged, as
                 // during the transport-only and downgrade phases.
-                let plain = if is_dave_frame(&plain) {
-                    let Some(user_id) = speakers
+                let mut dave_frame = is_dave_frame(&plain);
+                let mut frame = plain;
+                let mut opened = false;
+                if !dave_frame && !valid_opus_packet(&frame) {
+                    // Not marked as E2EE and not a well-formed Opus payload.
+                    // Opus has no checksum, so ciphertext handed to the
+                    // decoder is not an error but a loud burst of noise —
+                    // exactly the "loud low-quality sound" this guards
+                    // against. One last try at the ratchets: a sender may
+                    // encrypt without leaving the marker where we look for it.
+                    let known = speakers
                         .get(&header.ssrc)
-                        .and_then(|id| id.parse::<u64>().ok())
-                    else {
-                        no_user += 1;
+                        .and_then(|id| id.parse::<u64>().ok());
+                    if let Some((user_id, plaintext)) = dave
+                        .as_mut()
+                        .and_then(|state| state.decrypt_best(known, &frame))
+                    {
+                        if valid_opus_packet(&plaintext) {
+                            if known.is_none() {
+                                speakers.insert(header.ssrc, user_id.to_string());
+                                ssrc_learned += 1;
+                            }
+                            frame = plaintext;
+                            dave_frame = true;
+                            opened = true;
+                            dave_ok += 1;
+                        }
+                    }
+                    if !opened {
+                        malformed += 1;
                         continue;
-                    };
+                    }
+                }
+                let plain = if dave_frame && !opened {
+                    let known = speakers
+                        .get(&header.ssrc)
+                        .and_then(|id| id.parse::<u64>().ok());
                     let Some(state) = dave.as_mut() else {
                         dave_fail += 1;
                         continue;
                     };
-                    let Some(frame) = state.decrypt(user_id, &plain) else {
+                    let Some((user_id, plaintext)) = state.decrypt_best(known, &frame) else {
+                        if known.is_none() {
+                            no_user += 1;
+                        }
                         dave_fail += 1;
                         continue;
                     };
+                    if known.is_none() {
+                        // Learned straight from the ratchet that opened the
+                        // frame; no speaking event was needed.
+                        speakers.insert(header.ssrc, user_id.to_string());
+                        ssrc_learned += 1;
+                    }
                     dave_ok += 1;
-                    frame
+                    plaintext
                 } else {
                     plain_frames += 1;
-                    plain
+                    frame
                 };
                 last_toc = plain[0];
+                dump.push_packet(header.ssrc, &plain);
+                let gain = crate::audio::others_volume();
+                let now = player.position();
+                let (start, jumped) = anchor_frame(
+                    &mut anchors,
+                    now,
+                    player.end(),
+                    header.ssrc,
+                    header.timestamp,
+                );
+                if jumped {
+                    gap_jumps += 1;
+                    // After a pause the decoder still holds the history of a
+                    // stream that was already played; feeding it the first
+                    // frame of a new spurt makes the synthesis filter
+                    // overshoot.
+                    decoders.remove(&header.ssrc);
+                }
                 let decoder = match decoders.entry(header.ssrc) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => match OpusDecoder::new(48_000, 2) {
-                        Ok(d) => e.insert(d),
-                        // A codec failure must not kill the session.
-                        Err(_) => continue,
-                    },
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        match Decoder::new(48_000, Channels::Mono) {
+                            Ok(d) => e.insert(d),
+                            // A codec failure must not kill the session.
+                            Err(_) => continue,
+                        }
+                    }
                 };
+                // Packets the network lost must be replaced, not skipped: an
+                // Opus stream is stateful, and a gap leaves the decoder
+                // predicting from stale history, which is heard as crackle
+                // and "wobbly" speech after every loss. Concealing up to
+                // 120 ms keeps both the state and the timeline continuous; a
+                // longer hole is a pause and was re-anchored above. The hole
+                // must also still lie in the future: filling one that was
+                // already played as silence would push this stream further
+                // ahead of playback on every pause, which is how the delay
+                // grew to half a second.
+                if let Some(expected) = next_ts.get(&header.ssrc).copied() {
+                    let delta = header.timestamp.wrapping_sub(expected) as i32 as i64;
+                    if delta > 0 && delta <= MAX_CONCEAL_FRAMES && start - delta >= now {
+                        let mut cursor = start - delta;
+                        while cursor < start {
+                            let Ok(n) = decoder.decode(&[], &mut pcm, false) else {
+                                break;
+                            };
+                            if n == 0 {
+                                break;
+                            }
+                            let room = (start - cursor).min(n as i64) as usize;
+                            let used = dup_mono(&pcm[..room], &mut stereo);
+                            player.push_at_gain(cursor, &stereo[..used], gain);
+                            dump.push(header.ssrc, &stereo[..used]);
+                            cursor += room as i64;
+                        }
+                        concealed += 1;
+                    }
+                }
                 // 20 ms frame at 48 kHz; the buffer always has room for a
                 // full 120 ms frame.
                 let started = std::time::Instant::now();
@@ -691,17 +959,43 @@ async fn receive_loop(
                 decode_us += started.elapsed().as_micros();
                 let Ok(samples) = decoded else {
                     opus_fail += 1;
+                    // Opus has no integrity check: a corrupt payload can still
+                    // "decode" into a short burst of noise, so a rejected one
+                    // is worth showing verbatim.
+                    if opus_fail <= 3 {
+                        use std::fmt::Write as _;
+                        let mut hex = String::new();
+                        for byte in &plain[..plain.len().min(16)] {
+                            let _ = write!(hex, "{:02x}", byte);
+                        }
+                        let _ = event_tx.send(ToApp::Debug(format!(
+                            "Голос: Opus не принял кадр ssrc={} len={} dave={} нач={}",
+                            header.ssrc,
+                            plain.len(),
+                            dave_frame,
+                            hex,
+                        )));
+                    }
                     continue;
                 };
-                let used = samples * 2;
-                if used > 0 && used <= pcm.len() {
-                    let start = anchor_frame(
-                        &mut anchors,
-                        player.position(),
-                        header.ssrc,
-                        header.timestamp,
-                    );
-                    player.push_at_gain(start, &pcm[..used], crate::audio::others_volume());
+                next_ts.insert(
+                    header.ssrc,
+                    header.timestamp.wrapping_add(samples as u32),
+                );
+                // Opus has no checksum, so a payload that is not really Opus
+                // can decode into a saturated tone. Nothing that comes out of
+                // the decoder sounding like that is speech, and pushing it
+                // would be heard as a loud glitch; drop the frame and throw the
+                // poisoned decoder away so the next one starts clean.
+                if samples > 0 && is_decoder_blowup(&pcm[..samples.min(pcm.len())]) {
+                    blowups += 1;
+                    decoders.remove(&header.ssrc);
+                    continue;
+                }
+                if samples > 0 && samples <= pcm.len() {
+                    let used = dup_mono(&pcm[..samples], &mut stereo);
+                    player.push_at_gain(start, &stereo[..used], gain);
+                    dump.push(header.ssrc, &stereo[..used]);
                     pushed += 1;
                 }
             }
@@ -715,10 +1009,28 @@ async fn receive_loop(
                                 // RTP ssrc to a user id. Some events omit the
                                 // id, so the earlier mapping is the fallback.
                                 let d = &v["d"];
+                                // The first event is logged verbatim: whether
+                                // it carries a user id at all decides how an
+                                // ssrc is attributed, and servers have changed
+                                // between a string and a number here.
+                                if !op5_logged {
+                                    op5_logged = true;
+                                    let raw = v.to_string();
+                                    let _ = event_tx.send(ToApp::Debug(format!(
+                                        "Голос: первый op5 {}",
+                                        raw.chars().take(300).collect::<String>()
+                                    )));
+                                }
+                                speaking_events += 1;
                                 let speaking = d["speaking"].as_u64().unwrap_or(0) != 0;
                                 let ssrc = d["ssrc"].as_u64().map(|s| s as u32);
-                                let mut user_id = d["user_id"].as_str().unwrap_or("").to_string();
+                                let mut user_id = d["user_id"]
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .or_else(|| d["user_id"].as_u64().map(|id| id.to_string()))
+                                    .unwrap_or_default();
                                 if let (Some(ssrc), false) = (ssrc, user_id.is_empty()) {
+                                    speaking_with_id += 1;
                                     speakers.insert(ssrc, user_id.clone());
                                 } else if let Some(ssrc) = ssrc {
                                     user_id = speakers.get(&ssrc).cloned().unwrap_or_default();
@@ -753,33 +1065,64 @@ async fn receive_loop(
     }
 }
 
+/// Longest hole that is filled with concealing frames. Anything longer is a
+/// pause, not packet loss: the sender's RTP clock keeps running while nobody
+/// talks, and pretending to conceal a whole second of silence would only add
+/// delay.
+const MAX_CONCEAL_FRAMES: i64 = 5_760;
+/// Samples in the longest Opus frame: 120 ms at 48 kHz.
+const MAX_FRAME_SAMPLES: usize = 5_760;
+/// How far a sender's timeline may jump before the stream is re-anchored to
+/// the end of the queue. Equal to the conceal limit so a hole is either
+/// concealed or skipped, never both.
+const ANCHOR_GAP_FRAMES: i64 = MAX_CONCEAL_FRAMES;
+
 /// Mixer frame for this packet's first sample, derived from its RTP timestamp.
-/// The first packet of each ssrc is anchored 100 ms ahead of playback; later
-/// packets keep that offset, which is what aligns two speakers in the ring.
+///
+/// The first packet of each ssrc is anchored 100 ms ahead of playback (or at
+/// the end of the queue if other people are already playing). Later packets
+/// keep that offset, which is what aligns two speakers in the ring. The
+/// returned flag is set when the sender's clock jumped past the queue and the
+/// stream had to be re-anchored: RTP timestamps keep counting while someone
+/// is silent, so a pause would otherwise leave a hole in the timeline that is
+/// heard as a delay followed by a hiccup.
 pub(crate) fn anchor_frame(
     anchors: &mut HashMap<u32, (i64, u32)>,
     now: i64,
+    queue_end: i64,
     ssrc: u32,
     timestamp: u32,
-) -> i64 {
-    let (base, base_ts) = match anchors.get(&ssrc).copied() {
+) -> (i64, bool) {
+    // Join whatever is already queued; only an empty queue needs the
+    // pre-buffer lead. Adding the lead on top of a queue would leave a hole.
+    let resume = if queue_end > now {
+        queue_end
+    } else {
+        now + crate::audio::PREBUFFER_FRAMES as i64
+    };
+    let (base, base_ts, jumped) = match anchors.get(&ssrc).copied() {
         Some((base, base_ts)) => {
-            let delta = timestamp.wrapping_sub(base_ts) as i32 as i64;
-            let start = base + delta;
-            // A long pause (or a counter reset) leaves the old anchor hours
-            // away; join the current timeline instead of dropping forever.
-            if start < now - crate::audio::RING_FRAMES as i64
-                || start > now + crate::audio::RING_FRAMES as i64
-            {
-                (now + crate::audio::PREBUFFER_FRAMES as i64, timestamp)
+            let start = base + timestamp.wrapping_sub(base_ts) as i32 as i64;
+            if start + (crate::audio::RING_FRAMES as i64) < now {
+                // Counter reset or a stream restarted behind us.
+                (resume, timestamp, true)
+            } else if start > queue_end + ANCHOR_GAP_FRAMES {
+                // The sender paused and its clock moved on without us.
+                (resume, timestamp, true)
+            } else if start < now {
+                // The stream fell behind playback — a pause we already
+                // covered with silence, or a burst that arrived late. Audio
+                // cannot be played in the past; joining the queue now keeps
+                // the delay from growing with every pause.
+                (resume, timestamp, true)
             } else {
-                (base, base_ts)
+                (base, base_ts, false)
             }
         }
-        None => (now + crate::audio::PREBUFFER_FRAMES as i64, timestamp),
+        None => (resume, timestamp, false),
     };
     anchors.insert(ssrc, (base, base_ts));
-    base + timestamp.wrapping_sub(base_ts) as i32 as i64
+    (base + timestamp.wrapping_sub(base_ts) as i32 as i64, jumped)
 }
 
 /// Heartbeat body. v8 changed `d` from a bare `t` to an object and made
@@ -925,6 +1268,154 @@ pub(crate) fn parse_discovery_reply(buf: &[u8]) -> Option<(String, u16)> {
     Some((address.to_string(), port))
 }
 
+/// Copies a mono frame into interleaved stereo, returning the number of
+/// samples written.
+///
+/// Discord voice is mono, but Opus has no checksum: the decoder accepts
+/// almost any payload and, when the stream and the decoder disagree about the
+/// channel count, occasionally emits a full-scale anti-phase burst instead of
+/// speech. Decoding one channel and copying it is both cheaper and immune.
+pub(crate) fn dup_mono(src: &[i16], dst: &mut [i16]) -> usize {
+    let n = src.len().min(dst.len() / 2);
+    for (i, sample) in src[..n].iter().enumerate() {
+        dst[2 * i] = *sample;
+        dst[2 * i + 1] = *sample;
+    }
+    n * 2
+}
+
+/// Whether a decoded frame looks like the decoder blew up rather than like a
+/// loud voice.
+///
+/// A payload that is not really Opus — ciphertext that slipped through, a
+/// packet from another stream — leaves an unstable synthesis filter behind:
+/// the output ramps up to full scale and stays there, which is heard as a
+/// short loud tone. Speech has a much lower crest factor even when it clips,
+/// so a frame that is both saturated and nearly square is never voice. The
+/// artefact also starts on exact silence: the first samples are zero and the
+/// end of the same 20 ms frame is already pinned to full scale, which no
+/// microphone attack produces.
+pub(crate) fn is_decoder_blowup(pcm: &[i16]) -> bool {
+    if pcm.len() < 64 {
+        return false;
+    }
+    let mut peak = 0i32;
+    let mut sum = 0f64;
+    for sample in pcm {
+        let magnitude = (*sample as i32).abs();
+        peak = peak.max(magnitude);
+        sum += (*sample as f64) * (*sample as f64);
+    }
+    // Too quiet to be the artefact, and loud speech must never be dropped.
+    if peak < 32_000 {
+        return false;
+    }
+    let rms = (sum / pcm.len() as f64).sqrt();
+    if rms > peak as f64 * 0.85 {
+        return true;
+    }
+    let onset = pcm.len() / 8;
+    let tail = &pcm[pcm.len() / 4 * 3..];
+    pcm[..onset].iter().all(|s| (*s as i32).abs() < 200)
+        && tail.iter().any(|s| (*s as i32).abs() >= 31_000)
+}
+
+/// Reads a frame length as RFC 6716 section 3.2 encodes it: one byte below
+/// 252, otherwise a two-byte value.
+fn frame_length(body: &[u8], pos: &mut usize) -> Option<usize> {
+    let first = *body.get(*pos)? as usize;
+    *pos += 1;
+    if first < 252 {
+        return Some(first);
+    }
+    let second = *body.get(*pos)? as usize;
+    *pos += 1;
+    Some(first + 4 * second)
+}
+
+/// Whether `payload` is a syntactically valid Opus packet (RFC 6716 section
+/// 3). A payload that does not parse is ciphertext or a foreign protocol
+/// packet, and handing it to the decoder produces noise rather than an error,
+/// so the caller drops it instead.
+pub(crate) fn valid_opus_packet(payload: &[u8]) -> bool {
+    let Some(&toc) = payload.first() else {
+        return false;
+    };
+    let body = &payload[1..];
+    match toc & 0x03 {
+        // One frame of any size; zero bytes is a DTX frame.
+        0 => true,
+        // Two frames of equal size.
+        1 => body.len() % 2 == 0,
+        // Two frames, the first with an explicit length.
+        2 => {
+            let mut pos = 0;
+            let Some(first) = frame_length(body, &mut pos) else {
+                return false;
+            };
+            match body.len().checked_sub(pos) {
+                Some(rest) => first > 0 && rest > first,
+                None => false,
+            }
+        }
+        // Arbitrary framing: optional padding, then one to 48 frames whose
+        // lengths must add up to exactly what is left.
+        _ => {
+            let Some(&head) = body.first() else {
+                return false;
+            };
+            let count = (head & 0x3f) as usize;
+            if count == 0 {
+                return false;
+            }
+            let mut pos = 1;
+            let mut padding = 0usize;
+            if head & 0x40 != 0 {
+                loop {
+                    let Some(&byte) = body.get(pos) else {
+                        return false;
+                    };
+                    pos += 1;
+                    if byte == 255 {
+                        padding += 254;
+                    } else {
+                        padding += byte as usize;
+                        break;
+                    }
+                }
+            }
+            let Some(mut rest) = body.len().checked_sub(pos) else {
+                return false;
+            };
+            if rest <= padding {
+                return false;
+            }
+            rest -= padding;
+            if head & 0x80 != 0 {
+                let mut total = 0usize;
+                for _ in 1..count {
+                    let Some(length) = frame_length(body, &mut pos) else {
+                        return false;
+                    };
+                    if length == 0 {
+                        return false;
+                    }
+                    total += length;
+                }
+                let Some(rest) = body.len().checked_sub(pos) else {
+                    return false;
+                };
+                if rest <= padding {
+                    return false;
+                }
+                rest - padding > total
+            } else {
+                rest >= count
+            }
+        }
+    }
+}
+
 /// One parsed RTP packet header.
 pub(crate) struct RtpHeader {
     /// Full header length including CSRCs and the extension payload.
@@ -943,6 +1434,13 @@ pub(crate) struct RtpHeader {
 /// version 2 packet with a full authentication tag present.
 pub(crate) fn parse_rtp(packet: &[u8]) -> Option<RtpHeader> {
     if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    // RTCP shares the UDP port and its packet type goes into the same byte,
+    // but without RTP's marker bit: 200 (sender report) and up. Encrypted
+    // voice never uses a payload type that high, so reports and keepalives
+    // must not be counted as undecryptable audio.
+    if packet[1] >= 200 {
         return None;
     }
     let csrc_count = (packet[0] & 0x0f) as usize;
@@ -1051,6 +1549,146 @@ mod tests {
             "эндпоинт должен получить схему и версию"
         );
         assert_eq!(voice_url(" wss://x/ "), "wss://x/?v=8", "схема не должна дублироваться");
+    }
+
+    #[test]
+    fn rtcp_reports_are_not_mistaken_for_voice() {
+        // 0x81 0xC8: version 2, one report block, sender report (PT 200).
+        let mut packet = vec![0u8; 32];
+        packet[0] = 0x81;
+        packet[1] = 0xC8;
+        assert!(
+            parse_rtp(&packet).is_none(),
+            "RTCP-отчёт не должен считаться голосовым пакетом"
+        );
+    }
+
+    #[test]
+    fn anchor_joins_the_end_of_the_queue() {
+        let mut anchors = HashMap::new();
+        let (start, jumped) = anchor_frame(&mut anchors, 0, 0, 7, 1_000);
+        assert_eq!(start, 4_800, "пустая очередь — пакет через пребуфер");
+        assert!(!jumped, "первый пакет источника — не скачок");
+
+        // Someone is already playing: the new stream must follow it directly
+        // instead of opening a hole in the timeline.
+        let mut anchors = HashMap::new();
+        let (start, jumped) = anchor_frame(&mut anchors, 500, 1_000, 9, 0);
+        assert_eq!(start, 1_000, "новый источник встаёт в конец очереди");
+        assert!(!jumped);
+    }
+
+    #[test]
+    fn anchor_keeps_the_clock_of_a_running_stream() {
+        let mut anchors = HashMap::new();
+        anchor_frame(&mut anchors, 0, 0, 7, 1_000);
+        let (start, jumped) = anchor_frame(&mut anchors, 480, 5_760, 7, 1_960);
+        assert_eq!(start, 5_760, "кадры подряд должны идти вплотную");
+        assert!(!jumped);
+    }
+
+    #[test]
+    fn anchor_skips_a_pause_instead_of_leaving_a_hole() {
+        let mut anchors = HashMap::new();
+        anchor_frame(&mut anchors, 0, 0, 7, 0);
+        // Half a second of silence: the RTP clock kept running.
+        let (start, jumped) = anchor_frame(&mut anchors, 9_000, 10_000, 7, 24_000);
+        assert!(jumped, "пауза говорящего — это скачок таймлайна");
+        assert_eq!(start, 10_000, "после паузы звук идёт сразу за очередью");
+    }
+
+    #[test]
+    fn anchor_never_schedules_audio_in_the_past() {
+        // The stream fell behind the playback position (a pause that was
+        // already heard as silence, or a late burst). Playing it in the past
+        // is impossible; it has to join the queue instead of stretching the
+        // delay by the length of every pause.
+        let mut anchors = HashMap::new();
+        anchor_frame(&mut anchors, 0, 4_800, 7, 1_000);
+        let (start, jumped) = anchor_frame(&mut anchors, 12_000, 12_500, 7, 2_000);
+        assert!(jumped, "отставший источник должен переставиться");
+        assert_eq!(start, 12_500, "звук встаёт в конец очереди");
+    }
+
+    #[test]
+    fn mono_frame_is_copied_into_both_channels() {
+        let src = [1i16, -2, 3];
+        let mut dst = [0i16; 6];
+        let used = dup_mono(&src, &mut dst);
+        assert_eq!(used, 6, "моно-кадр занимает вдвое больше сэмплов");
+        assert_eq!(dst, [1, 1, -2, -2, 3, 3], "оба канала должны совпадать");
+    }
+
+    #[test]
+    fn opus_framing_rejects_ciphertext() {
+        // Payloads that reached the decoder in a real call instead of audio.
+        assert!(
+            !valid_opus_packet(&[
+                0x71, 0xc4, 0x63, 0x7a, 0x0c, 0xd2, 0x4c, 0x27, 0x21, 0xc2, 0x08, 0x89, 0xb3,
+                0x54, 0x5f, 0xad
+            ]),
+            "кадр с длиной больше остатка — не Opus"
+        );
+        assert!(!valid_opus_packet(&[]), "пустой кадр — не Opus");
+        assert!(
+            !valid_opus_packet(&[0x03, 0x62, 0x05]),
+            "произвольная упаковка с неверной длиной — не Opus"
+        );
+    }
+
+    #[test]
+    fn opus_framing_accepts_normal_frames() {
+        // Code 0 (single frame), code 1 (two equal), code 2 (explicit length)
+        // and code 3 with a frame count.
+        let single = [0x78u8, 0x11, 0x22, 0x33];
+        assert!(valid_opus_packet(&single), "одиночный кадр должен проходить");
+        let two_equal = [0x79u8, 0x11, 0x22, 0x33, 0x44];
+        assert!(valid_opus_packet(&two_equal), "два равных кадра");
+        let explicit = [0x7au8, 0x01, 0x11, 0x22];
+        assert!(valid_opus_packet(&explicit), "кадр с явной длиной");
+        let counted = [0x7bu8, 0x02, 0x01, 0x11, 0x22];
+        assert!(valid_opus_packet(&counted), "произвольная упаковка");
+        // Silence/DTX frame Discord sends between words.
+        assert!(valid_opus_packet(&[0xF8, 0xFF, 0xFE]), "DTX-кадр");
+    }
+
+    #[test]
+    fn saturated_square_frame_is_a_decoder_blowup() {
+        // The glitch heard in a call: a tone pinned to full scale. Speech
+        // never has RMS that close to the peak.
+        let blowup: Vec<i16> = (0..960)
+            .map(|i| if (i / 20) % 2 == 0 { 32_700 } else { -32_700 })
+            .collect();
+        assert!(is_decoder_blowup(&blowup), "прямоугольная волна — глитч");
+
+        // The same artefact's fade-in: exact silence, then full scale before
+        // the frame ends.
+        let ramp: Vec<i16> = (0..960)
+            .map(|i| {
+                if i < 600 {
+                    0
+                } else if i % 2 == 0 {
+                    32_767
+                } else {
+                    -32_767
+                }
+            })
+            .collect();
+        assert!(is_decoder_blowup(&ramp), "нарастание из тишины — глитч");
+
+        // Loud speech: lower crest factor even at full scale, must survive.
+        let speech: Vec<i16> = (0..960)
+            .map(|i| (((i as f32) * 0.11).sin() * 32_767.0) as i16)
+            .collect();
+        assert!(
+            !is_decoder_blowup(&speech),
+            "громкая речь не должна отбрасываться"
+        );
+        assert!(!is_decoder_blowup(&[0i16; 8]), "тишина — не глитч");
+        assert!(
+            !is_decoder_blowup(&[32_000i16, -32_000, 32_000, -32_000]),
+            "слишком короткий фрагмент не проверяется"
+        );
     }
 
     #[test]
@@ -1284,8 +1922,8 @@ mod tests {
     fn opus_decoder_handles_packet_loss() {
         // An empty packet is Opus packet-loss concealment; it must not error
         // even before the first real frame.
-        let mut decoder = OpusDecoder::new(48_000, 2).expect("декодер должен создаться");
-        let mut pcm = vec![0i16; OpusDecoder::MAX_FRAME_SIZE_48K * 2];
+        let mut decoder = Decoder::new(48_000, Channels::Stereo).expect("декодер должен создаться");
+        let mut pcm = vec![0i16; MAX_FRAME_SAMPLES * 2];
         assert!(decoder.decode(&[], &mut pcm, false).is_ok(), "PLC не должен падать");
     }
 }

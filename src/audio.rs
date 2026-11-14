@@ -157,6 +157,11 @@ pub(crate) struct Mixer {
     ahead: u64,
     /// Frames per output callback the device last asked for.
     callback_frames: usize,
+    /// Output frames whose sum exceeded full scale, i.e. where the mix was
+    /// clipped into distortion.
+    clipped: u64,
+    /// Loudest sample the mix reached, in 16-bit units.
+    peak: i32,
 }
 
 impl Mixer {
@@ -172,6 +177,8 @@ impl Mixer {
             late: 0,
             ahead: 0,
             callback_frames: 0,
+            clipped: 0,
+            peak: 0,
         }
     }
 
@@ -273,24 +280,41 @@ impl Mixer {
                 out.fill(0.0);
                 return;
             }
+            // While playback waited, the queue may have grown past the
+            // target (a slow first packet, or the app joining a call that is
+            // already loud). Starting from the old position would play that
+            // backlog as silence and keep the delay forever.
+            let head = self.write as f64 - target;
+            if head > self.read {
+                self.read = head;
+            }
             self.started = true;
         }
 
         for frame in out.chunks_mut(channels) {
             frame.fill(0.0);
-            if self.read + 1.0 >= self.write as f64 {
-                continue;
+            if self.read + 1.0 < self.write as f64 {
+                let base = self.read.floor() as i64;
+                let frac = (self.read - base as f64) as f32;
+                let a = Self::slot(base);
+                let b = Self::slot(base + 1);
+                let left = lerp(self.samples[a] as f32, self.samples[b] as f32, frac);
+                let right = lerp(self.samples[a + 1] as f32, self.samples[b + 1] as f32, frac);
+                let loudest = left.abs().max(right.abs());
+                if loudest > self.peak as f32 {
+                    self.peak = loudest as i32;
+                }
+                if loudest > FULL_SCALE {
+                    self.clipped += 1;
+                }
+                frame[0] = soft_limit(left);
+                if channels > 1 {
+                    frame[1] = soft_limit(right);
+                }
             }
-            let base = self.read.floor() as i64;
-            let frac = (self.read - base as f64) as f32;
-            let a = Self::slot(base);
-            let b = Self::slot(base + 1);
-            let left = lerp(self.samples[a] as f32, self.samples[b] as f32, frac);
-            let right = lerp(self.samples[a + 1] as f32, self.samples[b + 1] as f32, frac);
-            frame[0] = clamp(left);
-            if channels > 1 {
-                frame[1] = clamp(right);
-            }
+            // The position must follow the device clock even over a gap.
+            // Freezing it at the watermark made playback lag further behind
+            // with every thin buffer: the queue grew instead of draining.
             self.read += step;
         }
         // Everything strictly behind the interpolation window is dead audio:
@@ -316,10 +340,27 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Converts an accumulated sample to `[-1, 1]`, clamping the sum of several
-/// speakers instead of letting it wrap.
-fn clamp(value: f32) -> f32 {
-    (value / 32_768.0).clamp(-1.0, 1.0)
+/// Full scale of a 16-bit sample, in mixer units (an `i16` source sample).
+const FULL_SCALE: f32 = 32_767.0;
+/// Below this the limiter is a plain pass-through, in mixer units.
+const LIMIT_KNEE: f32 = 0.75 * FULL_SCALE;
+
+/// Converts an accumulated sample to `[-1, 1]`.
+///
+/// Several simultaneous speakers add up past full scale, and chopping the sum
+/// is heard as crackle and buzzing rather than as loudness. Above the knee the
+/// curve bends smoothly toward full scale instead of being cut off, so the
+/// worst case is a slightly squashed loud passage instead of distortion.
+fn soft_limit(value: f32) -> f32 {
+    let magnitude = value.abs();
+    let shaped = if magnitude <= LIMIT_KNEE {
+        magnitude
+    } else {
+        let room = FULL_SCALE - LIMIT_KNEE;
+        // Continuous with slope 1 at the knee, approaching full scale.
+        LIMIT_KNEE + room * (1.0 - (-(magnitude - LIMIT_KNEE) / room).exp())
+    };
+    (shaped.copysign(value) / 32_768.0).clamp(-1.0, 1.0)
 }
 
 /// Playback handle: shared mixer, stop flag and the threads that own the cpal
@@ -415,6 +456,12 @@ impl Player {
         self.mixer.lock().map(|m| m.position()).unwrap_or(0)
     }
 
+    /// End of the queued timeline: the frame after the last packet written.
+    /// New senders are anchored here so they join without a hole.
+    pub(crate) fn end(&self) -> i64 {
+        self.mixer.lock().map(|m| m.write).unwrap_or(0)
+    }
+
     /// How much audio is queued for playback, in 48 kHz frames.
     pub(crate) fn buffered(&self) -> i64 {
         self.mixer
@@ -430,6 +477,15 @@ impl Player {
             .lock()
             .map(|m| (m.underruns, m.dropped, m.late, m.ahead))
             .unwrap_or((0, 0, 0, 0))
+    }
+
+    /// Clipped output frames and the loudest sample so far: a hard clip on a
+    /// loud mix is heard as crackle and buzzing, not as loudness.
+    pub(crate) fn levels(&self) -> (u64, i32) {
+        self.mixer
+            .lock()
+            .map(|m| (m.clipped, m.peak))
+            .unwrap_or((0, 0))
     }
 
     /// Size of the last output callback in 48 kHz frames; 0 before the device
@@ -870,15 +926,81 @@ mod tests {
     }
 
     #[test]
-    fn mixer_sums_speakers_and_clamps() {
+    fn playback_skips_a_backlog_accumulated_before_start() {
+        // Audio that queued up while playback was waiting must not become
+        // permanent delay: playback starts near the end of the queue.
+        let mut mixer = Mixer::new();
+        push_constant(&mut mixer, 1_000, 28_800);
+        let mut out = vec![0.0f32; 960 * CHANNELS];
+        mixer.pull(&mut out, CHANNELS, 1.0);
+        assert!(
+            mixer.queued() <= PREBUFFER_FRAMES as f64,
+            "в очереди должно остаться не больше пребуфера, а осталось {:?}",
+            mixer.queued()
+        );
+        assert!(
+            mixer.position() >= 24_000,
+            "позиция должна прыгнуть к концу очереди, а не играть тишину: {:?}",
+            mixer.position()
+        );
+    }
+
+    #[test]
+    fn loud_speakers_are_limited_instead_of_clipped() {
+        // Three people at once sum to roughly three times full scale. The
+        // mix must stay inside [-1, 1] and keep rising with the input, i.e.
+        // be bent rather than chopped.
+        let mut previous = -1.0f32;
+        for value in [-120_000.0f32, -32_767.0, -20_000.0, 0.0, 20_000.0, 32_767.0, 120_000.0] {
+            let out = soft_limit(value);
+            assert!(out.is_finite() && (-1.0..=1.0).contains(&out), "выход вне шкалы: {out}");
+            assert!(out > previous, "кривая должна расти монотонно: {value}");
+            previous = out;
+        }
+        assert!(soft_limit(120_000.0) > 0.9, "громкий сигнал не должен пропадать");
+        assert_eq!(soft_limit(1_000.0), 1_000.0 / 32_768.0, "тихий сигнал не трогаем");
+    }
+
+    #[test]
+    fn mixer_keeps_time_when_the_queue_is_thin() {
+        // Freezing the position at the watermark made playback run slower
+        // than the device whenever the queue was thin: every callback skipped
+        // a few advances and the delay grew without bound.
+        let mut mixer = Mixer::new();
+        push_constant(&mut mixer, 1_000, 4_800);
+        let mut out = vec![0.0f32; 960 * CHANNELS];
+        mixer.pull(&mut out, CHANNELS, 1.0);
+        assert!(mixer.queued() > 0.0, "после пребуфера очередь не пуста");
+        // The callback now asks for far more than is queued: the tail is
+        // silence, but the position still has to follow the device clock.
+        let mut big = vec![0.0f32; 4_800 * CHANNELS];
+        mixer.pull(&mut big, CHANNELS, 1.0);
+        assert_eq!(
+            mixer.position(),
+            5_760,
+            "позиция должна идти по часам устройства, а не стоять на watermark"
+        );
+        assert!(
+            big[3_840 * CHANNELS..].iter().all(|&s| s == 0.0),
+            "за концом очереди должна быть тишина"
+        );
+    }
+
+    #[test]
+    fn mixer_sums_speakers_and_limits() {
         let mut mixer = Mixer::new();
         // Two speakers at the same RTP position: 20000 + 20000 overflows
-        // i16, but the mixer accumulates in i32 and clamps once at output.
+        // i16, but the mixer accumulates in i32 and shapes the sum once at
+        // the output.
         push_constant(&mut mixer, 20_000, PREBUFFER_FRAMES + 8);
         push_constant(&mut mixer, 20_000, PREBUFFER_FRAMES + 8);
         let mut out = [0.0f32; 16];
         mixer.pull(&mut out, 2, 1.0);
-        assert!(out[0] > 0.99, "сумма двух говорящих должна клиппироваться в 1.0: {}", out[0]);
+        assert!(
+            out[0] > 0.95,
+            "сумма двух говорящих должна упереться в верх шкалы: {}",
+            out[0]
+        );
         assert!(out[0] <= 1.0 && out[1] >= -1.0, "выход за пределы [-1, 1]");
 
         let mut quiet = Mixer::new();
@@ -903,11 +1025,14 @@ mod tests {
     #[test]
     fn mixer_resamples_to_the_device_rate() {
         let mut mixer = Mixer::new();
-        push_constant(&mut mixer, 1_000, RING_FRAMES - 100);
+        // Exactly one pre-buffer: playback starts at the queue head, so the
+        // measured consumption is the resampler's and not a start-up jump.
+        let queued_before = PREBUFFER_FRAMES as f64;
+        push_constant(&mut mixer, 1_000, PREBUFFER_FRAMES);
         let mut out = vec![0.0f32; 441 * 2];
         // 44.1 kHz device: 441 output frames must consume 480 source frames.
         mixer.pull(&mut out, 2, 48_000.0 / 44_100.0);
-        let consumed = (RING_FRAMES - 100) as f64 - mixer.queued();
+        let consumed = queued_before - mixer.queued();
         assert!((consumed - 480.0).abs() < 0.5, "ресемплер съел {} кадров вместо 480", consumed);
     }
 

@@ -21,12 +21,16 @@ Lightweight Discord client in Rust + egui 0.31.1 (user tokens).
   only for running from the repo root; it is not committed).
   Never run that `cp` on Windows — it would put an `.exe` where the Linux
   binary is expected.
-- Tests: `cargo test` - 409 tests (406 + 3 ignored); keep that count in sync
+- Opus decoding links the reference libopus (crate `opus`). The build uses
+  `libopus-dev` via `pkg-config` when present, otherwise it compiles the
+  bundled copy, which needs a C compiler plus CMake. With CMake 4 set
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment or the bundled
+  configure step is rejected.
+- Tests: `cargo test` - 420 tests (417 + 3 ignored); keep that count in sync
   with README.
 - 0 warnings required.
 - Windows has no MSVC linker (`link.exe`), so `cargo` alone fails. Use the gnu
-  toolchain that is installed there (one `#[cfg(unix)]` test is skipped, so
-  Windows reports 408 in total):
+  toolchain that is installed there:
 
   ```
   $env:Path = 'C:\Users\hackerman\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;' + $env:Path
